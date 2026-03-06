@@ -1187,9 +1187,67 @@ def handle_request(req):
                 "jsonrpc": "2.0", "id": req_id,
                 "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"},
             }
-    # Methods that Claude Code / Gemini CLI may probe — return empty results
-    elif method in ("resources/list", "resources/templates/list",
-                     "prompts/list", "completion/complete"):
+    # Methods that Claude Code / Gemini CLI may probe
+    elif method == "resources/list":
+        return {
+            "jsonrpc": "2.0", "id": req_id,
+            "result": {
+                "resources": [
+                    {
+                        "uri": "speech://readme",
+                        "name": "Speech-to-CLI Documentation",
+                        "description": "The complete README and documentation for the speech-to-cli MCP server, including features, usage, and configuration.",
+                        "mimeType": "text/markdown"
+                    },
+                    {
+                        "uri": "speech://config-schema",
+                        "name": "Configuration Schema",
+                        "description": "The current configuration settings loaded by the MCP server.",
+                        "mimeType": "application/json"
+                    }
+                ]
+            }
+        }
+    elif method == "resources/read":
+        uri = params.get("uri")
+        if uri == "speech://readme":
+            try:
+                readme_path = os.path.join(_SCRIPT_DIR, "README.md")
+                with open(readme_path, "r") as f:
+                    content = f.read()
+            except Exception as e:
+                content = f"Error reading README: {e}"
+            return {
+                "jsonrpc": "2.0", "id": req_id,
+                "result": {
+                    "contents": [
+                        {
+                            "uri": uri,
+                            "mimeType": "text/markdown",
+                            "text": content
+                        }
+                    ]
+                }
+            }
+        elif uri == "speech://config-schema":
+            return {
+                "jsonrpc": "2.0", "id": req_id,
+                "result": {
+                    "contents": [
+                        {
+                            "uri": uri,
+                            "mimeType": "application/json",
+                            "text": json.dumps(CONFIG, indent=2)
+                        }
+                    ]
+                }
+            }
+        else:
+            return {
+                "jsonrpc": "2.0", "id": req_id,
+                "error": {"code": -32602, "message": f"Resource not found: {uri}"}
+            }
+    elif method in ("resources/templates/list", "prompts/list", "completion/complete"):
         return {"jsonrpc": "2.0", "id": req_id, "result": {}}
     elif method == "ping":
         return {"jsonrpc": "2.0", "id": req_id, "result": {}}
