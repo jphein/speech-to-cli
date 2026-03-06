@@ -47,7 +47,11 @@ except ImportError:
     HAS_WHISPER = False
 
 DEFAULTS_PATH = os.path.expanduser("~/.config/speech-to-cli/config.json")
-CHIME_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chime.wav")
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CHIME_PATH = os.path.join(_SCRIPT_DIR, "chime_ready.wav")
+CHIME_PROCESSING = os.path.join(_SCRIPT_DIR, "chime_processing.wav")
+CHIME_SPEAK = os.path.join(_SCRIPT_DIR, "chime_speak.wav")
+CHIME_DONE = os.path.join(_SCRIPT_DIR, "chime_done.wav")
 
 # Audio settings
 SAMPLE_RATE = 16000
@@ -113,40 +117,67 @@ def _prewarm():
 # Audio utilities
 # ---------------------------------------------------------------------------
 
-def _generate_chime():
-    """Generate a short ascending two-tone chime WAV file if it doesn't exist."""
-    if os.path.exists(CHIME_PATH):
-        return
+def _generate_chimes():
+    """Generate all status chime WAV files if they don't exist."""
     import wave
     rate = 16000
-    samples = []
-    for freq, dur, vol in [(880, 0.03, 0.35), (1175, 0.05, 0.45)]:
-        for i in range(int(rate * dur)):
-            t = i / rate
-            env = min(1.0, min(t * 40, (dur - t) * 20))
-            samples.append(int(vol * env * math.sin(2 * math.pi * freq * t) * 32767))
-    raw = struct.pack(f"<{len(samples)}h", *samples)
-    try:
-        with open(CHIME_PATH, "wb") as f:
-            w = wave.open(f, "wb")
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(rate)
-            w.writeframes(raw)
-            w.close()
-    except OSError:
-        pass
 
-_generate_chime()
+    def _make(path, tones):
+        if os.path.exists(path):
+            return
+        samples = []
+        for freq, dur, vol in tones:
+            if freq == 0:  # silence gap
+                samples.extend([0] * int(rate * dur))
+            else:
+                for i in range(int(rate * dur)):
+                    t = i / rate
+                    env = min(1.0, min(t * 50, (dur - t) * 50))
+                    samples.append(int(vol * env * math.sin(2 * math.pi * freq * t) * 32767))
+        raw = struct.pack(f"<{len(samples)}h", *samples)
+        try:
+            with open(path, "wb") as f:
+                w = wave.open(f, "wb")
+                w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate)
+                w.writeframes(raw); w.close()
+        except OSError:
+            pass
+
+    _make(CHIME_PATH, [(880, 0.03, 0.3), (1175, 0.05, 0.4)])          # ready: ascending
+    _make(CHIME_PROCESSING, [(1320, 0.025, 0.2)])                       # processing: soft blip
+    _make(CHIME_SPEAK, [(1175, 0.03, 0.25), (880, 0.04, 0.3)])         # speak: descending
+    _make(CHIME_DONE, [(1047, 0.02, 0.15), (0, 0.02, 0), (1047, 0.02, 0.15)])  # done: double tap
+
+_generate_chimes()
+
+
+def _play_sound(path):
+    """Play a WAV file non-blocking."""
+    if os.path.exists(path):
+        subprocess.Popen(
+            ["aplay", "-D", "default", "-q", path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
 
 
 def play_chime():
-    """Play a short ready chime (non-blocking, ~80ms audio)."""
-    if os.path.exists(CHIME_PATH):
-        subprocess.Popen(
-            ["aplay", "-D", "default", "-q", CHIME_PATH],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+    """Ready chime — ascending tone, signals 'speak now'."""
+    _play_sound(CHIME_PATH)
+
+
+def play_processing():
+    """Processing blip — signals STT is done, thinking."""
+    _play_sound(CHIME_PROCESSING)
+
+
+def play_speak():
+    """Speak chime — descending tone, signals TTS starting."""
+    _play_sound(CHIME_SPEAK)
+
+
+def play_done():
+    """Done tap — signals TTS finished."""
+    _play_sound(CHIME_DONE)
 
 
 def rms_energy(frame_bytes):
@@ -582,13 +613,17 @@ def stt(seconds=None, mode=None):
             mode = "fixed"
 
     if mode == "streaming" and HAS_WS:
-        return stt_streaming(max_seconds)
+        result = stt_streaming(max_seconds)
     elif mode == "whisper" and HAS_WHISPER:
-        return stt_whisper(max_seconds)
+        result = stt_whisper(max_seconds)
     elif mode == "vad" and HAS_VAD:
-        return stt_vad(max_seconds)
+        result = stt_vad(max_seconds)
     else:
-        return stt_fixed(seconds or 5)
+        result = stt_fixed(seconds or 5)
+
+    if result.get("text"):
+        play_processing()
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -621,6 +656,8 @@ def tts(text, quality="fast", speed=1.0):
     resp = get_http_session().post(url, headers=headers, data=ssml.encode("utf-8"), timeout=60, stream=True)
     if resp.status_code != 200:
         return {"error": f"Azure TTS error {resp.status_code}"}
+
+    play_speak()
 
     # Stream MP3 audio via mpv/ffplay for immediate playback
     speed_args = ["--speed=" + str(speed)] if speed != 1.0 else []
@@ -659,6 +696,7 @@ def tts(text, quality="fast", speed=1.0):
         proc.wait()
     except BrokenPipeError:
         pass
+    play_done()
     return {"spoken": True, "chars": len(text)}
 
 
