@@ -94,6 +94,8 @@ def load_config():
         "chime_done": cfg.get("chime_done", False),
         "chime_hum": cfg.get("chime_hum", False),
         "visual_indicator": cfg.get("visual_indicator", True),
+        "live_subtitles": cfg.get("live_subtitles", True),
+        "vu_meter": cfg.get("vu_meter", True),
     }
 
 
@@ -499,7 +501,15 @@ def stt_streaming(max_seconds=30, progress_token=None):
                         
                         # Update UI with VU meter and partial text ~every 90ms (3 frames)
                         if total_frames % 3 == 0 or current_pct > last_progress_pct:
-                            msg = f"🎤 {vu} {shared_state['partial']}"
+                            parts = ["🎤"]
+                            if CONFIG.get("vu_meter", True):
+                                parts.append(vu)
+                            if CONFIG.get("live_subtitles", True):
+                                parts.append(shared_state["partial"])
+                            else:
+                                parts.append("Listening...")
+                                
+                            msg = " ".join(parts)
                             send_progress(progress_token, current_pct, 100, msg)
                             last_progress_pct = current_pct
                             
@@ -875,16 +885,31 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
         dl_thread = threading.Thread(target=download_audio)
         dl_thread.start()
         
+        import random
+        bars = [" ", "▂", "▃", "▄", "▅"]
         last_pct = 0
-        send_progress(progress_token, 0, 100, "🔊 Speaking...")
+        
+        # Prepare display text for speaking
+        display_text = text if len(text) < 50 else text[:47] + "..."
+        base_msg = f"Speaking: {display_text}" if CONFIG.get("live_subtitles", True) else "Speaking..."
+        
+        send_progress(progress_token, 0, 100, f"🔊 {base_msg}")
         
         while proc.poll() is None:
             elapsed = time.time() - start_time
             # Allow progress to reach 100% naturally while playing
             current_pct = int(min(1.0, elapsed / estimated_duration) * 100)
+            
+            # Simulated VU meter that animates while playing
+            vu = random.choice(bars) if CONFIG.get("vu_meter", True) else ""
+            vu_prefix = f"{vu} " if vu else ""
+            
+            # Send updates frequently to animate the VU meter
+            send_progress(progress_token, current_pct, 100, f"🔊 {vu_prefix}{base_msg}")
+            
             if current_pct > last_pct:
-                send_progress(progress_token, current_pct, 100, "🔊 Speaking...")
                 last_pct = current_pct
+                
             time.sleep(0.1)
             
         dl_thread.join()

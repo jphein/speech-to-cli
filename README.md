@@ -127,6 +127,8 @@ Example `config.json`:
 | `chime_speak` | `false` | Play a descending tone before starting to speak. |
 | `chime_done` | `false` | Play a double-tap tone when the AI is done talking. |
 | `visual_indicator`| `true` | Show status icons (🎤/🧠) in the terminal. |
+| `live_subtitles` | `true` | Show real-time partial transcription in progress bar. |
+| `vu_meter` | `true` | Show live volume meter in progress bar. |
 
 > ⚠️ **Never commit your API key.** Use environment variables or the config file (which is in your home directory, outside the repo). See [Security](#security) below.
 
