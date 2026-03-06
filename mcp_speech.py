@@ -2,16 +2,20 @@
 """
 Azure Speech MCP Server for Copilot CLI.
 
-Provides 'listen' (STT) and 'speak' (TTS) tools so Copilot can
-have voice conversations.
+Provides 'listen' (STT), 'speak' (TTS), and 'converse' tools so Copilot
+can have voice conversations.
 
 STT modes (selected automatically):
-  - streaming: Real-time WebSocket recognition (fastest, ~0.5s after speech ends)
-  - vad:       Record with voice activity detection, upload when silence detected (~2-4s)
+  - streaming: Real-time WebSocket recognition + energy-gated VAD (fastest)
+  - vad:       Record with energy-gated VAD, upload on silence
+  - whisper:   Local transcription via faster-whisper (no network, CPU-only)
   - fixed:     Record for a fixed duration, then upload (fallback)
+
+TTS: Streams audio playback as chunks arrive from Azure for lower latency.
 """
 
 import json
+import math
 import os
 import struct
 import subprocess
@@ -35,15 +39,26 @@ try:
 except ImportError:
     HAS_WS = False
 
+try:
+    from faster_whisper import WhisperModel
+    HAS_WHISPER = True
+    _whisper_model = None
+except ImportError:
+    HAS_WHISPER = False
+
 DEFAULTS_PATH = os.path.expanduser("~/.config/speech-to-cli/config.json")
 
-# VAD settings
+# Audio settings
 SAMPLE_RATE = 16000
 FRAME_MS = 30
 FRAME_BYTES = SAMPLE_RATE * 2 * FRAME_MS // 1000  # 960 bytes per 30ms frame
+
+# VAD + energy gate settings
 SILENCE_TIMEOUT = 1.5  # seconds of silence before stopping
 MIN_SPEECH_DURATION = 0.3  # minimum speech before accepting silence
-VAD_AGGRESSIVENESS = 3  # 0-3, higher = more aggressive filtering of non-speech
+VAD_AGGRESSIVENESS = 3  # 0-3, higher filters more non-speech
+ENERGY_CALIBRATION_FRAMES = 15  # ~0.5s of ambient noise sampling
+ENERGY_THRESHOLD_MULTIPLIER = 2.5  # speech must be Nx louder than ambient
 
 
 def load_config():
@@ -61,8 +76,96 @@ def load_config():
 CONFIG = load_config()
 
 
+# ---------------------------------------------------------------------------
+# Audio utilities
+# ---------------------------------------------------------------------------
+
+def rms_energy(frame_bytes):
+    """Calculate RMS energy of a 16-bit PCM frame."""
+    n_samples = len(frame_bytes) // 2
+    if n_samples == 0:
+        return 0.0
+    samples = struct.unpack(f"<{n_samples}h", frame_bytes[:n_samples * 2])
+    return math.sqrt(sum(s * s for s in samples) / n_samples)
+
+
+def calibrate_noise(proc, n_frames=ENERGY_CALIBRATION_FRAMES):
+    """Read a few frames to estimate ambient noise energy. Returns (threshold, collected_frames)."""
+    energies = []
+    frames = []
+    for _ in range(n_frames):
+        chunk = proc.stdout.read(FRAME_BYTES)
+        if not chunk or len(chunk) < FRAME_BYTES:
+            break
+        frames.append(chunk)
+        energies.append(rms_energy(chunk))
+    if not energies:
+        return 500.0, frames  # safe default
+    ambient = sum(energies) / len(energies)
+    threshold = max(ambient * ENERGY_THRESHOLD_MULTIPLIER, 300.0)
+    return threshold, frames
+
+
+def is_speech_energy(chunk, vad, energy_threshold):
+    """Combined VAD + energy gate: both must agree it's speech."""
+    energy = rms_energy(chunk)
+    if energy < energy_threshold:
+        return False
+    if vad:
+        return vad.is_speech(chunk, SAMPLE_RATE)
+    return True
+
+
+def get_whisper_model():
+    """Lazy-load whisper model (first call downloads ~150MB)."""
+    global _whisper_model
+    if _whisper_model is None:
+        _whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+    return _whisper_model
+
+
+def write_wav(path, raw_data):
+    """Write raw PCM data as a WAV file."""
+    with open(path, "wb") as f:
+        f.write(struct.pack('<4sI4s4sIHHIIHH4sI',
+            b'RIFF', 36 + len(raw_data), b'WAVE', b'fmt ', 16, 1, 1,
+            SAMPLE_RATE, SAMPLE_RATE * 2, 2, 16, b'data', len(raw_data)))
+        f.write(raw_data)
+
+
+def record_with_vad(proc, max_seconds):
+    """Record with energy-gated VAD, returning (raw_frames, energy_threshold)."""
+    energy_threshold, calibration_frames = calibrate_noise(proc)
+    vad = webrtcvad.Vad(VAD_AGGRESSIVENESS) if HAS_VAD else None
+    frames = list(calibration_frames)
+    silence_frames = 0
+    speech_frames = 0
+    max_silence = int(SILENCE_TIMEOUT * 1000 / FRAME_MS)
+    min_speech = int(MIN_SPEECH_DURATION * 1000 / FRAME_MS)
+    max_frames = int(max_seconds * 1000 / FRAME_MS)
+
+    for _ in range(max_frames):
+        chunk = proc.stdout.read(FRAME_BYTES)
+        if not chunk or len(chunk) < FRAME_BYTES:
+            break
+        frames.append(chunk)
+        if is_speech_energy(chunk, vad, energy_threshold):
+            speech_frames += 1
+            silence_frames = 0
+        else:
+            silence_frames += 1
+        if speech_frames >= min_speech and silence_frames >= max_silence:
+            break
+
+    return frames, energy_threshold
+
+
+# ---------------------------------------------------------------------------
+# STT backends
+# ---------------------------------------------------------------------------
+
 def stt_streaming(max_seconds=30):
-    """Real-time STT via Azure WebSocket — transcribes as you speak."""
+    """Real-time STT via Azure WebSocket + energy-gated VAD."""
     region = CONFIG["region"]
     key = CONFIG["key"]
     conn_id = uuid.uuid4().hex
@@ -71,7 +174,7 @@ def stt_streaming(max_seconds=30):
         f"wss://{region}.stt.speech.microsoft.com/speech/recognition"
         f"/conversation/cognitiveservices/v1?language=en-US&format=detailed"
     )
-    headers = {
+    ws_headers = {
         "Ocp-Apim-Subscription-Key": key,
         "X-ConnectionId": conn_id,
     }
@@ -82,19 +185,18 @@ def stt_streaming(max_seconds=30):
     def on_message(ws, message):
         try:
             if isinstance(message, str):
-                # Parse the Azure Speech protocol message
                 parts = message.split("\r\n\r\n", 1)
                 if len(parts) < 2:
                     return
-                headers_part, body = parts
-                if "speech.phrase" in headers_part.lower():
+                hdr, body = parts
+                if "speech.phrase" in hdr.lower():
                     data = json.loads(body)
                     if data.get("RecognitionStatus") == "Success":
                         nbest = data.get("NBest", [])
                         text = nbest[0]["Display"] if nbest else data.get("DisplayText", "")
                         with lock:
                             result["text"] = (result["text"] + " " + text).strip()
-                elif "turn.end" in headers_part.lower():
+                elif "turn.end" in hdr.lower():
                     with lock:
                         result["done"] = True
                     ws.close()
@@ -112,7 +214,6 @@ def stt_streaming(max_seconds=30):
 
     def on_open(ws):
         def send_audio():
-            # Send speech config
             speech_config = {
                 "context": {
                     "system": {"version": "1.0.00000"},
@@ -121,26 +222,23 @@ def stt_streaming(max_seconds=30):
                                          "model": "Unknown", "type": "Unknown"}},
                 }
             }
+            request_id = uuid.uuid4().hex
             config_msg = (
                 f"Path: speech.config\r\n"
-                f"X-RequestId: {uuid.uuid4().hex}\r\n"
+                f"X-RequestId: {request_id}\r\n"
                 f"X-Timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())}\r\n"
                 f"Content-Type: application/json\r\n\r\n"
                 + json.dumps(speech_config)
             )
             ws.send(config_msg)
 
-            # Start arecord (raw PCM)
             proc = subprocess.Popen(
                 ["arecord", "-D", "default", "-f", "S16_LE", "-r", "16000", "-c", "1",
                  "-t", "raw", "-d", str(max_seconds)],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             )
 
-            request_id = uuid.uuid4().hex
-
             def make_audio_binary(audio_data):
-                """Build Azure Speech binary frame: 2-byte header len + ASCII header + audio."""
                 header_str = (
                     f"Path: audio\r\n"
                     f"X-RequestId: {request_id}\r\n"
@@ -150,10 +248,17 @@ def stt_streaming(max_seconds=30):
                 header_bytes = header_str.encode('ascii')
                 return struct.pack('>H', len(header_bytes)) + header_bytes + audio_data
 
-            # First chunk includes RIFF/WAV header
+            # Calibrate noise floor
+            energy_threshold, calibration_frames = calibrate_noise(proc)
+
+            # WAV header
             wav_header = struct.pack('<4sI4s4sIHHIIHH4sI',
                 b'RIFF', 0, b'WAVE', b'fmt ', 16, 1, 1, 16000, 32000, 2, 16, b'data', 0)
             ws.send(make_audio_binary(wav_header), opcode=websocket.ABNF.OPCODE_BINARY)
+
+            # Send calibration frames
+            for frame in calibration_frames:
+                ws.send(make_audio_binary(frame), opcode=websocket.ABNF.OPCODE_BINARY)
 
             vad = webrtcvad.Vad(VAD_AGGRESSIVENESS) if HAS_VAD else None
             silence_frames = 0
@@ -168,10 +273,8 @@ def stt_streaming(max_seconds=30):
                         break
                     ws.send(make_audio_binary(chunk), opcode=websocket.ABNF.OPCODE_BINARY)
 
-                    # VAD: stop on silence after speech detected
-                    if vad and len(chunk) == FRAME_BYTES:
-                        is_speech = vad.is_speech(chunk, SAMPLE_RATE)
-                        if is_speech:
+                    if len(chunk) == FRAME_BYTES:
+                        if is_speech_energy(chunk, vad, energy_threshold):
                             speech_frames += 1
                             silence_frames = 0
                         else:
@@ -184,20 +287,18 @@ def stt_streaming(max_seconds=30):
                 proc.terminate()
                 proc.wait()
 
-            # Send empty audio to signal end of stream
             ws.send(make_audio_binary(b""), opcode=websocket.ABNF.OPCODE_BINARY)
 
         threading.Thread(target=send_audio, daemon=True).start()
 
     ws_app = websocket.WebSocketApp(
-        ws_url, header=headers,
+        ws_url, header=ws_headers,
         on_open=on_open, on_message=on_message,
         on_error=on_error, on_close=on_close,
     )
     ws_thread = threading.Thread(target=ws_app.run_forever, daemon=True)
     ws_thread.start()
 
-    # Wait for result
     deadline = time.time() + max_seconds + 5
     while time.time() < deadline:
         with lock:
@@ -211,7 +312,7 @@ def stt_streaming(max_seconds=30):
 
 
 def stt_vad(max_seconds=30):
-    """Record with VAD — stops when silence is detected after speech."""
+    """Record with energy-gated VAD, stop on silence, upload via REST."""
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp_path = tmp.name
     try:
@@ -220,43 +321,16 @@ def stt_vad(max_seconds=30):
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
 
-        vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
-        frames = []
-        silence_frames = 0
-        speech_frames = 0
-        max_silence = int(SILENCE_TIMEOUT * 1000 / FRAME_MS)
-        min_speech = int(MIN_SPEECH_DURATION * 1000 / FRAME_MS)
-        max_frames = int(max_seconds * 1000 / FRAME_MS)
-
-        for _ in range(max_frames):
-            chunk = proc.stdout.read(FRAME_BYTES)
-            if not chunk or len(chunk) < FRAME_BYTES:
-                break
-            frames.append(chunk)
-            is_speech = vad.is_speech(chunk, SAMPLE_RATE)
-            if is_speech:
-                speech_frames += 1
-                silence_frames = 0
-            else:
-                silence_frames += 1
-            if speech_frames >= min_speech and silence_frames >= max_silence:
-                break
-
+        frames, _ = record_with_vad(proc, max_seconds)
         proc.terminate()
         proc.wait()
 
         if not frames:
             return {"text": "", "status": "NoAudio"}
 
-        # Write WAV file
         raw_data = b"".join(frames)
-        with open(tmp_path, "wb") as f:
-            f.write(struct.pack('<4sI4s4sIHHIIHH4sI',
-                b'RIFF', 36 + len(raw_data), b'WAVE', b'fmt ', 16, 1, 1,
-                SAMPLE_RATE, SAMPLE_RATE * 2, 2, 16, b'data', len(raw_data)))
-            f.write(raw_data)
+        write_wav(tmp_path, raw_data)
 
-        # Upload to Azure STT
         url = f"https://{CONFIG['region']}.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1"
         headers = {
             "Ocp-Apim-Subscription-Key": CONFIG["key"],
@@ -280,8 +354,44 @@ def stt_vad(max_seconds=30):
             pass
 
 
+def stt_whisper(max_seconds=30):
+    """Local STT via faster-whisper - no network needed."""
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        proc = subprocess.Popen(
+            ["arecord", "-D", "default", "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "raw"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+
+        if HAS_VAD:
+            frames, _ = record_with_vad(proc, max_seconds)
+            proc.terminate()
+            proc.wait()
+            raw_data = b"".join(frames)
+        else:
+            raw_data = proc.stdout.read(SAMPLE_RATE * 2 * max_seconds)
+            proc.terminate()
+            proc.wait()
+
+        if not raw_data:
+            return {"text": "", "status": "NoAudio"}
+
+        write_wav(tmp_path, raw_data)
+
+        model = get_whisper_model()
+        segments, _ = model.transcribe(tmp_path, beam_size=5, language="en")
+        text = " ".join(seg.text.strip() for seg in segments).strip()
+        return {"text": text}
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
 def stt_fixed(seconds=5):
-    """Record for a fixed duration, then upload (original fallback)."""
+    """Record for a fixed duration, then upload (fallback)."""
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp_path = tmp.name
     try:
@@ -317,7 +427,7 @@ def stt_fixed(seconds=5):
 def stt(seconds=None, mode=None):
     """Speech-to-text with automatic mode selection.
 
-    Modes: 'streaming' (fastest), 'vad' (stop on silence), 'fixed' (original).
+    Modes: 'streaming', 'vad', 'whisper', 'fixed'.
     If mode is None, picks the best available.
     """
     max_seconds = min(seconds or 30, 30)
@@ -332,66 +442,87 @@ def stt(seconds=None, mode=None):
 
     if mode == "streaming" and HAS_WS:
         return stt_streaming(max_seconds)
+    elif mode == "whisper" and HAS_WHISPER:
+        return stt_whisper(max_seconds)
     elif mode == "vad" and HAS_VAD:
         return stt_vad(max_seconds)
     else:
         return stt_fixed(seconds or 5)
 
 
+# ---------------------------------------------------------------------------
+# TTS (streaming playback)
+# ---------------------------------------------------------------------------
+
 def tts(text):
-    """Speak text aloud via Azure TTS."""
-    # Escape XML special chars
-    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    """Speak text aloud via Azure TTS with streaming playback."""
+    safe_text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     url = f"https://{CONFIG['region']}.tts.speech.microsoft.com/cognitiveservices/v1"
     ssml = (
         f'<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US">'
-        f'<voice name="{CONFIG["voice"]}">{text}</voice></speak>'
+        f'<voice name="{CONFIG["voice"]}">{safe_text}</voice></speak>'
     )
     headers = {
         "Ocp-Apim-Subscription-Key": CONFIG["key"],
         "Content-Type": "application/ssml+xml",
         "X-Microsoft-OutputFormat": "riff-24khz-16bit-mono-pcm",
     }
-    resp = requests.post(url, headers=headers, data=ssml.encode("utf-8"), timeout=60)
+    resp = requests.post(url, headers=headers, data=ssml.encode("utf-8"), timeout=60, stream=True)
     if resp.status_code != 200:
         return {"error": f"Azure TTS error {resp.status_code}"}
-    subprocess.run(["aplay", "-D", "default", "-q", "-"],
-                   input=resp.content, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # Stream audio to aplay as chunks arrive - starts playing before download finishes
+    proc = subprocess.Popen(
+        ["aplay", "-D", "default", "-q", "-"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        for chunk in resp.iter_content(chunk_size=4096):
+            if chunk:
+                proc.stdin.write(chunk)
+        proc.stdin.close()
+        proc.wait()
+    except BrokenPipeError:
+        pass
     return {"spoken": True, "chars": len(text)}
 
 
-# --- MCP Protocol (stdio JSON-RPC) ---
+# ---------------------------------------------------------------------------
+# MCP Protocol (stdio JSON-RPC)
+# ---------------------------------------------------------------------------
 
 TOOLS = [
     {
         "name": "listen",
         "description": (
-            "Record audio from the user's microphone and transcribe it to text using Azure Speech-to-Text. "
-            "Use this to hear what the user is saying via voice. "
-            "By default uses the fastest available mode: streaming (real-time WebSocket), "
-            "vad (stops on silence), or fixed duration."
+            "Record audio from the user's microphone and transcribe it to text. "
+            "Uses energy-gated voice activity detection to stop automatically when the user "
+            "finishes speaking (ignores background noise). "
+            "Modes: 'streaming' (real-time Azure WebSocket, fastest), "
+            "'vad' (record then upload), 'whisper' (local, no network), 'fixed' (timed). "
+            "Default: best available."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "seconds": {
                     "type": "integer",
-                    "description": "Max recording duration in seconds (default 30, max 30). With streaming/vad modes, recording stops early when silence is detected.",
+                    "description": "Max recording duration in seconds (default 30, max 30). With streaming/vad/whisper modes, recording stops early on silence.",
                     "default": 30,
                     "minimum": 1,
                     "maximum": 30,
                 },
                 "mode": {
                     "type": "string",
-                    "description": "STT mode: 'streaming' (fastest, real-time), 'vad' (stop on silence), 'fixed' (record full duration). Default: best available.",
-                    "enum": ["streaming", "vad", "fixed"],
+                    "description": "STT mode: 'streaming' (fastest, real-time Azure), 'vad' (stop on silence, upload), 'whisper' (local, offline), 'fixed' (full duration). Default: best available.",
+                    "enum": ["streaming", "vad", "whisper", "fixed"],
                 },
             },
         },
     },
     {
         "name": "speak",
-        "description": "Speak text aloud to the user using Azure Text-to-Speech. Use this to read your responses out loud so the user can hear them.",
+        "description": "Speak text aloud to the user using Azure Text-to-Speech with streaming playback. Starts playing audio as it downloads for lower latency.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -401,6 +532,32 @@ TOOLS = [
                 }
             },
             "required": ["text"],
+        },
+    },
+    {
+        "name": "converse",
+        "description": (
+            "Have a voice conversation turn: listen to the user via microphone, return their speech as text, "
+            "AND after you process it and call 'speak' with your reply, call 'converse' again to keep the "
+            "conversation going. This creates a natural voice chat loop. "
+            "Equivalent to calling 'listen' but signals conversational intent."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "seconds": {
+                    "type": "integer",
+                    "description": "Max recording duration in seconds (default 30).",
+                    "default": 30,
+                    "minimum": 1,
+                    "maximum": 30,
+                },
+                "mode": {
+                    "type": "string",
+                    "description": "STT mode (same as listen).",
+                    "enum": ["streaming", "vad", "whisper", "fixed"],
+                },
+            },
         },
     },
 ]
@@ -417,7 +574,7 @@ def handle_request(req):
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "azure-speech", "version": "1.0.0"},
+                "serverInfo": {"name": "azure-speech", "version": "2.0.0"},
             },
         }
     elif method == "notifications/initialized":
@@ -427,12 +584,15 @@ def handle_request(req):
     elif method == "tools/call":
         tool_name = params.get("name")
         args = params.get("arguments", {})
-        if tool_name == "listen":
+        if tool_name in ("listen", "converse"):
             result = stt(seconds=args.get("seconds"), mode=args.get("mode"))
             text = result.get("text", result.get("error", ""))
+            content_text = text or "(no speech detected)"
+            if tool_name == "converse":
+                content_text += "\n\n[Voice conversation active - speak your response using the 'speak' tool, then call 'converse' again to keep listening.]"
             return {
                 "jsonrpc": "2.0", "id": req_id,
-                "result": {"content": [{"type": "text", "text": text or "(no speech detected)"}]},
+                "result": {"content": [{"type": "text", "text": content_text}]},
             }
         elif tool_name == "speak":
             result = tts(args.get("text", ""))

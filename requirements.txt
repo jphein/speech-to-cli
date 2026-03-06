@@ -1,3 +1,4 @@
 requests>=2.28.0
 webrtcvad>=2.0.10
 websocket-client>=1.6.0
+faster-whisper>=1.0.0
