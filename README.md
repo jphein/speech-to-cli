@@ -4,7 +4,7 @@ Voice interface for AI coding assistants — talk to your CLI agent and hear it 
 
 ![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
-![License](https://img.shields.io/badge/license-MIT-green)
+![License](https://img.shields.io/badge/license-GPLv3-green)
 
 ## What it does
 
@@ -290,8 +290,8 @@ Use of GitHub Copilot CLI requires an active Copilot subscription and is subject
 ### This project
 This project is independently developed and is **not affiliated with, endorsed by, or sponsored by Microsoft or GitHub**. It is a third-party integration that connects to their respective APIs.
 
-Licensed under MIT — see [LICENSE](LICENSE).
+Licensed under the GNU General Public License v3.0 (GPLv3) — see [LICENSE](LICENSE).
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
+GNU General Public License v3.0 (GPLv3) — see [LICENSE](LICENSE) for details.
