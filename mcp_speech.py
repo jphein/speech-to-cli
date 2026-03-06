@@ -54,11 +54,18 @@ FRAME_MS = 30
 FRAME_BYTES = SAMPLE_RATE * 2 * FRAME_MS // 1000  # 960 bytes per 30ms frame
 
 # VAD + energy gate settings
-SILENCE_TIMEOUT = 0.75  # seconds of silence before stopping
+SILENCE_TIMEOUT = 0.5  # seconds of silence before stopping
+NO_SPEECH_TIMEOUT = 3.0  # bail out if no speech detected at all for this long
 MIN_SPEECH_DURATION = 0.15  # minimum speech before accepting silence
 VAD_AGGRESSIVENESS = 3  # 0-3, higher filters more non-speech
 ENERGY_CALIBRATION_FRAMES = 5  # ~0.15s of ambient noise sampling
 ENERGY_THRESHOLD_MULTIPLIER = 2.5  # speech must be Nx louder than ambient
+NOISE_CACHE_TTL = 30.0  # seconds before re-calibrating noise floor
+
+# Cached state for persistent connections and noise floor
+_cached_noise_threshold = None
+_cached_noise_time = 0.0
+_http_session = None
 
 
 def load_config():
@@ -76,6 +83,14 @@ def load_config():
 CONFIG = load_config()
 
 
+def get_http_session():
+    """Reuse HTTP session for connection pooling (saves ~150ms per TTS call)."""
+    global _http_session
+    if _http_session is None:
+        _http_session = requests.Session()
+    return _http_session
+
+
 # ---------------------------------------------------------------------------
 # Audio utilities
 # ---------------------------------------------------------------------------
@@ -90,7 +105,12 @@ def rms_energy(frame_bytes):
 
 
 def calibrate_noise(proc, n_frames=ENERGY_CALIBRATION_FRAMES):
-    """Read a few frames to estimate ambient noise energy. Returns (threshold, collected_frames)."""
+    """Estimate ambient noise energy. Uses cached threshold if fresh (saves ~150ms)."""
+    global _cached_noise_threshold, _cached_noise_time
+    if _cached_noise_threshold is not None and (time.time() - _cached_noise_time) < NOISE_CACHE_TTL:
+        chunk = proc.stdout.read(FRAME_BYTES)
+        frames = [chunk] if chunk and len(chunk) == FRAME_BYTES else []
+        return _cached_noise_threshold, frames
     energies = []
     frames = []
     for _ in range(n_frames):
@@ -100,9 +120,11 @@ def calibrate_noise(proc, n_frames=ENERGY_CALIBRATION_FRAMES):
         frames.append(chunk)
         energies.append(rms_energy(chunk))
     if not energies:
-        return 500.0, frames  # safe default
+        return 500.0, frames
     ambient = sum(energies) / len(energies)
     threshold = max(ambient * ENERGY_THRESHOLD_MULTIPLIER, 300.0)
+    _cached_noise_threshold = threshold
+    _cached_noise_time = time.time()
     return threshold, frames
 
 
@@ -141,20 +163,27 @@ def record_with_vad(proc, max_seconds):
     silence_frames = 0
     speech_frames = 0
     max_silence = int(SILENCE_TIMEOUT * 1000 / FRAME_MS)
+    max_no_speech = int(NO_SPEECH_TIMEOUT * 1000 / FRAME_MS)
     min_speech = int(MIN_SPEECH_DURATION * 1000 / FRAME_MS)
     max_frames = int(max_seconds * 1000 / FRAME_MS)
+    total_frames = 0
 
     for _ in range(max_frames):
         chunk = proc.stdout.read(FRAME_BYTES)
         if not chunk or len(chunk) < FRAME_BYTES:
             break
         frames.append(chunk)
+        total_frames += 1
         if is_speech_energy(chunk, vad, energy_threshold):
             speech_frames += 1
             silence_frames = 0
         else:
             silence_frames += 1
+        # Stop after silence following speech
         if speech_frames >= min_speech and silence_frames >= max_silence:
+            break
+        # Bail out if no speech detected at all for too long
+        if speech_frames == 0 and total_frames >= max_no_speech:
             break
 
     return frames, energy_threshold
@@ -263,7 +292,9 @@ def stt_streaming(max_seconds=30):
             vad = webrtcvad.Vad(VAD_AGGRESSIVENESS) if HAS_VAD else None
             silence_frames = 0
             speech_frames = 0
+            total_frames = 0
             max_silence = int(SILENCE_TIMEOUT * 1000 / FRAME_MS)
+            max_no_speech = int(NO_SPEECH_TIMEOUT * 1000 / FRAME_MS)
             min_speech = int(MIN_SPEECH_DURATION * 1000 / FRAME_MS)
 
             try:
@@ -274,12 +305,15 @@ def stt_streaming(max_seconds=30):
                     ws.send(make_audio_binary(chunk), opcode=websocket.ABNF.OPCODE_BINARY)
 
                     if len(chunk) == FRAME_BYTES:
+                        total_frames += 1
                         if is_speech_energy(chunk, vad, energy_threshold):
                             speech_frames += 1
                             silence_frames = 0
                         else:
                             silence_frames += 1
                         if speech_frames >= min_speech and silence_frames >= max_silence:
+                            break
+                        if speech_frames == 0 and total_frames >= max_no_speech:
                             break
             except Exception:
                 pass
@@ -337,7 +371,7 @@ def stt_vad(max_seconds=30):
             "Content-Type": "audio/wav; codecs=audio/pcm; samplerate=16000",
         }
         with open(tmp_path, "rb") as f:
-            resp = requests.post(url, params={"language": "en-US", "format": "detailed"},
+            resp = get_http_session().post(url, params={"language": "en-US", "format": "detailed"},
                                  headers=headers, data=f, timeout=30)
         if resp.status_code != 200:
             return {"error": f"Azure STT error {resp.status_code}"}
@@ -407,7 +441,7 @@ def stt_fixed(seconds=5):
             "Content-Type": "audio/wav; codecs=audio/pcm; samplerate=16000",
         }
         with open(tmp_path, "rb") as f:
-            resp = requests.post(url, params={"language": "en-US", "format": "detailed"},
+            resp = get_http_session().post(url, params={"language": "en-US", "format": "detailed"},
                                  headers=headers, data=f, timeout=30)
         if resp.status_code != 200:
             return {"error": f"Azure STT error {resp.status_code}"}
@@ -465,9 +499,9 @@ def tts(text):
     headers = {
         "Ocp-Apim-Subscription-Key": CONFIG["key"],
         "Content-Type": "application/ssml+xml",
-        "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
+        "X-Microsoft-OutputFormat": "audio-16khz-32kbitrate-mono-mp3",
     }
-    resp = requests.post(url, headers=headers, data=ssml.encode("utf-8"), timeout=60, stream=True)
+    resp = get_http_session().post(url, headers=headers, data=ssml.encode("utf-8"), timeout=60, stream=True)
     if resp.status_code != 200:
         return {"error": f"Azure TTS error {resp.status_code}"}
 
