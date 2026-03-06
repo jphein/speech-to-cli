@@ -646,23 +646,41 @@ def stt(seconds=None, mode=None, silence_timeout=None, vad_aggressiveness=None, 
 # TTS (streaming playback)
 # ---------------------------------------------------------------------------
 
-def tts(text, quality="fast", speed=1.0, voice=None):
+def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="default"):
     """Speak text aloud via Azure TTS with streaming playback.
     
     quality: 'fast' uses standard Neural voice (~120ms), 'hd' uses DragonHD (~1200ms).
     speed: playback speed multiplier (1.0 = normal, 1.2 = 20% faster).
     voice: override voice name (e.g. 'en-US-AvaNeural')
+    pitch: e.g. 'high', 'low', '+20%', '-10%', or 'default'
+    volume: e.g. 'loud', 'soft', '+10%', '-20%', or 'default'
     """
     if not voice:
         voice = CONFIG["fast_voice"] if quality == "fast" else CONFIG["voice"]
     
     safe_text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     url = f"https://{CONFIG['region']}.tts.speech.microsoft.com/cognitiveservices/v1"
-    # Use SSML prosody rate to generate faster speech in fast mode (smaller audio, faster playback)
+    
+    # Construct prosody tag with all modifiers
+    prosody_attrs = []
     if quality == "fast":
-        body_ssml = f'<prosody rate="+15%">{safe_text}</prosody>'
+        prosody_attrs.append('rate="+15%"')
+    elif speed != 1.0:
+        rate_pct = int((speed - 1.0) * 100)
+        sign = "+" if rate_pct >= 0 else ""
+        prosody_attrs.append(f'rate="{sign}{rate_pct}%"')
+    
+    if pitch != "default":
+        prosody_attrs.append(f'pitch="{pitch}"')
+    if volume != "default":
+        prosody_attrs.append(f'volume="{volume}"')
+    
+    prosody_str = " ".join(prosody_attrs)
+    if prosody_str:
+        body_ssml = f'<prosody {prosody_str}>{safe_text}</prosody>'
     else:
         body_ssml = safe_text
+
     ssml = (
         f'<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US">'
         f'<voice name="{voice}">{body_ssml}</voice></speak>'
@@ -674,14 +692,15 @@ def tts(text, quality="fast", speed=1.0, voice=None):
     }
     resp = get_http_session().post(url, headers=headers, data=ssml.encode("utf-8"), timeout=60, stream=True)
     if resp.status_code != 200:
-        return {"error": f"Azure TTS error {resp.status_code}"}
+        return {"error": f"Azure TTS error {resp.status_code}: {resp.text}"}
 
     play_speak()
 
     # Stream MP3 audio via mpv/ffplay for immediate playback
-    speed_args = ["--speed=" + str(speed)] if speed != 1.0 else []
+    # Note: speed_args here is for the local player, prosody rate is for the server-side generation
+    # We prefer server-side (prosody) for better quality.
     for player_cmd in [
-        ["mpv", "--no-terminal", "--no-video"] + speed_args + ["-"],
+        ["mpv", "--no-terminal", "--no-video", "-"],
         ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-i", "pipe:0"],
     ]:
         try:
@@ -717,6 +736,19 @@ def tts(text, quality="fast", speed=1.0, voice=None):
         pass
     play_done()
     return {"spoken": True, "chars": len(text)}
+
+
+def get_voices():
+    """Fetch available voices from Azure."""
+    url = f"https://{CONFIG['region']}.tts.speech.microsoft.com/cognitiveservices/voices/list"
+    headers = {"Ocp-Apim-Subscription-Key": CONFIG["key"]}
+    try:
+        resp = get_http_session().get(url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            return resp.json()
+        return {"error": f"Azure error {resp.status_code}"}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # ---------------------------------------------------------------------------
@@ -788,9 +820,22 @@ TOOLS = [
                     "description": "Playback speed multiplier (default 1.0).",
                     "default": 1.0,
                 },
+                "pitch": {
+                    "type": "string",
+                    "description": "Pitch: 'high', 'low', '+20%', or 'default'.",
+                },
+                "volume": {
+                    "type": "string",
+                    "description": "Volume: 'loud', 'soft', '+10%', or 'default'.",
+                },
             },
             "required": ["text"],
         },
+    },
+    {
+        "name": "get_voices",
+        "description": "List available Azure Speech voices for the current region.",
+        "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "converse",
@@ -831,7 +876,7 @@ def handle_request(req):
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {"listChanged": True}},
-                "serverInfo": {"name": "azure-speech", "version": "3.2.0"},
+                "serverInfo": {"name": "azure-speech", "version": "3.3.0"},
             },
         }
     elif method == "notifications/initialized":
@@ -862,12 +907,26 @@ def handle_request(req):
                 args.get("text", ""),
                 quality=args.get("quality", "fast"),
                 voice=args.get("voice"),
-                speed=args.get("speed", 1.0)
+                speed=args.get("speed", 1.0),
+                pitch=args.get("pitch", "default"),
+                volume=args.get("volume", "default")
             )
             msg = "Spoke the text aloud." if result.get("spoken") else result.get("error", "Failed")
             return {
                 "jsonrpc": "2.0", "id": req_id,
                 "result": {"content": [{"type": "text", "text": msg}]},
+            }
+        elif tool_name == "get_voices":
+            voices = get_voices()
+            if isinstance(voices, dict) and "error" in voices:
+                text = voices["error"]
+            else:
+                # Format a subset of info for brevity
+                lines = [f"{v['ShortName']} ({v['Gender']}, {v['LocaleName']})" for v in voices[:50]]
+                text = "Available voices (first 50):\n" + "\n".join(lines)
+            return {
+                "jsonrpc": "2.0", "id": req_id,
+                "result": {"content": [{"type": "text", "text": text}]},
             }
         else:
             return {
