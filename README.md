@@ -57,6 +57,17 @@ copilot          # launch and authenticate
 - Python 3.8+
 - An [Azure Speech Services](https://azure.microsoft.com/en-us/products/ai-services/speech-services) API key (free tier: 5 hours STT + 500K characters TTS per month)
 
+### Azure Speech HD voices
+
+This project defaults to **Azure HD (DragonHD) voices** — specifically `en-US-Ava:DragonHDLatestNeural`. These are Azure's highest-quality neural voices with natural intonation, breathing, and expressiveness that sounds remarkably human. You can change the voice via the `AZURE_SPEECH_VOICE` env var or config file.
+
+Browse all available voices in the [Azure Voice Gallery](https://speech.microsoft.com/portal/voicegallery). Look for voices tagged **HD** or **DragonHD** for the best quality.
+
+### Azure for nonprofits and education
+
+- **Nonprofits**: Microsoft offers up to **$3,500/year in free Azure credits** through [Azure for Nonprofits](https://nonprofit.microsoft.com/en-us/getting-started). This more than covers Speech Services usage for voice-enabled Copilot workflows.
+- **Students**: The [Azure for Students](https://azure.microsoft.com/en-us/free/students/) program provides **$100 in free credits** with no credit card required — just verify with your school email.
+
 ### Install
 
 ```bash
