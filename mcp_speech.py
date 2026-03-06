@@ -596,7 +596,7 @@ def stt_fixed(seconds=5):
             pass
 
 
-def stt(seconds=None, mode=None):
+def stt(seconds=None, mode=None, silence_timeout=None, vad_aggressiveness=None, energy_multiplier=None):
     """Speech-to-text with automatic mode selection.
 
     Modes: 'streaming', 'vad', 'whisper', 'fixed'.
@@ -604,39 +604,58 @@ def stt(seconds=None, mode=None):
     """
     max_seconds = min(seconds or 30, 30)
 
-    if mode is None:
-        if HAS_WS and HAS_VAD:
-            mode = "streaming"
-        elif HAS_VAD:
-            mode = "vad"
+    # Override defaults if provided
+    global SILENCE_TIMEOUT, VAD_AGGRESSIVENESS, ENERGY_THRESHOLD_MULTIPLIER
+    old_silence = SILENCE_TIMEOUT
+    old_vad = VAD_AGGRESSIVENESS
+    old_energy = ENERGY_THRESHOLD_MULTIPLIER
+
+    if silence_timeout is not None: SILENCE_TIMEOUT = silence_timeout
+    if vad_aggressiveness is not None: VAD_AGGRESSIVENESS = vad_aggressiveness
+    if energy_multiplier is not None: ENERGY_THRESHOLD_MULTIPLIER = energy_multiplier
+
+    try:
+        if mode is None:
+            if HAS_WS and HAS_VAD:
+                mode = "streaming"
+            elif HAS_VAD:
+                mode = "vad"
+            else:
+                mode = "fixed"
+
+        if mode == "streaming" and HAS_WS:
+            result = stt_streaming(max_seconds)
+        elif mode == "whisper" and HAS_WHISPER:
+            result = stt_whisper(max_seconds)
+        elif mode == "vad" and HAS_VAD:
+            result = stt_vad(max_seconds)
         else:
-            mode = "fixed"
+            result = stt_fixed(seconds or 5)
 
-    if mode == "streaming" and HAS_WS:
-        result = stt_streaming(max_seconds)
-    elif mode == "whisper" and HAS_WHISPER:
-        result = stt_whisper(max_seconds)
-    elif mode == "vad" and HAS_VAD:
-        result = stt_vad(max_seconds)
-    else:
-        result = stt_fixed(seconds or 5)
-
-    if result.get("text"):
-        play_processing()
-    return result
+        if result.get("text"):
+            play_processing()
+        return result
+    finally:
+        # Restore defaults
+        SILENCE_TIMEOUT = old_silence
+        VAD_AGGRESSIVENESS = old_vad
+        ENERGY_THRESHOLD_MULTIPLIER = old_energy
 
 
 # ---------------------------------------------------------------------------
 # TTS (streaming playback)
 # ---------------------------------------------------------------------------
 
-def tts(text, quality="fast", speed=1.0):
+def tts(text, quality="fast", speed=1.0, voice=None):
     """Speak text aloud via Azure TTS with streaming playback.
     
     quality: 'fast' uses standard Neural voice (~120ms), 'hd' uses DragonHD (~1200ms).
     speed: playback speed multiplier (1.0 = normal, 1.2 = 20% faster).
+    voice: override voice name (e.g. 'en-US-AvaNeural')
     """
-    voice = CONFIG["fast_voice"] if quality == "fast" else CONFIG["voice"]
+    if not voice:
+        voice = CONFIG["fast_voice"] if quality == "fast" else CONFIG["voice"]
+    
     safe_text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     url = f"https://{CONFIG['region']}.tts.speech.microsoft.com/cognitiveservices/v1"
     # Use SSML prosody rate to generate faster speech in fast mode (smaller audio, faster playback)
@@ -710,32 +729,43 @@ TOOLS = [
         "description": (
             "Record audio from the user's microphone and transcribe it to text. "
             "Uses energy-gated voice activity detection to stop automatically when the user "
-            "finishes speaking (ignores background noise). "
-            "Modes: 'streaming' (real-time Azure WebSocket, fastest), "
-            "'vad' (record then upload), 'whisper' (local, no network), 'fixed' (timed). "
-            "Default: best available."
+            "finishes speaking (ignores background noise)."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "seconds": {
                     "type": "integer",
-                    "description": "Max recording duration in seconds (default 30, max 30). With streaming/vad/whisper modes, recording stops early on silence.",
+                    "description": "Max recording duration (default 30).",
                     "default": 30,
                     "minimum": 1,
                     "maximum": 30,
                 },
                 "mode": {
                     "type": "string",
-                    "description": "STT mode: 'streaming' (fastest, real-time Azure), 'vad' (stop on silence, upload), 'whisper' (local, offline), 'fixed' (full duration). Default: best available.",
+                    "description": "STT mode: 'streaming' (fastest), 'vad', 'whisper', 'fixed'.",
                     "enum": ["streaming", "vad", "whisper", "fixed"],
+                },
+                "silence_timeout": {
+                    "type": "number",
+                    "description": "Seconds of silence before stopping (default 0.8).",
+                },
+                "vad_aggressiveness": {
+                    "type": "integer",
+                    "description": "VAD level 0-3 (3 is most aggressive, default 3).",
+                    "minimum": 0,
+                    "maximum": 3,
+                },
+                "energy_multiplier": {
+                    "type": "number",
+                    "description": "Energy threshold multiplier for noise gating (default 2.5).",
                 },
             },
         },
     },
     {
         "name": "speak",
-        "description": "Speak text aloud to the user using Azure Text-to-Speech with streaming playback. Use quality='fast' for conversation (10x faster) or 'hd' for DragonHD quality.",
+        "description": "Speak text aloud using Azure TTS.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -745,9 +775,18 @@ TOOLS = [
                 },
                 "quality": {
                     "type": "string",
-                    "description": "Voice quality: 'fast' (standard Neural, ~120ms) or 'hd' (DragonHD, ~1200ms). Default: fast.",
+                    "description": "Voice quality: 'fast' or 'hd'.",
                     "enum": ["fast", "hd"],
                     "default": "fast",
+                },
+                "voice": {
+                    "type": "string",
+                    "description": "Azure voice name (e.g. 'en-US-AvaNeural').",
+                },
+                "speed": {
+                    "type": "number",
+                    "description": "Playback speed multiplier (default 1.0).",
+                    "default": 1.0,
                 },
             },
             "required": ["text"],
@@ -756,25 +795,24 @@ TOOLS = [
     {
         "name": "converse",
         "description": (
-            "Have a voice conversation turn: listen to the user via microphone, return their speech as text, "
-            "AND after you process it and call 'speak' with your reply, call 'converse' again to keep the "
-            "conversation going. This creates a natural voice chat loop. "
-            "Equivalent to calling 'listen' but signals conversational intent."
+            "Have a voice conversation turn: listen to the user, return their speech as text, "
+            "and signal to continue the loop."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "seconds": {
                     "type": "integer",
-                    "description": "Max recording duration in seconds (default 30).",
+                    "description": "Max recording duration (default 30).",
                     "default": 30,
-                    "minimum": 1,
-                    "maximum": 30,
                 },
                 "mode": {
                     "type": "string",
-                    "description": "STT mode (same as listen).",
-                    "enum": ["streaming", "vad", "whisper", "fixed"],
+                    "description": "STT mode (streaming, vad, whisper, fixed).",
+                },
+                "silence_timeout": {
+                    "type": "number",
+                    "description": "Seconds of silence before stopping.",
                 },
             },
         },
@@ -793,7 +831,7 @@ def handle_request(req):
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {"listChanged": True}},
-                "serverInfo": {"name": "azure-speech", "version": "3.1.0"},
+                "serverInfo": {"name": "azure-speech", "version": "3.2.0"},
             },
         }
     elif method == "notifications/initialized":
@@ -804,7 +842,13 @@ def handle_request(req):
         tool_name = params.get("name")
         args = params.get("arguments", {})
         if tool_name in ("listen", "converse"):
-            result = stt(seconds=args.get("seconds"), mode=args.get("mode"))
+            result = stt(
+                seconds=args.get("seconds"),
+                mode=args.get("mode"),
+                silence_timeout=args.get("silence_timeout"),
+                vad_aggressiveness=args.get("vad_aggressiveness"),
+                energy_multiplier=args.get("energy_multiplier")
+            )
             text = result.get("text", result.get("error", ""))
             content_text = text or "(no speech detected)"
             if tool_name == "converse":
@@ -814,7 +858,12 @@ def handle_request(req):
                 "result": {"content": [{"type": "text", "text": content_text}]},
             }
         elif tool_name == "speak":
-            result = tts(args.get("text", ""), quality=args.get("quality", "fast"))
+            result = tts(
+                args.get("text", ""),
+                quality=args.get("quality", "fast"),
+                voice=args.get("voice"),
+                speed=args.get("speed", 1.0)
+            )
             msg = "Spoke the text aloud." if result.get("spoken") else result.get("error", "Failed")
             return {
                 "jsonrpc": "2.0", "id": req_id,
