@@ -1,6 +1,6 @@
 # speech-to-cli
 
-Voice interface for [GitHub Copilot CLI](https://docs.github.com/copilot/concepts/agents/about-copilot-cli) — talk to Copilot and hear it respond, powered by Azure Speech Services.
+Voice interface for AI coding assistants — talk to your CLI agent and hear it respond, powered by Azure Speech Services. Works with **GitHub Copilot CLI**, **Claude Code**, and **Gemini CLI**.
 
 ![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
@@ -12,7 +12,7 @@ This project adds voice input and output to your terminal AI workflow via the [M
 
 | Tool | Description |
 |------|-------------|
-| **MCP Server** (`mcp_speech.py`) | Integrates directly with Copilot CLI via MCP — gives Copilot `listen` and `speak` tools |
+| **MCP Server** (`mcp_speech.py`) | Integrates with Copilot CLI, Claude Code, and Gemini CLI via MCP — gives your AI `listen`, `speak`, and `converse` tools |
 | **Voice Chat** (`voice_chat.py`) | Standalone voice chat companion — runs in a second terminal alongside Copilot CLI |
 | **Speech-to-Text** (`speech.py`) | Simple mic → text → clipboard tool |
 | **Text-to-Speech** (`tts.py`) | Simple text → speech tool (reads from args, stdin, or clipboard) |
@@ -101,7 +101,11 @@ Or create a JSON config file at `~/.config/speech-to-cli/config.json`:
 
 ## Usage
 
-### MCP Server (recommended with Copilot CLI)
+### MCP Server (recommended)
+
+The MCP server works with any AI CLI that supports the Model Context Protocol.
+
+#### GitHub Copilot CLI
 
 Add to your `~/.copilot/mcp.json`:
 
@@ -116,7 +120,40 @@ Add to your `~/.copilot/mcp.json`:
 }
 ```
 
-Restart Copilot CLI — it will now have `listen`, `speak`, and `converse` tools available. Just say "listen" and Copilot will record your voice, transcribe it, and respond. Ask it to "speak" and it'll read its response aloud. Use "converse" for a continuous voice chat loop.
+#### Claude Code
+
+Option A — Use the included `.mcp.json` (auto-detected when working in the project directory).
+
+Option B — Add globally via the CLI:
+
+```bash
+claude mcp add --transport stdio azure-speech -- python3 /path/to/speech-to-cli/mcp_speech.py
+```
+
+#### Gemini CLI
+
+Install as a Gemini extension (uses the included `gemini-extension.json`):
+
+```bash
+gemini extensions install /path/to/speech-to-cli
+```
+
+Or add manually to your `~/.gemini/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "azure-speech": {
+      "command": "python3",
+      "args": ["/path/to/speech-to-cli/mcp_speech.py"]
+    }
+  }
+}
+```
+
+---
+
+Restart your CLI — it will now have `listen`, `speak`, and `converse` tools available. Just say "listen" and your AI will record your voice, transcribe it, and respond. Ask it to "speak" and it'll read its response aloud. Use "converse" for a continuous voice chat loop.
 
 **MCP Tools:**
 

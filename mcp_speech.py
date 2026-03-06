@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Azure Speech MCP Server for Copilot CLI.
+Azure Speech MCP Server — compatible with Copilot CLI, Claude Code, and Gemini CLI.
 
-Provides 'listen' (STT), 'speak' (TTS), and 'converse' tools so Copilot
+Provides 'listen' (STT), 'speak' (TTS), and 'converse' tools so AI assistants
 can have voice conversations.
 
 STT modes (selected automatically):
@@ -792,8 +792,8 @@ def handle_request(req):
             "jsonrpc": "2.0", "id": req_id,
             "result": {
                 "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "azure-speech", "version": "3.0.0"},
+                "capabilities": {"tools": {"listChanged": True}},
+                "serverInfo": {"name": "azure-speech", "version": "3.1.0"},
             },
         }
     elif method == "notifications/initialized":
@@ -825,9 +825,16 @@ def handle_request(req):
                 "jsonrpc": "2.0", "id": req_id,
                 "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"},
             }
+    # Methods that Claude Code / Gemini CLI may probe — return empty results
+    elif method in ("resources/list", "resources/templates/list",
+                     "prompts/list", "completion/complete"):
+        return {"jsonrpc": "2.0", "id": req_id, "result": {}}
     elif method == "ping":
         return {"jsonrpc": "2.0", "id": req_id, "result": {}}
+    elif method == "notifications/cancelled":
+        return None
     else:
+        # Ignore unknown notifications (no id); error on unknown requests
         if req_id is not None:
             return {
                 "jsonrpc": "2.0", "id": req_id,

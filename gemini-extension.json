@@ -1,0 +1,25 @@
+{
+  "name": "speech-to-cli",
+  "version": "3.1.0",
+  "description": "Voice interface for AI CLI assistants — listen, speak, and converse using Azure Speech Services.",
+  "mcpServers": {
+    "azure-speech": {
+      "command": "python3",
+      "args": ["${extensionPath}/mcp_speech.py"],
+      "cwd": "${extensionPath}"
+    }
+  },
+  "settings": [
+    {
+      "name": "Azure Speech Key",
+      "description": "Your Azure Cognitive Services Speech API key.",
+      "envVar": "AZURE_SPEECH_KEY",
+      "sensitive": true
+    },
+    {
+      "name": "Azure Speech Region",
+      "description": "Azure region for Speech Services (e.g. westus2).",
+      "envVar": "AZURE_SPEECH_REGION"
+    }
+  ]
+}
