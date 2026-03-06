@@ -152,18 +152,15 @@ _generate_chimes()
 
 
 def _play_sound(path):
-    """Play a WAV file non-blocking. Tries aplay first (fastest), falls back to mpv."""
-    if not os.path.exists(path):
-        return
-    for cmd in [
-        ["aplay", "-D", "default", "-q", path],
-        ["mpv", "--no-terminal", "--no-video", path],
-    ]:
+    """Play a WAV file non-blocking via aplay."""
+    if os.path.exists(path):
         try:
-            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return
+            subprocess.Popen(
+                ["aplay", "-D", "default", "-q", path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
         except FileNotFoundError:
-            continue
+            pass
 
 
 def play_chime():
