@@ -17,6 +17,15 @@ This project adds voice input and output to your terminal AI workflow via the [M
 | **Speech-to-Text** (`speech.py`) | Simple mic → text → clipboard tool |
 | **Text-to-Speech** (`tts.py`) | Simple text → speech tool (reads from args, stdin, or clipboard) |
 
+## Features
+
+- **Azure HD Voices**: Uses high-quality DragonHD voices for natural-sounding speech.
+- **Thinking Hum**: A subtle 150Hz tone that loops while the AI is processing.
+- **Visual Status**: Colorful indicators in your terminal (🎤 Listening, 🧠 Thinking).
+- **Audio Feedback**: Configurable chimes for ready, processing, speak, and done states.
+- **Low Latency**: Streaming playback and persistent connections for fast responses.
+- **VAD**: Energy-gated voice activity detection that auto-calibrates to your environment.
+
 ## About GitHub Copilot CLI
 
 [GitHub Copilot CLI](https://docs.github.com/copilot/concepts/agents/about-copilot-cli) brings agentic AI coding assistance directly to your terminal. It can edit files, run commands, search code, and interact with GitHub — all through natural language.
@@ -85,17 +94,39 @@ export AZURE_SPEECH_KEY="your-key-here"
 export AZURE_SPEECH_REGION="westus2"           # optional, default: westus2
 export AZURE_SPEECH_VOICE="en-US-Ava:DragonHDLatestNeural"  # optional
 ```
+Or create a JSON config file at `~/.config/speech-to-cli/config.json`. You can create the directory if it doesn't exist:
 
-Or create a JSON config file at `~/.config/speech-to-cli/config.json`:
+```bash
+mkdir -p ~/.config/speech-to-cli
+```
+
+Example `config.json`:
 
 ```json
 {
   "key": "your-azure-speech-key",
   "region": "westus2",
   "voice": "en-US-Ava:DragonHDLatestNeural",
-  "fast_voice": "en-US-AvaNeural"
+  "fast_voice": "en-US-AvaNeural",
+  "chime_hum": true,
+  "visual_indicator": true
 }
 ```
+
+### Configuration Settings
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `key` | None | Your Azure Speech Services API key. |
+| `region` | `westus2` | The Azure region for your speech resource. |
+| `voice` | `en-US-Ava:DragonHDLatestNeural` | Primary voice for high-quality (HD) synthesis. |
+| `fast_voice` | `en-US-AvaNeural` | Low-latency voice for fast responses. |
+| `chime_ready` | `true` | Play an ascending tone when the microphone opens. |
+| `chime_processing`| `false` | Play a short "blip" when speech is recognized. |
+| `chime_hum` | `false` | Start a looping 150Hz tone while thinking. |
+| `chime_speak` | `false` | Play a descending tone before starting to speak. |
+| `chime_done` | `false` | Play a double-tap tone when the AI is done talking. |
+| `visual_indicator`| `true` | Show status icons (🎤/🧠) in the terminal. |
 
 > ⚠️ **Never commit your API key.** Use environment variables or the config file (which is in your home directory, outside the repo). See [Security](#security) below.
 
