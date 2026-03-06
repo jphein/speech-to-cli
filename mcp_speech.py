@@ -114,11 +114,11 @@ def _prewarm():
 # ---------------------------------------------------------------------------
 
 def play_chime():
-    """Play a short ready chime to signal the user to speak."""
+    """Play a short ready chime (non-blocking, ~80ms audio)."""
     if os.path.exists(CHIME_PATH):
-        subprocess.run(
+        subprocess.Popen(
             ["aplay", "-D", "default", "-q", CHIME_PATH],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
 
 
@@ -268,6 +268,15 @@ def stt_streaming(max_seconds=30):
 
     def _do_streaming(ws, max_seconds):
         request_id = uuid.uuid4().hex
+
+        # Drain any stale messages from previous turn
+        try:
+            ws.settimeout(0.05)
+            while True:
+                ws.recv()
+        except Exception:
+            pass
+
         speech_config = {
             "context": {
                 "system": {"version": "1.0.00000"},
@@ -355,14 +364,17 @@ def stt_streaming(max_seconds=30):
 
         # Read responses until turn.end
         deadline = time.time() + max_seconds + 5
+        got_phrase = False
         while time.time() < deadline:
             try:
                 ws.settimeout(1.0)
                 msg = ws.recv()
             except websocket.WebSocketTimeoutException:
                 if sender_done.is_set():
+                    if got_phrase:
+                        break  # Already have result, don't wait longer
                     try:
-                        ws.settimeout(3.0)
+                        ws.settimeout(2.0)
                         msg = ws.recv()
                     except Exception:
                         break
@@ -382,6 +394,15 @@ def stt_streaming(max_seconds=30):
                         nbest = data.get("NBest", [])
                         text = nbest[0]["Display"] if nbest else data.get("DisplayText", "")
                         result_text.append(text)
+                    got_phrase = True
+                    # Early exit: if sender done, quick drain for turn.end
+                    if sender_done.is_set():
+                        try:
+                            ws.settimeout(0.5)
+                            end_msg = ws.recv()
+                        except Exception:
+                            pass
+                        break
                 elif "turn.end" in hdr.lower():
                     break
 
@@ -556,9 +577,14 @@ def tts(text, quality="fast", speed=1.0):
     voice = CONFIG["fast_voice"] if quality == "fast" else CONFIG["voice"]
     safe_text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     url = f"https://{CONFIG['region']}.tts.speech.microsoft.com/cognitiveservices/v1"
+    # Use SSML prosody rate to generate faster speech in fast mode (smaller audio, faster playback)
+    if quality == "fast":
+        body_ssml = f'<prosody rate="+15%">{safe_text}</prosody>'
+    else:
+        body_ssml = safe_text
     ssml = (
         f'<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US">'
-        f'<voice name="{voice}">{safe_text}</voice></speak>'
+        f'<voice name="{voice}">{body_ssml}</voice></speak>'
     )
     headers = {
         "Ocp-Apim-Subscription-Key": CONFIG["key"],
