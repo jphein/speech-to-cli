@@ -92,7 +92,8 @@ Or create a JSON config file at `~/.config/speech-to-cli/config.json`:
 {
   "key": "your-azure-speech-key",
   "region": "westus2",
-  "voice": "en-US-Ava:DragonHDLatestNeural"
+  "voice": "en-US-Ava:DragonHDLatestNeural",
+  "fast_voice": "en-US-AvaNeural"
 }
 ```
 
@@ -115,14 +116,31 @@ Add to your `~/.copilot/mcp.json`:
 }
 ```
 
-Restart Copilot CLI — it will now have `listen` and `speak` tools available. Just say "listen" and Copilot will record your voice, transcribe it, and respond. Ask it to "speak" and it'll read its response aloud.
+Restart Copilot CLI — it will now have `listen`, `speak`, and `converse` tools available. Just say "listen" and Copilot will record your voice, transcribe it, and respond. Ask it to "speak" and it'll read its response aloud. Use "converse" for a continuous voice chat loop.
 
 **MCP Tools:**
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| `listen` | `seconds` (1-30, default 5) | Records from mic, returns transcribed text |
-| `speak` | `text` (required) | Speaks text aloud via Azure TTS |
+| `listen` | `seconds` (1-30), `mode` (streaming/vad/whisper/fixed) | Records from mic, returns transcribed text |
+| `speak` | `text` (required), `quality` (fast/hd) | Speaks text aloud via Azure TTS |
+| `converse` | `seconds`, `mode` | Like `listen`, but signals conversational intent — Copilot will speak its reply then listen again |
+
+**STT Modes** (auto-selected by default):
+
+| Mode | Description |
+|------|-------------|
+| `streaming` | Real-time Azure WebSocket + energy-gated VAD (fastest, default) |
+| `vad` | Record with VAD, upload on silence |
+| `whisper` | Local transcription via faster-whisper (offline, no network) |
+| `fixed` | Record for full duration, then upload (fallback) |
+
+**TTS Quality:**
+
+| Quality | Voice | Azure latency | Best for |
+|---------|-------|--------------|----------|
+| `fast` (default) | AvaNeural | ~120ms | Conversation, quick responses |
+| `hd` | DragonHD | ~1200ms | High-quality narration |
 
 ### Voice Chat (standalone companion)
 
@@ -152,12 +170,15 @@ python3 tts.py  # speaks clipboard contents
 
 ## How it works
 
-- **Recording**: Uses `arecord` (ALSA) to capture 16kHz mono WAV audio from the default input device
-- **Speech-to-Text**: Sends audio to the [Azure STT REST API](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/rest-speech-to-text-short)
-- **Text-to-Speech**: Sends SSML to the [Azure TTS REST API](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/rest-text-to-speech), plays back via `aplay`
+- **Recording**: Uses `arecord` (ALSA) to capture 16kHz mono audio from the default input device
+- **Voice Activity Detection**: Energy-gated VAD auto-calibrates to ambient noise, stops recording on silence (~400ms after speech ends)
+- **Speech-to-Text**: Streams audio to Azure via persistent WebSocket for real-time recognition, with local Whisper fallback for offline use
+- **Text-to-Speech**: Sends SSML to Azure TTS REST API with HTTP connection pooling; streams MP3 audio through mpv for immediate playback
+- **Ready chime**: A short ascending tone plays before each recording so you know when to speak
+- **Performance**: Connections are pre-warmed on startup; noise floor is cached between calls; response latency is ~275ms from end of speech to first audio byte
 - **MCP Protocol**: Implements [MCP](https://modelcontextprotocol.io/) (v2024-11-05) over stdio JSON-RPC for direct Copilot CLI integration
 
-No Azure SDK required — just plain REST API calls.
+No Azure SDK required — just plain REST/WebSocket API calls.
 
 ## Security
 
@@ -180,7 +201,7 @@ This project handles audio data and API credentials. Please review:
 - Audio data and API keys are sent over encrypted connections only.
 
 ### MCP server scope
-- The MCP server only exposes two tools (`listen` and `speak`). It cannot read files, execute commands, or access anything beyond the microphone and Azure API.
+- The MCP server exposes three tools (`listen`, `speak`, `converse`). It cannot read files, execute commands, or access anything beyond the microphone and Azure API.
 - The server communicates with Copilot CLI over local stdio only — no network listeners are opened.
 
 ### Recommendations

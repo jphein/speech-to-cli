@@ -113,6 +113,33 @@ def _prewarm():
 # Audio utilities
 # ---------------------------------------------------------------------------
 
+def _generate_chime():
+    """Generate a short ascending two-tone chime WAV file if it doesn't exist."""
+    if os.path.exists(CHIME_PATH):
+        return
+    import wave
+    rate = 16000
+    samples = []
+    for freq, dur, vol in [(880, 0.03, 0.35), (1175, 0.05, 0.45)]:
+        for i in range(int(rate * dur)):
+            t = i / rate
+            env = min(1.0, min(t * 40, (dur - t) * 20))
+            samples.append(int(vol * env * math.sin(2 * math.pi * freq * t) * 32767))
+    raw = struct.pack(f"<{len(samples)}h", *samples)
+    try:
+        with open(CHIME_PATH, "wb") as f:
+            w = wave.open(f, "wb")
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(raw)
+            w.close()
+    except OSError:
+        pass
+
+_generate_chime()
+
+
 def play_chime():
     """Play a short ready chime (non-blocking, ~80ms audio)."""
     if os.path.exists(CHIME_PATH):
