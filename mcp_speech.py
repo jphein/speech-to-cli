@@ -47,6 +47,7 @@ except ImportError:
     HAS_WHISPER = False
 
 DEFAULTS_PATH = os.path.expanduser("~/.config/speech-to-cli/config.json")
+CHIME_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chime.wav")
 
 # Audio settings
 SAMPLE_RATE = 16000
@@ -54,7 +55,7 @@ FRAME_MS = 30
 FRAME_BYTES = SAMPLE_RATE * 2 * FRAME_MS // 1000  # 960 bytes per 30ms frame
 
 # VAD + energy gate settings
-SILENCE_TIMEOUT = 0.5  # seconds of silence before stopping
+SILENCE_TIMEOUT = 0.4  # seconds of silence before stopping
 NO_SPEECH_TIMEOUT = 3.0  # bail out if no speech detected at all for this long
 MIN_SPEECH_DURATION = 0.15  # minimum speech before accepting silence
 VAD_AGGRESSIVENESS = 3  # 0-3, higher filters more non-speech
@@ -80,6 +81,7 @@ def load_config():
         "key": os.environ.get("AZURE_SPEECH_KEY") or cfg.get("key"),
         "region": os.environ.get("AZURE_SPEECH_REGION") or cfg.get("region", "westus2"),
         "voice": os.environ.get("AZURE_SPEECH_VOICE") or cfg.get("voice", "en-US-Ava:DragonHDLatestNeural"),
+        "fast_voice": cfg.get("fast_voice", "en-US-AvaNeural"),
     }
 
 
@@ -94,9 +96,31 @@ def get_http_session():
     return _http_session
 
 
+def _prewarm():
+    """Pre-establish connections in background so first call is fast."""
+    try:
+        get_http_session()
+    except Exception:
+        pass
+    try:
+        if HAS_WS:
+            _get_stt_ws()  # noqa: defined below
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Audio utilities
 # ---------------------------------------------------------------------------
+
+def play_chime():
+    """Play a short ready chime to signal the user to speak."""
+    if os.path.exists(CHIME_PATH):
+        subprocess.run(
+            ["aplay", "-D", "default", "-q", CHIME_PATH],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2,
+        )
+
 
 def rms_energy(frame_bytes):
     """Calculate RMS energy of a 16-bit PCM frame."""
@@ -235,6 +259,10 @@ def _invalidate_stt_ws():
         _persistent_ws = None
 
 
+# Pre-warm connections in background on module load
+threading.Thread(target=_prewarm, daemon=True).start()
+
+
 def stt_streaming(max_seconds=30):
     """Real-time STT via persistent Azure WebSocket + energy-gated VAD."""
 
@@ -267,6 +295,7 @@ def stt_streaming(max_seconds=30):
             header_bytes = header_str.encode('ascii')
             return struct.pack('>H', len(header_bytes)) + header_bytes + audio_data
 
+        play_chime()
         proc = subprocess.Popen(
             ["arecord", "-D", "default", "-f", "S16_LE", "-r", "16000", "-c", "1",
              "-t", "raw", "-d", str(max_seconds)],
@@ -377,6 +406,7 @@ def stt_vad(max_seconds=30):
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp_path = tmp.name
     try:
+        play_chime()
         proc = subprocess.Popen(
             ["arecord", "-D", "default", "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "raw"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -420,6 +450,7 @@ def stt_whisper(max_seconds=30):
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp_path = tmp.name
     try:
+        play_chime()
         proc = subprocess.Popen(
             ["arecord", "-D", "default", "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "raw"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -456,6 +487,7 @@ def stt_fixed(seconds=5):
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp_path = tmp.name
     try:
+        play_chime()
         cmd = ["arecord", "-D", "default", "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "wav",
                "-d", str(seconds), tmp_path]
         subprocess.run(cmd, capture_output=True, timeout=seconds + 5)
@@ -515,13 +547,18 @@ def stt(seconds=None, mode=None):
 # TTS (streaming playback)
 # ---------------------------------------------------------------------------
 
-def tts(text):
-    """Speak text aloud via Azure TTS with streaming playback."""
+def tts(text, quality="fast", speed=1.0):
+    """Speak text aloud via Azure TTS with streaming playback.
+    
+    quality: 'fast' uses standard Neural voice (~120ms), 'hd' uses DragonHD (~1200ms).
+    speed: playback speed multiplier (1.0 = normal, 1.2 = 20% faster).
+    """
+    voice = CONFIG["fast_voice"] if quality == "fast" else CONFIG["voice"]
     safe_text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     url = f"https://{CONFIG['region']}.tts.speech.microsoft.com/cognitiveservices/v1"
     ssml = (
         f'<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US">'
-        f'<voice name="{CONFIG["voice"]}">{safe_text}</voice></speak>'
+        f'<voice name="{voice}">{safe_text}</voice></speak>'
     )
     headers = {
         "Ocp-Apim-Subscription-Key": CONFIG["key"],
@@ -532,10 +569,10 @@ def tts(text):
     if resp.status_code != 200:
         return {"error": f"Azure TTS error {resp.status_code}"}
 
-    # Stream MP3 audio via ffplay/mpv for immediate playback (no WAV header needed)
-    # Fall back to piping through ffmpeg→aplay if needed
+    # Stream MP3 audio via mpv/ffplay for immediate playback
+    speed_args = ["--speed=" + str(speed)] if speed != 1.0 else []
     for player_cmd in [
-        ["mpv", "--no-terminal", "--no-video", "-"],
+        ["mpv", "--no-terminal", "--no-video"] + speed_args + ["-"],
         ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-i", "pipe:0"],
     ]:
         try:
@@ -607,14 +644,20 @@ TOOLS = [
     },
     {
         "name": "speak",
-        "description": "Speak text aloud to the user using Azure Text-to-Speech with streaming playback. Starts playing audio as it downloads for lower latency.",
+        "description": "Speak text aloud to the user using Azure Text-to-Speech with streaming playback. Use quality='fast' for conversation (10x faster) or 'hd' for DragonHD quality.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "text": {
                     "type": "string",
                     "description": "The text to speak aloud",
-                }
+                },
+                "quality": {
+                    "type": "string",
+                    "description": "Voice quality: 'fast' (standard Neural, ~120ms) or 'hd' (DragonHD, ~1200ms). Default: fast.",
+                    "enum": ["fast", "hd"],
+                    "default": "fast",
+                },
             },
             "required": ["text"],
         },
@@ -659,7 +702,7 @@ def handle_request(req):
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "azure-speech", "version": "2.0.0"},
+                "serverInfo": {"name": "azure-speech", "version": "3.0.0"},
             },
         }
     elif method == "notifications/initialized":
@@ -680,7 +723,7 @@ def handle_request(req):
                 "result": {"content": [{"type": "text", "text": content_text}]},
             }
         elif tool_name == "speak":
-            result = tts(args.get("text", ""))
+            result = tts(args.get("text", ""), quality=args.get("quality", "fast"))
             msg = "Spoke the text aloud." if result.get("spoken") else result.get("error", "Failed")
             return {
                 "jsonrpc": "2.0", "id": req_id,
