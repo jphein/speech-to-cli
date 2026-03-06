@@ -54,10 +54,10 @@ FRAME_MS = 30
 FRAME_BYTES = SAMPLE_RATE * 2 * FRAME_MS // 1000  # 960 bytes per 30ms frame
 
 # VAD + energy gate settings
-SILENCE_TIMEOUT = 1.5  # seconds of silence before stopping
-MIN_SPEECH_DURATION = 0.3  # minimum speech before accepting silence
+SILENCE_TIMEOUT = 0.75  # seconds of silence before stopping
+MIN_SPEECH_DURATION = 0.15  # minimum speech before accepting silence
 VAD_AGGRESSIVENESS = 3  # 0-3, higher filters more non-speech
-ENERGY_CALIBRATION_FRAMES = 15  # ~0.5s of ambient noise sampling
+ENERGY_CALIBRATION_FRAMES = 5  # ~0.15s of ambient noise sampling
 ENERGY_THRESHOLD_MULTIPLIER = 2.5  # speech must be Nx louder than ambient
 
 
@@ -465,17 +465,41 @@ def tts(text):
     headers = {
         "Ocp-Apim-Subscription-Key": CONFIG["key"],
         "Content-Type": "application/ssml+xml",
-        "X-Microsoft-OutputFormat": "riff-24khz-16bit-mono-pcm",
+        "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
     }
     resp = requests.post(url, headers=headers, data=ssml.encode("utf-8"), timeout=60, stream=True)
     if resp.status_code != 200:
         return {"error": f"Azure TTS error {resp.status_code}"}
 
-    # Stream audio to aplay as chunks arrive - starts playing before download finishes
-    proc = subprocess.Popen(
-        ["aplay", "-D", "default", "-q", "-"],
-        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
+    # Stream MP3 audio via ffplay/mpv for immediate playback (no WAV header needed)
+    # Fall back to piping through ffmpeg→aplay if needed
+    for player_cmd in [
+        ["mpv", "--no-terminal", "--no-video", "-"],
+        ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-i", "pipe:0"],
+    ]:
+        try:
+            proc = subprocess.Popen(
+                player_cmd,
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            break
+        except FileNotFoundError:
+            continue
+    else:
+        # Fallback: aplay can't play MP3, so buffer and convert
+        import tempfile
+        audio_data = resp.content
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+            tmp.write(audio_data)
+            tmp_path = tmp.name
+        subprocess.run(["ffmpeg", "-y", "-i", tmp_path, "-f", "wav", "-acodec", "pcm_s16le", "-"],
+                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return {"spoken": True, "chars": len(text)}
+
     try:
         for chunk in resp.iter_content(chunk_size=4096):
             if chunk:
