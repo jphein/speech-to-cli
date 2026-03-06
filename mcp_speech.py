@@ -66,6 +66,9 @@ NOISE_CACHE_TTL = 30.0  # seconds before re-calibrating noise floor
 _cached_noise_threshold = None
 _cached_noise_time = 0.0
 _http_session = None
+_persistent_ws = None
+_persistent_ws_time = 0.0
+WS_IDLE_TIMEOUT = 540  # Azure closes at ~600s
 
 
 def load_config():
@@ -193,117 +196,109 @@ def record_with_vad(proc, max_seconds):
 # STT backends
 # ---------------------------------------------------------------------------
 
-def stt_streaming(max_seconds=30):
-    """Real-time STT via Azure WebSocket + energy-gated VAD."""
-    region = CONFIG["region"]
-    key = CONFIG["key"]
-    conn_id = uuid.uuid4().hex
-
-    ws_url = (
-        f"wss://{region}.stt.speech.microsoft.com/speech/recognition"
-        f"/conversation/cognitiveservices/v1?language=en-US&format=detailed"
-    )
-    ws_headers = {
-        "Ocp-Apim-Subscription-Key": key,
-        "X-ConnectionId": conn_id,
-    }
-
-    result = {"text": "", "done": False, "error": None}
-    lock = threading.Lock()
-
-    def on_message(ws, message):
+def _get_stt_ws():
+    """Get or create persistent WebSocket to Azure STT (saves ~230ms on reuse)."""
+    global _persistent_ws, _persistent_ws_time
+    now = time.time()
+    if _persistent_ws is not None and (now - _persistent_ws_time) < WS_IDLE_TIMEOUT:
+        _persistent_ws_time = now
+        return _persistent_ws
+    if _persistent_ws is not None:
         try:
-            if isinstance(message, str):
-                parts = message.split("\r\n\r\n", 1)
-                if len(parts) < 2:
-                    return
-                hdr, body = parts
-                if "speech.phrase" in hdr.lower():
-                    data = json.loads(body)
-                    if data.get("RecognitionStatus") == "Success":
-                        nbest = data.get("NBest", [])
-                        text = nbest[0]["Display"] if nbest else data.get("DisplayText", "")
-                        with lock:
-                            result["text"] = (result["text"] + " " + text).strip()
-                elif "turn.end" in hdr.lower():
-                    with lock:
-                        result["done"] = True
-                    ws.close()
+            _persistent_ws.close()
         except Exception:
             pass
+        _persistent_ws = None
+    region = CONFIG["region"]
+    key = CONFIG["key"]
+    _persistent_ws = websocket.create_connection(
+        f"wss://{region}.stt.speech.microsoft.com/speech/recognition"
+        f"/conversation/cognitiveservices/v1?language=en-US&format=detailed",
+        header=[
+            f"Ocp-Apim-Subscription-Key: {key}",
+            f"X-ConnectionId: {uuid.uuid4().hex}",
+        ],
+        timeout=10,
+    )
+    _persistent_ws_time = time.time()
+    return _persistent_ws
 
-    def on_error(ws, error):
-        with lock:
-            result["error"] = str(error)
-            result["done"] = True
 
-    def on_close(ws, status, msg):
-        with lock:
-            result["done"] = True
+def _invalidate_stt_ws():
+    """Close and discard the persistent WebSocket."""
+    global _persistent_ws
+    if _persistent_ws is not None:
+        try:
+            _persistent_ws.close()
+        except Exception:
+            pass
+        _persistent_ws = None
 
-    def on_open(ws):
-        def send_audio():
-            speech_config = {
-                "context": {
-                    "system": {"version": "1.0.00000"},
-                    "os": {"platform": "Linux", "name": "speech-to-cli"},
-                    "audio": {"source": {"connectivity": "Unknown", "manufacturer": "Unknown",
-                                         "model": "Unknown", "type": "Unknown"}},
-                }
+
+def stt_streaming(max_seconds=30):
+    """Real-time STT via persistent Azure WebSocket + energy-gated VAD."""
+
+    def _do_streaming(ws, max_seconds):
+        request_id = uuid.uuid4().hex
+        speech_config = {
+            "context": {
+                "system": {"version": "1.0.00000"},
+                "os": {"platform": "Linux", "name": "speech-to-cli"},
+                "audio": {"source": {"connectivity": "Unknown", "manufacturer": "Unknown",
+                                     "model": "Unknown", "type": "Unknown"}},
             }
-            request_id = uuid.uuid4().hex
-            config_msg = (
-                f"Path: speech.config\r\n"
+        }
+        config_msg = (
+            f"Path: speech.config\r\n"
+            f"X-RequestId: {request_id}\r\n"
+            f"X-Timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())}\r\n"
+            f"Content-Type: application/json\r\n\r\n"
+            + json.dumps(speech_config)
+        )
+        ws.send(config_msg)
+
+        def make_audio_binary(audio_data):
+            header_str = (
+                f"Path: audio\r\n"
                 f"X-RequestId: {request_id}\r\n"
                 f"X-Timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())}\r\n"
-                f"Content-Type: application/json\r\n\r\n"
-                + json.dumps(speech_config)
+                f"Content-Type: audio/x-wav\r\n"
             )
-            ws.send(config_msg)
+            header_bytes = header_str.encode('ascii')
+            return struct.pack('>H', len(header_bytes)) + header_bytes + audio_data
 
-            proc = subprocess.Popen(
-                ["arecord", "-D", "default", "-f", "S16_LE", "-r", "16000", "-c", "1",
-                 "-t", "raw", "-d", str(max_seconds)],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            )
+        proc = subprocess.Popen(
+            ["arecord", "-D", "default", "-f", "S16_LE", "-r", "16000", "-c", "1",
+             "-t", "raw", "-d", str(max_seconds)],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
 
-            def make_audio_binary(audio_data):
-                header_str = (
-                    f"Path: audio\r\n"
-                    f"X-RequestId: {request_id}\r\n"
-                    f"X-Timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())}\r\n"
-                    f"Content-Type: audio/x-wav\r\n"
-                )
-                header_bytes = header_str.encode('ascii')
-                return struct.pack('>H', len(header_bytes)) + header_bytes + audio_data
+        result_text = []
+        sender_done = threading.Event()
 
-            # Calibrate noise floor
-            energy_threshold, calibration_frames = calibrate_noise(proc)
-
-            # WAV header
-            wav_header = struct.pack('<4sI4s4sIHHIIHH4sI',
-                b'RIFF', 0, b'WAVE', b'fmt ', 16, 1, 1, 16000, 32000, 2, 16, b'data', 0)
-            ws.send(make_audio_binary(wav_header), opcode=websocket.ABNF.OPCODE_BINARY)
-
-            # Send calibration frames
-            for frame in calibration_frames:
-                ws.send(make_audio_binary(frame), opcode=websocket.ABNF.OPCODE_BINARY)
-
-            vad = webrtcvad.Vad(VAD_AGGRESSIVENESS) if HAS_VAD else None
-            silence_frames = 0
-            speech_frames = 0
-            total_frames = 0
-            max_silence = int(SILENCE_TIMEOUT * 1000 / FRAME_MS)
-            max_no_speech = int(NO_SPEECH_TIMEOUT * 1000 / FRAME_MS)
-            min_speech = int(MIN_SPEECH_DURATION * 1000 / FRAME_MS)
-
+        def send_audio():
             try:
-                while not result["done"]:
+                energy_threshold, calibration_frames = calibrate_noise(proc)
+                wav_header = struct.pack('<4sI4s4sIHHIIHH4sI',
+                    b'RIFF', 0, b'WAVE', b'fmt ', 16, 1, 1, 16000, 32000, 2, 16, b'data', 0)
+                ws.send(make_audio_binary(wav_header), opcode=websocket.ABNF.OPCODE_BINARY)
+
+                for frame in calibration_frames:
+                    ws.send(make_audio_binary(frame), opcode=websocket.ABNF.OPCODE_BINARY)
+
+                vad = webrtcvad.Vad(VAD_AGGRESSIVENESS) if HAS_VAD else None
+                silence_frames = 0
+                speech_frames = 0
+                total_frames = 0
+                max_silence = int(SILENCE_TIMEOUT * 1000 / FRAME_MS)
+                max_no_speech = int(NO_SPEECH_TIMEOUT * 1000 / FRAME_MS)
+                min_speech = int(MIN_SPEECH_DURATION * 1000 / FRAME_MS)
+
+                while True:
                     chunk = proc.stdout.read(FRAME_BYTES)
                     if not chunk:
                         break
                     ws.send(make_audio_binary(chunk), opcode=websocket.ABNF.OPCODE_BINARY)
-
                     if len(chunk) == FRAME_BYTES:
                         total_frames += 1
                         if is_speech_energy(chunk, vad, energy_threshold):
@@ -320,29 +315,61 @@ def stt_streaming(max_seconds=30):
             finally:
                 proc.terminate()
                 proc.wait()
+                try:
+                    ws.send(make_audio_binary(b""), opcode=websocket.ABNF.OPCODE_BINARY)
+                except Exception:
+                    pass
+                sender_done.set()
 
-            ws.send(make_audio_binary(b""), opcode=websocket.ABNF.OPCODE_BINARY)
+        sender = threading.Thread(target=send_audio, daemon=True)
+        sender.start()
 
-        threading.Thread(target=send_audio, daemon=True).start()
-
-    ws_app = websocket.WebSocketApp(
-        ws_url, header=ws_headers,
-        on_open=on_open, on_message=on_message,
-        on_error=on_error, on_close=on_close,
-    )
-    ws_thread = threading.Thread(target=ws_app.run_forever, daemon=True)
-    ws_thread.start()
-
-    deadline = time.time() + max_seconds + 5
-    while time.time() < deadline:
-        with lock:
-            if result["done"]:
+        # Read responses until turn.end
+        deadline = time.time() + max_seconds + 5
+        while time.time() < deadline:
+            try:
+                ws.settimeout(1.0)
+                msg = ws.recv()
+            except websocket.WebSocketTimeoutException:
+                if sender_done.is_set():
+                    try:
+                        ws.settimeout(3.0)
+                        msg = ws.recv()
+                    except Exception:
+                        break
+                else:
+                    continue
+            except Exception:
                 break
-        time.sleep(0.1)
 
-    if result["error"]:
-        return {"error": result["error"]}
-    return {"text": result["text"]}
+            if isinstance(msg, str):
+                parts = msg.split("\r\n\r\n", 1)
+                if len(parts) < 2:
+                    continue
+                hdr, body = parts
+                if "speech.phrase" in hdr.lower():
+                    data = json.loads(body)
+                    if data.get("RecognitionStatus") == "Success":
+                        nbest = data.get("NBest", [])
+                        text = nbest[0]["Display"] if nbest else data.get("DisplayText", "")
+                        result_text.append(text)
+                elif "turn.end" in hdr.lower():
+                    break
+
+        sender.join(timeout=2)
+        return " ".join(result_text).strip()
+
+    # Try persistent connection, retry once on failure
+    for attempt in range(2):
+        try:
+            ws = _get_stt_ws()
+            text = _do_streaming(ws, max_seconds)
+            return {"text": text}
+        except Exception as e:
+            _invalidate_stt_ws()
+            if attempt == 0:
+                continue
+            return {"error": str(e)}
 
 
 def stt_vad(max_seconds=30):
