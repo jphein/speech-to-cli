@@ -1,20 +1,53 @@
 # speech-to-cli
 
-Voice interface for GitHub Copilot CLI — talk to Copilot and hear it respond using Azure Speech Services.
+Voice interface for [GitHub Copilot CLI](https://docs.github.com/copilot/concepts/agents/about-copilot-cli) — talk to Copilot and hear it respond, powered by Azure Speech Services.
 
 ![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
+![License](https://img.shields.io/badge/license-MIT-green)
 
 ## What it does
 
-This project provides three ways to add voice to your CLI workflow:
+This project adds voice input and output to your terminal AI workflow via the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/):
 
 | Tool | Description |
 |------|-------------|
-| **MCP Server** (`mcp_speech.py`) | Integrates directly with Copilot CLI via MCP protocol — gives Copilot `listen` and `speak` tools |
+| **MCP Server** (`mcp_speech.py`) | Integrates directly with Copilot CLI via MCP — gives Copilot `listen` and `speak` tools |
 | **Voice Chat** (`voice_chat.py`) | Standalone voice chat companion — runs in a second terminal alongside Copilot CLI |
 | **Speech-to-Text** (`speech.py`) | Simple mic → text → clipboard tool |
 | **Text-to-Speech** (`tts.py`) | Simple text → speech tool (reads from args, stdin, or clipboard) |
+
+## About GitHub Copilot CLI
+
+[GitHub Copilot CLI](https://docs.github.com/copilot/concepts/agents/about-copilot-cli) brings agentic AI coding assistance directly to your terminal. It can edit files, run commands, search code, and interact with GitHub — all through natural language.
+
+### Available models
+
+Copilot CLI gives you access to multiple frontier models via the `/model` command:
+
+| Model | Tier |
+|-------|------|
+| Claude Sonnet 4.5 | Standard (default) |
+| Claude Sonnet 4 | Standard |
+| Claude Opus 4.5 | Premium |
+| Claude Opus 4.6 | Premium |
+| Claude Haiku 4.5 | Fast |
+| GPT-5.1 / 5.2 / 5.4 | Standard |
+| GPT-5.1-Codex / 5.2-Codex / 5.3-Codex | Standard |
+| GPT-5.1-Codex-Max | Standard |
+| GPT-5 mini | Fast |
+| Gemini 3 Pro (Preview) | Standard |
+
+### Free for students
+
+**GitHub Education** members get **Copilot Pro free for 1 year**, which includes Copilot CLI access. Sign up at [education.github.com](https://education.github.com/) with your school email — no credit card required. Each prompt uses one premium request from your monthly quota.
+
+### Install Copilot CLI
+
+```bash
+curl -fsSL https://gh.io/copilot-install | bash
+copilot          # launch and authenticate
+```
 
 ## Quick start
 
@@ -22,7 +55,7 @@ This project provides three ways to add voice to your CLI workflow:
 
 - Linux with ALSA audio (`arecord`/`aplay`)
 - Python 3.8+
-- An [Azure Speech Services](https://azure.microsoft.com/en-us/products/ai-services/speech-services) key (free tier works fine)
+- An [Azure Speech Services](https://azure.microsoft.com/en-us/products/ai-services/speech-services) API key (free tier: 5 hours STT + 500K characters TTS per month)
 
 ### Install
 
@@ -51,6 +84,8 @@ Or create a JSON config file at `~/.config/speech-to-cli/config.json`:
   "voice": "en-US-Ava:DragonHDLatestNeural"
 }
 ```
+
+> ⚠️ **Never commit your API key.** Use environment variables or the config file (which is in your home directory, outside the repo). See [Security](#security) below.
 
 ## Usage
 
@@ -109,10 +144,52 @@ python3 tts.py  # speaks clipboard contents
 - **Recording**: Uses `arecord` (ALSA) to capture 16kHz mono WAV audio from the default input device
 - **Speech-to-Text**: Sends audio to the [Azure STT REST API](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/rest-speech-to-text-short)
 - **Text-to-Speech**: Sends SSML to the [Azure TTS REST API](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/rest-text-to-speech), plays back via `aplay`
-- **MCP Protocol**: Implements the [Model Context Protocol](https://modelcontextprotocol.io/) (v2024-11-05) over stdio JSON-RPC for direct Copilot CLI integration
+- **MCP Protocol**: Implements [MCP](https://modelcontextprotocol.io/) (v2024-11-05) over stdio JSON-RPC for direct Copilot CLI integration
 
 No Azure SDK required — just plain REST API calls.
 
+## Security
+
+This project handles audio data and API credentials. Please review:
+
+### API key management
+- **Never hardcode your Azure key in source code or commit it to git.** The `.gitignore` includes `.env` to help prevent this.
+- Store your key via environment variable (`AZURE_SPEECH_KEY`) or in the user-level config file (`~/.config/speech-to-cli/config.json`).
+- Azure keys can be rotated at any time in the [Azure Portal](https://portal.azure.com/) → your Speech resource → Keys and Endpoint.
+- Consider using a restricted key with only Speech Services access (not a broad subscription key).
+
+### Audio and data privacy
+- **Audio is recorded from your local microphone** and sent to Azure Speech Services for processing. No audio is stored locally after transcription (temp files are deleted immediately).
+- **Azure processes your audio** to produce transcriptions. Review the [Azure AI Services data privacy policy](https://learn.microsoft.com/en-us/legal/cognitive-services/speech-service/speech-to-text/data-privacy-security) to understand how Microsoft handles your audio data.
+- **Text sent to TTS** is transmitted to Azure for synthesis. The same privacy policies apply.
+- **No data is sent anywhere other than Azure Speech Services** — there are no analytics, telemetry, or third-party services.
+
+### Network security
+- All Azure API calls use **HTTPS** (TLS encrypted in transit).
+- Audio data and API keys are sent over encrypted connections only.
+
+### MCP server scope
+- The MCP server only exposes two tools (`listen` and `speak`). It cannot read files, execute commands, or access anything beyond the microphone and Azure API.
+- The server communicates with Copilot CLI over local stdio only — no network listeners are opened.
+
+### Recommendations
+- Rotate your Azure key periodically.
+- Use Azure's free tier to limit potential cost exposure from a leaked key.
+- If running on a shared machine, be aware that other users with access to your environment variables or config file can read your API key.
+
+## Legal
+
+### Azure Speech Services
+Use of Azure Speech Services is subject to the [Microsoft Azure terms of service](https://azure.microsoft.com/en-us/support/legal/) and the [Azure AI Services terms](https://www.microsoft.com/licensing/terms/productoffering/MicrosoftAzure). You are responsible for your own Azure usage and billing.
+
+### GitHub Copilot
+Use of GitHub Copilot CLI requires an active Copilot subscription and is subject to the [GitHub Copilot terms](https://docs.github.com/en/site-policy/github-terms/github-terms-for-additional-products-and-features#github-copilot). Copilot is free for verified students, teachers, and maintainers of popular open-source projects.
+
+### This project
+This project is independently developed and is **not affiliated with, endorsed by, or sponsored by Microsoft or GitHub**. It is a third-party integration that connects to their respective APIs.
+
+Licensed under MIT — see [LICENSE](LICENSE).
+
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE) for details.

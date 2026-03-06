@@ -14,12 +14,14 @@ import sys
 import tempfile
 import requests
 
-DEFAULTS_PATH = os.path.expanduser("~/Projects/chap1/tts_defaults.json")
+DEFAULTS_PATH = os.path.expanduser("~/.config/speech-to-cli/config.json")
 
 
 def load_config():
-    with open(DEFAULTS_PATH) as f:
-        cfg = json.load(f)
+    cfg = {}
+    if os.path.exists(DEFAULTS_PATH):
+        with open(DEFAULTS_PATH) as f:
+            cfg = json.load(f)
     return {
         "key": os.environ.get("AZURE_SPEECH_KEY") or cfg.get("key"),
         "region": os.environ.get("AZURE_SPEECH_REGION") or cfg.get("region", "westus2"),
