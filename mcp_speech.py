@@ -59,7 +59,7 @@ FRAME_MS = 30
 FRAME_BYTES = SAMPLE_RATE * 2 * FRAME_MS // 1000  # 960 bytes per 30ms frame
 
 # VAD + energy gate settings
-SILENCE_TIMEOUT = 0.4  # seconds of silence before stopping
+SILENCE_TIMEOUT = 0.8  # seconds of silence before stopping
 NO_SPEECH_TIMEOUT = 3.0  # bail out if no speech detected at all for this long
 MIN_SPEECH_DURATION = 0.15  # minimum speech before accepting silence
 VAD_AGGRESSIVENESS = 3  # 0-3, higher filters more non-speech
