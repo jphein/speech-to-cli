@@ -204,6 +204,20 @@ def _get_tty():
     return _tty_fd
 
 
+def _get_tty_width():
+    """Attempt to get the true terminal width, bypassing pipes."""
+    import shutil
+    if "COLUMNS" in os.environ:
+        try: return int(os.environ["COLUMNS"])
+        except ValueError: pass
+    try:
+        with open("/dev/tty", "r") as tty:
+            return os.get_terminal_size(tty.fileno()).columns
+    except Exception:
+        pass
+    return shutil.get_terminal_size(fallback=(120, 24)).columns
+
+
 def _print_status(text, color_code="90"):
     """Print a status indicator to stderr."""
     if CONFIG.get("visual_indicator", True):
@@ -583,8 +597,11 @@ def stt_streaming(max_seconds=30, progress_token=None):
                     data = json.loads(body)
                     partial_text = data.get("Text", "")
                     if partial_text:
-                        # Truncate if too long so it fits in terminal UI nicely
-                        display_text = partial_text if len(partial_text) < 50 else "..." + partial_text[-47:]
+                        term_width = _get_tty_width()
+                        window_size = max(40, term_width - 25)
+                        
+                        # Truncate left side if too long so Gemini CLI doesn't right-truncate with "..."
+                        display_text = partial_text if len(partial_text) < window_size else "..." + partial_text[-(window_size-3):]
                         shared_state["partial"] = display_text
                 elif "turn.end" in hdr.lower():
                     break
@@ -889,11 +906,21 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
         bars = [" ", "▂", "▃", "▄", "▅"]
         last_pct = 0
         
-        # Prepare display text for speaking
-        display_text = text if len(text) < 50 else text[:47] + "..."
-        base_msg = f"Speaking: {display_text}" if CONFIG.get("live_subtitles", True) else "Speaking..."
+        # Prepare text for rolling display
+        total_len = len(text)
         
-        send_progress(progress_token, 0, 100, f"🔊 {base_msg}")
+        import shutil
+        try:
+            tty = _get_tty()
+            if tty and hasattr(tty, 'fileno'):
+                term_width = os.get_terminal_size(tty.fileno()).columns
+            else:
+                term_width = shutil.get_terminal_size((80, 24)).columns
+        except Exception:
+            term_width = 80
+            
+        # Subtract ~40 chars for progress bar UI overhead
+        window_size = max(30, term_width - 40)
         
         while proc.poll() is None:
             elapsed = time.time() - start_time
@@ -904,7 +931,24 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
             vu = random.choice(bars) if CONFIG.get("vu_meter", True) else ""
             vu_prefix = f"{vu} " if vu else ""
             
-            # Send updates frequently to animate the VU meter
+            # Create a typewriter text reveal effect
+            if CONFIG.get("live_subtitles", True) and total_len > 0:
+                # Estimate current character position
+                char_idx = int((current_pct / 100.0) * total_len)
+                
+                # Gemini CLI forces progress messages to a single line and adds "..." on the right
+                # if it exceeds terminal width. To see the *newest* words being spoken, we must 
+                # truncate the left side and only show the trailing window.
+                term_width = _get_tty_width()
+                window_size = max(40, term_width - 25)
+                
+                start_idx = max(0, char_idx - window_size)
+                snippet = text[start_idx:char_idx]
+                base_msg = f"Speaking: {snippet}"
+            else:
+                base_msg = "Speaking..."
+            
+            # Send updates frequently to animate the VU meter and rolling text
             send_progress(progress_token, current_pct, 100, f"🔊 {vu_prefix}{base_msg}")
             
             if current_pct > last_pct:
