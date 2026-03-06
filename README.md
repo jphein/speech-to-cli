@@ -136,7 +136,7 @@ Example `config.json`:
 
 ### MCP Server (recommended)
 
-The MCP server works with any AI CLI that supports the Model Context Protocol.
+The MCP server works with any AI CLI that supports the Model Context Protocol. **When paired with a modern terminal AI like Gemini CLI, Claude Code, or Copilot CLI, it creates an incredibly seamless voice loop.** The AI automatically invokes the `listen` tool when it needs input, processes your request, and calls the `speak` tool to respond—all while providing rich, real-time terminal UI feedback (like live subtitles and VU meters) without you ever needing to type a command.
 
 #### GitHub Copilot CLI
 
