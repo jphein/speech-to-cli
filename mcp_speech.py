@@ -456,6 +456,7 @@ def stt_streaming(max_seconds=30, progress_token=None):
 
         result_text = []
         sender_done = threading.Event()
+        shared_state = {"partial": "Listening..."}
 
         def send_audio():
             try:
@@ -477,6 +478,7 @@ def stt_streaming(max_seconds=30, progress_token=None):
 
                 max_frames = int(max_seconds * 1000 / FRAME_MS)
                 last_progress_pct = 0
+                bars = [" ", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
                 
                 while True:
                     chunk = proc.stdout.read(FRAME_BYTES)
@@ -488,8 +490,17 @@ def stt_streaming(max_seconds=30, progress_token=None):
                         
                         # Calculate progress incrementally (0% to 70% during listening)
                         current_pct = int((total_frames / max_frames) * 70)
-                        if current_pct > last_progress_pct:
-                            send_progress(progress_token, current_pct, 100, "🎤 Listening...")
+                        
+                        # Calculate VU meter
+                        energy = rms_energy(chunk)
+                        # typical energy ranges 0 to ~1500 for normal speech
+                        idx = max(0, min(7, int((energy / 1200.0) * 8)))
+                        vu = bars[idx]
+                        
+                        # Update UI with VU meter and partial text ~every 90ms (3 frames)
+                        if total_frames % 3 == 0 or current_pct > last_progress_pct:
+                            msg = f"🎤 {vu} {shared_state['partial']}"
+                            send_progress(progress_token, current_pct, 100, msg)
                             last_progress_pct = current_pct
                             
                         if is_speech_energy(chunk, vad, energy_threshold):
@@ -564,7 +575,7 @@ def stt_streaming(max_seconds=30, progress_token=None):
                     if partial_text:
                         # Truncate if too long so it fits in terminal UI nicely
                         display_text = partial_text if len(partial_text) < 50 else "..." + partial_text[-47:]
-                        send_progress(progress_token, 50, 100, f"🎤 {display_text}")
+                        shared_state["partial"] = display_text
                 elif "turn.end" in hdr.lower():
                     break
 

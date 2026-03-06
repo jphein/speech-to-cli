@@ -21,7 +21,7 @@ This project adds voice input and output to your terminal AI workflow via the [M
 
 - **Azure HD Voices**: Uses high-quality DragonHD voices for natural-sounding speech.
 - **Thinking Hum**: A subtle 150Hz tone that loops while the AI is processing.
-- **Visual Status**: Colorful indicators in your terminal (🎤 Listening, 🧠 Thinking).
+- **Visual Status**: Colorful progress bars with live VU meters and real-time subtitles (🎤/🧠/🔊).
 - **Audio Feedback**: Configurable chimes for ready, processing, speak, and done states.
 - **Low Latency**: Streaming playback and persistent connections for fast responses.
 - **VAD**: Energy-gated voice activity detection that auto-calibrates to your environment.
