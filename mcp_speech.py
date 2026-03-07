@@ -86,6 +86,7 @@ _cancel_event = threading.Event()
 _active_request_id = None  # tracks which request is currently running
 _active_procs = []  # subprocesses to kill on cancel
 _active_procs_lock = threading.Lock()
+_pause_event = threading.Event()  # set = paused, clear = running
 
 
 def is_cancelled():
@@ -111,10 +112,35 @@ def unregister_proc(proc):
 def cancel_active():
     """Kill all tracked subprocesses and signal cancellation."""
     _cancel_event.set()
+    _pause_event.clear()  # unpause first so loops can exit
     with _active_procs_lock:
         for proc in _active_procs:
             try:
                 proc.terminate()
+            except Exception:
+                pass
+
+
+def pause_active():
+    """Pause all tracked subprocesses via SIGSTOP."""
+    import signal as _sig
+    _pause_event.set()
+    with _active_procs_lock:
+        for proc in _active_procs:
+            try:
+                os.kill(proc.pid, _sig.SIGSTOP)
+            except Exception:
+                pass
+
+
+def resume_active():
+    """Resume all tracked subprocesses via SIGCONT."""
+    import signal as _sig
+    _pause_event.clear()
+    with _active_procs_lock:
+        for proc in _active_procs:
+            try:
+                os.kill(proc.pid, _sig.SIGCONT)
             except Exception:
                 pass
 
@@ -1004,13 +1030,26 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
         bars = [" ", "▂", "▃", "▄", "▅"]
         total_len = len(text)
         last_msg = ""
+        current_pct = 0
         show_vu = CONFIG.get("vu_meter", True)
         show_subs = CONFIG.get("live_subtitles", True)
 
+        pause_start = None
         while proc.poll() is None:
             if is_cancelled():
                 proc.terminate()
                 break
+
+            if _pause_event.is_set():
+                if pause_start is None:
+                    pause_start = time.time()
+                    send_progress(progress_token, current_pct, 100, "⏸ Paused")
+                time.sleep(0.2)
+                continue
+            elif pause_start is not None:
+                # Subtract paused time from elapsed calculation
+                start_time += time.time() - pause_start
+                pause_start = None
 
             elapsed = time.time() - start_time
             current_pct = int(min(1.0, elapsed / estimated_duration) * 100)
@@ -1233,6 +1272,23 @@ TOOLS = [
             },
             "required": ["text"],
         },
+    },
+    {
+        "name": "pause",
+        "description": (
+            "Pause whatever is currently happening — freezes audio playback or recording in place. "
+            "Call 'resume' to pick up exactly where it left off. "
+            "Use this when the user says 'pause', 'hold on', 'wait', or 'stop for a sec'."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "resume",
+        "description": (
+            "Resume after a pause — unfreezes audio playback or recording from where it stopped. "
+            "Call this when the user says 'resume', 'continue', 'go ahead', or 'unpause'."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
     },
 ]
 
@@ -1495,7 +1551,7 @@ def _write_response(resp):
 
 
 def _stdin_reader():
-    """Read stdin in a background thread, routing cancellations immediately."""
+    """Read stdin in a background thread, routing urgent requests immediately."""
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -1506,10 +1562,29 @@ def _stdin_reader():
             continue
 
         method = req.get("method")
+        req_id = req.get("id")
+
         if method == "notifications/cancelled":
-            # Handle cancellation immediately without queuing
             cancel_active()
             continue
+
+        # Handle pause/resume immediately (don't queue — they must execute mid-operation)
+        if method == "tools/call":
+            tool_name = req.get("params", {}).get("name")
+            if tool_name == "pause":
+                pause_active()
+                _write_response({
+                    "jsonrpc": "2.0", "id": req_id,
+                    "result": {"content": [{"type": "text", "text": "Paused. Call 'resume' to continue."}]},
+                })
+                continue
+            elif tool_name == "resume":
+                resume_active()
+                _write_response({
+                    "jsonrpc": "2.0", "id": req_id,
+                    "result": {"content": [{"type": "text", "text": "Resumed."}]},
+                })
+                continue
 
         # Queue everything else for the main processing thread
         with _request_cond:
