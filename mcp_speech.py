@@ -14,9 +14,13 @@ STT modes (selected automatically):
 TTS: Streams audio playback as chunks arrive from Azure for lower latency.
 """
 
+import array
 import json
 import math
 import os
+import random
+import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -204,18 +208,32 @@ def _get_tty():
     return _tty_fd
 
 
+_cached_tty_width = None
+_cached_tty_width_time = 0.0
+
 def _get_tty_width():
-    """Attempt to get the true terminal width, bypassing pipes."""
-    import shutil
+    """Get terminal width, cached for 2s to avoid repeated /dev/tty opens."""
+    global _cached_tty_width, _cached_tty_width_time
+    now = time.monotonic()
+    if _cached_tty_width is not None and (now - _cached_tty_width_time) < 2.0:
+        return _cached_tty_width
+    width = 120
     if "COLUMNS" in os.environ:
-        try: return int(os.environ["COLUMNS"])
-        except ValueError: pass
+        try:
+            width = int(os.environ["COLUMNS"])
+            _cached_tty_width = width
+            _cached_tty_width_time = now
+            return width
+        except ValueError:
+            pass
     try:
         with open("/dev/tty", "r") as tty:
-            return os.get_terminal_size(tty.fileno()).columns
+            width = os.get_terminal_size(tty.fileno()).columns
     except Exception:
-        pass
-    return shutil.get_terminal_size(fallback=(120, 24)).columns
+        width = shutil.get_terminal_size(fallback=(120, 24)).columns
+    _cached_tty_width = width
+    _cached_tty_width_time = now
+    return width
 
 
 def _print_status(text, color_code="90"):
@@ -241,12 +259,11 @@ def play_processing():
         
     if CONFIG.get("chime_hum", False):
         _print_status("🧠 Thinking...", "94")  # Blue
-        # Start the looping hum
         try:
             _hum_proc = subprocess.Popen(
-                ["bash", "-c", f"while true; do aplay -D default -q {CHIME_HUM}; done"],
+                ["bash", "-c", "while true; do aplay -D default -q -- \"$1\"; done", "_", CHIME_HUM],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                start_new_session=True # Ensure we can kill the whole process group
+                start_new_session=True,
             )
         except Exception:
             pass
@@ -279,12 +296,13 @@ def play_done():
 
 
 def rms_energy(frame_bytes):
-    """Calculate RMS energy of a 16-bit PCM frame."""
+    """Calculate RMS energy of a 16-bit PCM frame (array module for speed)."""
     n_samples = len(frame_bytes) // 2
     if n_samples == 0:
         return 0.0
-    samples = struct.unpack(f"<{n_samples}h", frame_bytes[:n_samples * 2])
-    return math.sqrt(sum(s * s for s in samples) / n_samples)
+    a = array.array("h")
+    a.frombytes(frame_bytes[:n_samples * 2])
+    return math.sqrt(sum(s * s for s in a) / n_samples)
 
 
 def calibrate_noise(proc, n_frames=ENERGY_CALIBRATION_FRAMES):
@@ -750,71 +768,85 @@ def stt_fixed(seconds=5, progress_token=None):
             pass
 
 
+_stt_lock = threading.Lock()
+
 def stt(seconds=None, mode=None, silence_timeout=None, vad_aggressiveness=None, energy_multiplier=None, progress_token=None):
-    """Speech-to-text with automatic mode selection.
+    """Speech-to-text with automatic mode selection."""
+    max_seconds = max(1, min(int(seconds or 30), 30))
 
-    Modes: 'streaming', 'vad', 'whisper', 'fixed'.
-    If mode is None, picks the best available.
-    """
-    max_seconds = min(seconds or 30, 30)
+    with _stt_lock:
+        global SILENCE_TIMEOUT, VAD_AGGRESSIVENESS, ENERGY_THRESHOLD_MULTIPLIER
+        old_silence = SILENCE_TIMEOUT
+        old_vad = VAD_AGGRESSIVENESS
+        old_energy = ENERGY_THRESHOLD_MULTIPLIER
 
-    # Override defaults if provided
-    global SILENCE_TIMEOUT, VAD_AGGRESSIVENESS, ENERGY_THRESHOLD_MULTIPLIER
-    old_silence = SILENCE_TIMEOUT
-    old_vad = VAD_AGGRESSIVENESS
-    old_energy = ENERGY_THRESHOLD_MULTIPLIER
+        if silence_timeout is not None:
+            SILENCE_TIMEOUT = max(0.1, min(float(silence_timeout), 10.0))
+        if vad_aggressiveness is not None:
+            VAD_AGGRESSIVENESS = max(0, min(int(vad_aggressiveness), 3))
+        if energy_multiplier is not None:
+            ENERGY_THRESHOLD_MULTIPLIER = max(0.5, min(float(energy_multiplier), 20.0))
 
-    if silence_timeout is not None: SILENCE_TIMEOUT = silence_timeout
-    if vad_aggressiveness is not None: VAD_AGGRESSIVENESS = vad_aggressiveness
-    if energy_multiplier is not None: ENERGY_THRESHOLD_MULTIPLIER = energy_multiplier
+        try:
+            if mode is None:
+                if HAS_WS and HAS_VAD:
+                    mode = "streaming"
+                elif HAS_VAD:
+                    mode = "vad"
+                else:
+                    mode = "fixed"
 
-    try:
-        if mode is None:
-            if HAS_WS and HAS_VAD:
-                mode = "streaming"
-            elif HAS_VAD:
-                mode = "vad"
+            if mode == "streaming" and HAS_WS:
+                result = stt_streaming(max_seconds, progress_token=progress_token)
+            elif mode == "whisper" and HAS_WHISPER:
+                result = stt_whisper(max_seconds, progress_token=progress_token)
+            elif mode == "vad" and HAS_VAD:
+                result = stt_vad(max_seconds, progress_token=progress_token)
             else:
-                mode = "fixed"
+                result = stt_fixed(max_seconds, progress_token=progress_token)
 
-        if mode == "streaming" and HAS_WS:
-            result = stt_streaming(max_seconds, progress_token=progress_token)
-        elif mode == "whisper" and HAS_WHISPER:
-            result = stt_whisper(max_seconds, progress_token=progress_token)
-        elif mode == "vad" and HAS_VAD:
-            result = stt_vad(max_seconds, progress_token=progress_token)
-        else:
-            result = stt_fixed(seconds or 5, progress_token=progress_token)
-
-        if result.get("text"):
-            play_processing()
-        return result
-    finally:
-        # Restore defaults
-        SILENCE_TIMEOUT = old_silence
-        VAD_AGGRESSIVENESS = old_vad
-        ENERGY_THRESHOLD_MULTIPLIER = old_energy
+            if result.get("text"):
+                play_processing()
+            return result
+        finally:
+            SILENCE_TIMEOUT = old_silence
+            VAD_AGGRESSIVENESS = old_vad
+            ENERGY_THRESHOLD_MULTIPLIER = old_energy
 
 
 # ---------------------------------------------------------------------------
 # TTS (streaming playback)
 # ---------------------------------------------------------------------------
 
+_SSML_SAFE_RE = re.compile(r'^[a-zA-Z0-9\-_.:+%() ]+$')
+
+def _sanitize_ssml_attr(value, default="default"):
+    """Reject values that could inject SSML markup."""
+    if not value or not isinstance(value, str):
+        return default
+    value = value.strip()[:64]
+    if not _SSML_SAFE_RE.match(value):
+        return default
+    return value
+
+_MAX_TTS_CHARS = 5000
+
 def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="default", progress_token=None):
-    """Speak text aloud via Azure TTS with streaming playback.
-    
-    quality: 'fast' uses standard Neural voice (~120ms), 'hd' uses DragonHD (~1200ms).
-    speed: playback speed multiplier (1.0 = normal, 1.2 = 20% faster).
-    voice: override voice name (e.g. 'en-US-AvaNeural')
-    pitch: e.g. 'high', 'low', '+20%', '-10%', or 'default'
-    volume: e.g. 'loud', 'soft', '+10%', '-20%', or 'default'
-    """
+    """Speak text aloud via Azure TTS with streaming playback."""
     stop_hum()
     send_progress(progress_token, 0, 100, "🔊 Synthesizing...")
+
+    if not text or not isinstance(text, str):
+        return {"error": "No text provided"}
+    text = text[:_MAX_TTS_CHARS]
+
     if not voice:
         voice = CONFIG["fast_voice"] if quality == "fast" else CONFIG["voice"]
-    
-    safe_text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    voice = _sanitize_ssml_attr(voice, CONFIG["fast_voice"])
+    pitch = _sanitize_ssml_attr(pitch, "default")
+    volume = _sanitize_ssml_attr(volume, "default")
+
+    safe_text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
     url = f"https://{CONFIG['region']}.tts.speech.microsoft.com/cognitiveservices/v1"
     
     # Construct prosody tag with all modifiers
@@ -891,69 +923,42 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
         
         def download_audio():
             try:
-                for chunk in resp.iter_content(chunk_size=4096):
+                for chunk in resp.iter_content(chunk_size=16384):
                     if chunk:
                         proc.stdin.write(chunk)
                 proc.stdin.close()
             except Exception:
                 pass
-                
-        # Start download in background
-        dl_thread = threading.Thread(target=download_audio)
+
+        dl_thread = threading.Thread(target=download_audio, daemon=True)
         dl_thread.start()
-        
-        import random
+
         bars = [" ", "▂", "▃", "▄", "▅"]
-        last_pct = 0
-        
-        # Prepare text for rolling display
         total_len = len(text)
-        
-        import shutil
-        try:
-            tty = _get_tty()
-            if tty and hasattr(tty, 'fileno'):
-                term_width = os.get_terminal_size(tty.fileno()).columns
-            else:
-                term_width = shutil.get_terminal_size((80, 24)).columns
-        except Exception:
-            term_width = 80
-            
-        # Subtract ~40 chars for progress bar UI overhead
-        window_size = max(30, term_width - 40)
-        
+        last_msg = ""
+        show_vu = CONFIG.get("vu_meter", True)
+        show_subs = CONFIG.get("live_subtitles", True)
+
         while proc.poll() is None:
             elapsed = time.time() - start_time
-            # Allow progress to reach 100% naturally while playing
             current_pct = int(min(1.0, elapsed / estimated_duration) * 100)
-            
-            # Simulated VU meter that animates while playing
-            vu = random.choice(bars) if CONFIG.get("vu_meter", True) else ""
-            vu_prefix = f"{vu} " if vu else ""
-            
-            # Create a typewriter text reveal effect
-            if CONFIG.get("live_subtitles", True) and total_len > 0:
-                # Estimate current character position
+
+            vu_prefix = f"{random.choice(bars)} " if show_vu else ""
+
+            if show_subs and total_len > 0:
                 char_idx = int((current_pct / 100.0) * total_len)
-                
-                # Gemini CLI forces progress messages to a single line and adds "..." on the right
-                # if it exceeds terminal width. To see the *newest* words being spoken, we must 
-                # truncate the left side and only show the trailing window.
-                term_width = _get_tty_width()
-                window_size = max(40, term_width - 25)
-                
+                window_size = max(40, _get_tty_width() - 25)
                 start_idx = max(0, char_idx - window_size)
                 snippet = text[start_idx:char_idx]
                 base_msg = f"Speaking: {snippet}"
             else:
                 base_msg = "Speaking..."
-            
-            # Send updates frequently to animate the VU meter and rolling text
-            send_progress(progress_token, current_pct, 100, f"🔊 {vu_prefix}{base_msg}")
-            
-            if current_pct > last_pct:
-                last_pct = current_pct
-                
+
+            msg = f"🔊 {vu_prefix}{base_msg}"
+            if msg != last_msg or show_vu:
+                send_progress(progress_token, current_pct, 100, msg)
+                last_msg = msg
+
             time.sleep(0.1)
             
         dl_thread.join()
@@ -1128,7 +1133,7 @@ def handle_request(req):
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {"listChanged": True}},
-                "serverInfo": {"name": "azure-speech", "version": "3.3.0"},
+                "serverInfo": {"name": "azure-speech", "version": "3.4.0"},
             },
         }
     elif method == "notifications/initialized":
@@ -1156,11 +1161,24 @@ def handle_request(req):
                 "result": {"content": [{"type": "text", "text": content_text}]},
             }
         elif tool_name == "speak":
+            speak_text = args.get("text", "")
+            if not speak_text or not isinstance(speak_text, str):
+                return {
+                    "jsonrpc": "2.0", "id": req_id,
+                    "result": {"content": [{"type": "text", "text": "Error: 'text' is required."}]},
+                }
+            quality = args.get("quality", "fast")
+            if quality not in ("fast", "hd"):
+                quality = "fast"
+            speed_val = args.get("speed", 1.0)
+            if not isinstance(speed_val, (int, float)):
+                speed_val = 1.0
+            speed_val = max(0.5, min(float(speed_val), 3.0))
             result = tts(
-                args.get("text", ""),
-                quality=args.get("quality", "fast"),
+                speak_text,
+                quality=quality,
                 voice=args.get("voice"),
-                speed=args.get("speed", 1.0),
+                speed=speed_val,
                 pitch=args.get("pitch", "default"),
                 volume=args.get("volume", "default"),
                 progress_token=progress_token
@@ -1230,6 +1248,7 @@ def handle_request(req):
                 }
             }
         elif uri == "speech://config-schema":
+            safe_config = {k: ("***" if k == "key" else v) for k, v in CONFIG.items()}
             return {
                 "jsonrpc": "2.0", "id": req_id,
                 "result": {
@@ -1237,7 +1256,7 @@ def handle_request(req):
                         {
                             "uri": uri,
                             "mimeType": "application/json",
-                            "text": json.dumps(CONFIG, indent=2)
+                            "text": json.dumps(safe_config, indent=2)
                         }
                     ]
                 }
