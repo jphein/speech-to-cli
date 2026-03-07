@@ -81,6 +81,43 @@ _persistent_ws_time = 0.0
 _hum_proc = None
 WS_IDLE_TIMEOUT = 540  # Azure closes at ~600s
 
+# Cancellation support — set by the stdin reader thread when notifications/cancelled arrives
+_cancel_event = threading.Event()
+_active_request_id = None  # tracks which request is currently running
+_active_procs = []  # subprocesses to kill on cancel
+_active_procs_lock = threading.Lock()
+
+
+def is_cancelled():
+    """Check if the current operation has been cancelled."""
+    return _cancel_event.is_set()
+
+
+def register_proc(proc):
+    """Track a subprocess so it can be killed on cancellation."""
+    with _active_procs_lock:
+        _active_procs.append(proc)
+
+
+def unregister_proc(proc):
+    """Stop tracking a subprocess."""
+    with _active_procs_lock:
+        try:
+            _active_procs.remove(proc)
+        except ValueError:
+            pass
+
+
+def cancel_active():
+    """Kill all tracked subprocesses and signal cancellation."""
+    _cancel_event.set()
+    with _active_procs_lock:
+        for proc in _active_procs:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
 
 def load_config():
     cfg = {}
@@ -370,6 +407,8 @@ def record_with_vad(proc, max_seconds):
     total_frames = 0
 
     for _ in range(max_frames):
+        if is_cancelled():
+            break
         chunk = proc.stdout.read(FRAME_BYTES)
         if not chunk or len(chunk) < FRAME_BYTES:
             break
@@ -487,6 +526,7 @@ def stt_streaming(max_seconds=30, progress_token=None):
              "-t", "raw", "-d", str(max_seconds)],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
+        register_proc(proc)
 
         result_text = []
         sender_done = threading.Event()
@@ -515,6 +555,8 @@ def stt_streaming(max_seconds=30, progress_token=None):
                 bars = [" ", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
                 
                 while True:
+                    if is_cancelled():
+                        break
                     chunk = proc.stdout.read(FRAME_BYTES)
                     if not chunk:
                         break
@@ -560,6 +602,7 @@ def stt_streaming(max_seconds=30, progress_token=None):
             finally:
                 proc.terminate()
                 proc.wait()
+                unregister_proc(proc)
                 try:
                     ws.send(make_audio_binary(b""), opcode=websocket.ABNF.OPCODE_BINARY)
                 except Exception:
@@ -572,7 +615,7 @@ def stt_streaming(max_seconds=30, progress_token=None):
         # Read responses until turn.end
         deadline = time.time() + max_seconds + 5
         got_phrase = False
-        while time.time() < deadline:
+        while time.time() < deadline and not is_cancelled():
             try:
                 ws.settimeout(1.0)
                 msg = ws.recv()
@@ -632,6 +675,8 @@ def stt_streaming(max_seconds=30, progress_token=None):
         try:
             ws = _get_stt_ws()
             text = _do_streaming(ws, max_seconds)
+            if is_cancelled():
+                return {"text": "", "cancelled": True}
             return {"text": text}
         except Exception as e:
             _invalidate_stt_ws()
@@ -651,10 +696,15 @@ def stt_vad(max_seconds=30, progress_token=None):
             ["arecord", "-D", "default", "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "raw"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
+        register_proc(proc)
 
         frames, _ = record_with_vad(proc, max_seconds)
         proc.terminate()
         proc.wait()
+        unregister_proc(proc)
+
+        if is_cancelled():
+            return {"text": "", "cancelled": True}
 
         if not frames:
             return {"text": "", "status": "NoAudio"}
@@ -699,6 +749,7 @@ def stt_whisper(max_seconds=30, progress_token=None):
             ["arecord", "-D", "default", "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "raw"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
+        register_proc(proc)
 
         if HAS_VAD:
             frames, _ = record_with_vad(proc, max_seconds)
@@ -709,6 +760,10 @@ def stt_whisper(max_seconds=30, progress_token=None):
             raw_data = proc.stdout.read(SAMPLE_RATE * 2 * max_seconds)
             proc.terminate()
             proc.wait()
+        unregister_proc(proc)
+
+        if is_cancelled():
+            return {"text": "", "cancelled": True}
 
         if not raw_data:
             return {"text": "", "status": "NoAudio"}
@@ -738,7 +793,17 @@ def stt_fixed(seconds=5, progress_token=None):
         send_progress(progress_token, 0, 100, "🎤 Listening...")
         cmd = ["arecord", "-D", "default", "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "wav",
                "-d", str(seconds), tmp_path]
-        subprocess.run(cmd, capture_output=True, timeout=seconds + 5)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        register_proc(proc)
+        try:
+            proc.wait(timeout=seconds + 5)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            proc.wait()
+        unregister_proc(proc)
+
+        if is_cancelled():
+            return {"text": "", "cancelled": True}
         if not os.path.exists(tmp_path):
             return {"error": "Recording failed"}
 
@@ -913,6 +978,7 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
             pass
         return {"spoken": True, "chars": len(text)}
 
+    register_proc(proc)
     try:
         # We download chunks much faster than they play.
         # To make a smooth progress bar, we calculate estimated duration:
@@ -920,10 +986,12 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
         speed_factor = 22.0 if quality == "fast" else 15.0
         estimated_duration = max(1.0, len(text) / speed_factor)
         start_time = time.time()
-        
+
         def download_audio():
             try:
                 for chunk in resp.iter_content(chunk_size=16384):
+                    if is_cancelled():
+                        break
                     if chunk:
                         proc.stdin.write(chunk)
                 proc.stdin.close()
@@ -940,6 +1008,10 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
         show_subs = CONFIG.get("live_subtitles", True)
 
         while proc.poll() is None:
+            if is_cancelled():
+                proc.terminate()
+                break
+
             elapsed = time.time() - start_time
             current_pct = int(min(1.0, elapsed / estimated_duration) * 100)
 
@@ -960,13 +1032,17 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
                 last_msg = msg
 
             time.sleep(0.1)
-            
+
         dl_thread.join()
-        
+
     except BrokenPipeError:
         pass
     finally:
+        unregister_proc(proc)
         stop_hum()
+        if is_cancelled():
+            send_progress(progress_token, 100, 100, "⏹ Cancelled")
+            return {"spoken": False, "cancelled": True}
         send_progress(progress_token, 100, 100, "✅ Done")
     play_done()
     return {"spoken": True, "chars": len(text)}
@@ -1195,7 +1271,7 @@ def handle_request(req):
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {"listChanged": True}},
-                "serverInfo": {"name": "azure-speech", "version": "3.5.0"},
+                "serverInfo": {"name": "azure-speech", "version": "3.6.0"},
             },
         }
     elif method == "notifications/initialized":
@@ -1214,6 +1290,11 @@ def handle_request(req):
                 energy_multiplier=args.get("energy_multiplier"),
                 progress_token=progress_token
             )
+            if result.get("cancelled"):
+                return {
+                    "jsonrpc": "2.0", "id": req_id,
+                    "result": {"content": [{"type": "text", "text": "(cancelled)"}]},
+                }
             text = result.get("text", result.get("error", ""))
             content_text = text or "(no speech detected)"
             if tool_name == "converse":
@@ -1245,7 +1326,10 @@ def handle_request(req):
                 volume=args.get("volume", "default"),
                 progress_token=progress_token
             )
-            msg = "Spoke the text aloud." if result.get("spoken") else result.get("error", "Failed")
+            if result.get("cancelled"):
+                msg = "(cancelled)"
+            else:
+                msg = "Spoke the text aloud." if result.get("spoken") else result.get("error", "Failed")
             return {
                 "jsonrpc": "2.0", "id": req_id,
                 "result": {"content": [{"type": "text", "text": msg}]},
@@ -1274,6 +1358,11 @@ def handle_request(req):
                 volume=args.get("volume", "default"),
                 progress_token=progress_token,
             )
+            if tts_result.get("cancelled"):
+                return {
+                    "jsonrpc": "2.0", "id": req_id,
+                    "result": {"content": [{"type": "text", "text": "(cancelled)"}]},
+                }
             if not tts_result.get("spoken"):
                 return {
                     "jsonrpc": "2.0", "id": req_id,
@@ -1286,6 +1375,11 @@ def handle_request(req):
                 silence_timeout=args.get("silence_timeout"),
                 progress_token=progress_token,
             )
+            if isinstance(stt_result, dict) and stt_result.get("cancelled"):
+                return {
+                    "jsonrpc": "2.0", "id": req_id,
+                    "result": {"content": [{"type": "text", "text": "(cancelled)"}]},
+                }
             user_said = stt_result.get("text", stt_result.get("error", "")) if isinstance(stt_result, dict) else str(stt_result)
             content_text = user_said or "(no speech detected)"
             content_text += "\n\n[Voice conversation active — call 'talk' again with your response to continue, or 'speak' for a final message with no reply needed.]"
@@ -1376,6 +1470,7 @@ def handle_request(req):
     elif method == "ping":
         return {"jsonrpc": "2.0", "id": req_id, "result": {}}
     elif method == "notifications/cancelled":
+        cancel_active()
         return None
     else:
         # Ignore unknown notifications (no id); error on unknown requests
@@ -1387,7 +1482,20 @@ def handle_request(req):
         return None
 
 
-def main():
+_stdout_lock = threading.Lock()
+_request_queue = []
+_request_cond = threading.Condition()
+
+
+def _write_response(resp):
+    """Thread-safe write to stdout."""
+    with _stdout_lock:
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+
+
+def _stdin_reader():
+    """Read stdin in a background thread, routing cancellations immediately."""
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -1396,10 +1504,47 @@ def main():
             req = json.loads(line)
         except json.JSONDecodeError:
             continue
+
+        method = req.get("method")
+        if method == "notifications/cancelled":
+            # Handle cancellation immediately without queuing
+            cancel_active()
+            continue
+
+        # Queue everything else for the main processing thread
+        with _request_cond:
+            _request_queue.append(req)
+            _request_cond.notify()
+
+    # Signal EOF
+    with _request_cond:
+        _request_queue.append(None)
+        _request_cond.notify()
+
+
+def main():
+    reader = threading.Thread(target=_stdin_reader, daemon=True)
+    reader.start()
+
+    while True:
+        with _request_cond:
+            while not _request_queue:
+                _request_cond.wait()
+            req = _request_queue.pop(0)
+
+        if req is None:
+            break  # EOF
+
+        # Clear cancellation state before each request
+        global _active_request_id
+        _cancel_event.clear()
+        _active_request_id = req.get("id")
+
         resp = handle_request(req)
         if resp is not None:
-            sys.stdout.write(json.dumps(resp) + "\n")
-            sys.stdout.flush()
+            _write_response(resp)
+
+        _active_request_id = None
 
 
 if __name__ == "__main__":
