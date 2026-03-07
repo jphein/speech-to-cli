@@ -1892,7 +1892,12 @@ TOOLS = [
             "(3) Keep messages short and conversational (1-3 sentences). Long messages delay the user's reply. "
             "(4) Treat this like a phone call — the user is on earbuds/speakers talking to a mic. "
             "(5) Only use 'speak' for a true final goodbye. "
-            "(6) When the user types 'talk' in chat, start the voice conversation immediately."
+            "(6) When the user types 'talk' in chat, start the voice conversation immediately. "
+            "TOKEN ECONOMY: "
+            "(A) Keep 'text' under 2 sentences — speech is slower than reading, so less is more. "
+            "(B) Never echo back what the user said — they already know. "
+            "(C) Do NOT output any text to the chat between talk calls — the user cannot see it while on earbuds. "
+            "(D) Skip preamble like 'Sure!' or 'Great question!' — just answer directly."
         ),
         "inputSchema": {
             "type": "object",
@@ -2095,9 +2100,9 @@ def handle_request(req):
                 user_said = result.get("text", "")
                 content_text = user_said or "(no speech detected)"
                 if user_said:
-                    content_text += "\n\n[RESPOND NOW: call 'talk' with a short spoken reply. Do NOT type text to the user — they are listening on earbuds. Keep it conversational, 1-3 sentences.]"
+                    content_text += "\n\n[Call 'talk' now. Keep reply under 2 sentences. No chat text — user is on earbuds.]"
                 else:
-                    content_text += "\n\n[No speech detected — the user may still be there. Call 'talk' again with a brief check-in like 'Hey, are you still there?' Do NOT drop to text.]"
+                    content_text += "\n\n[No speech — call 'talk' with a short check-in. Don't drop to text.]"
                 return {
                     "jsonrpc": "2.0", "id": req_id,
                     "result": {"content": [{"type": "text", "text": content_text}]},
