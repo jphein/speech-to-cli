@@ -993,9 +993,9 @@ TOOLS = [
     {
         "name": "listen",
         "description": (
-            "Record audio from the user's microphone and transcribe it to text. "
-            "Uses energy-gated voice activity detection to stop automatically when the user "
-            "finishes speaking (ignores background noise)."
+            "Listen through the microphone and return what the user said as text. "
+            "Stops automatically when the user finishes speaking. "
+            "This is listen-only — if you also need to speak, use 'talk' instead."
         ),
         "inputSchema": {
             "type": "object",
@@ -1031,7 +1031,11 @@ TOOLS = [
     },
     {
         "name": "speak",
-        "description": "Speak text aloud using Azure TTS.",
+        "description": (
+            "Say something out loud (text-to-speech) WITHOUT listening for a reply. "
+            "Use this for one-way announcements or final messages. "
+            "If you want to speak AND hear the user's response, use 'talk' instead."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1074,8 +1078,9 @@ TOOLS = [
     {
         "name": "converse",
         "description": (
-            "Have a voice conversation turn: listen to the user, return their speech as text, "
-            "and signal to continue the loop."
+            "Listen to the user through their microphone and return what they said as text. "
+            "Use this to START a voice conversation (listen first, then respond with 'talk'). "
+            "For ongoing back-and-forth, prefer 'talk' which speaks AND listens in one step."
         ),
         "inputSchema": {
             "type": "object",
@@ -1094,6 +1099,63 @@ TOOLS = [
                     "description": "Seconds of silence before stopping.",
                 },
             },
+        },
+    },
+    {
+        "name": "talk",
+        "description": (
+            "Say something out loud, then immediately listen for the user's reply. "
+            "This is the PRIMARY tool for voice conversations — it speaks your response "
+            "and waits for the user to talk back, all in one fast step. "
+            "Just pass your message as 'text' and you'll get back what the user said. "
+            "Keep calling 'talk' each turn to continue the conversation. "
+            "Use 'speak' instead only when you want to say something final with no reply expected."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "The text to speak aloud before listening.",
+                },
+                "quality": {
+                    "type": "string",
+                    "description": "Voice quality: 'fast' or 'hd'.",
+                    "enum": ["fast", "hd"],
+                    "default": "fast",
+                },
+                "speed": {
+                    "type": "number",
+                    "description": "Playback speed multiplier (default 1.0).",
+                    "default": 1.0,
+                },
+                "voice": {
+                    "type": "string",
+                    "description": "Azure voice name.",
+                },
+                "pitch": {
+                    "type": "string",
+                    "description": "Pitch: 'high', 'low', '+20%', or 'default'.",
+                },
+                "volume": {
+                    "type": "string",
+                    "description": "Volume: 'loud', 'soft', '+10%', or 'default'.",
+                },
+                "seconds": {
+                    "type": "integer",
+                    "description": "Max recording duration (default 30).",
+                    "default": 30,
+                },
+                "mode": {
+                    "type": "string",
+                    "description": "STT mode (streaming, vad, whisper, fixed).",
+                },
+                "silence_timeout": {
+                    "type": "number",
+                    "description": "Seconds of silence before stopping.",
+                },
+            },
+            "required": ["text"],
         },
     },
 ]
@@ -1133,7 +1195,7 @@ def handle_request(req):
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {"listChanged": True}},
-                "serverInfo": {"name": "azure-speech", "version": "3.4.0"},
+                "serverInfo": {"name": "azure-speech", "version": "3.5.0"},
             },
         }
     elif method == "notifications/initialized":
@@ -1155,7 +1217,7 @@ def handle_request(req):
             text = result.get("text", result.get("error", ""))
             content_text = text or "(no speech detected)"
             if tool_name == "converse":
-                content_text += "\n\n[Voice conversation active - speak your response using the 'speak' tool, then call 'converse' again to keep listening.]"
+                content_text += "\n\n[Voice conversation active — call 'talk' with your response to speak and listen in one step, or call 'speak' for a final message with no reply needed.]"
             return {
                 "jsonrpc": "2.0", "id": req_id,
                 "result": {"content": [{"type": "text", "text": content_text}]},
@@ -1187,6 +1249,49 @@ def handle_request(req):
             return {
                 "jsonrpc": "2.0", "id": req_id,
                 "result": {"content": [{"type": "text", "text": msg}]},
+            }
+        elif tool_name == "talk":
+            # Combo: speak then immediately listen — eliminates round-trip latency
+            speak_text = args.get("text", "")
+            if not speak_text or not isinstance(speak_text, str):
+                return {
+                    "jsonrpc": "2.0", "id": req_id,
+                    "result": {"content": [{"type": "text", "text": "Error: 'text' is required."}]},
+                }
+            quality = args.get("quality", "fast")
+            if quality not in ("fast", "hd"):
+                quality = "fast"
+            speed_val = args.get("speed", 1.0)
+            if not isinstance(speed_val, (int, float)):
+                speed_val = 1.0
+            speed_val = max(0.5, min(float(speed_val), 3.0))
+            tts_result = tts(
+                speak_text,
+                quality=quality,
+                voice=args.get("voice"),
+                speed=speed_val,
+                pitch=args.get("pitch", "default"),
+                volume=args.get("volume", "default"),
+                progress_token=progress_token,
+            )
+            if not tts_result.get("spoken"):
+                return {
+                    "jsonrpc": "2.0", "id": req_id,
+                    "result": {"content": [{"type": "text", "text": tts_result.get("error", "TTS failed")}]},
+                }
+            # Now immediately listen
+            stt_result = stt(
+                seconds=args.get("seconds"),
+                mode=args.get("mode"),
+                silence_timeout=args.get("silence_timeout"),
+                progress_token=progress_token,
+            )
+            user_said = stt_result.get("text", stt_result.get("error", "")) if isinstance(stt_result, dict) else str(stt_result)
+            content_text = user_said or "(no speech detected)"
+            content_text += "\n\n[Voice conversation active — call 'talk' again with your response to continue, or 'speak' for a final message with no reply needed.]"
+            return {
+                "jsonrpc": "2.0", "id": req_id,
+                "result": {"content": [{"type": "text", "text": content_text}]},
             }
         elif tool_name == "get_voices":
             voices = get_voices()
