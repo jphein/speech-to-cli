@@ -200,7 +200,11 @@ def get_http_session():
 def _prewarm():
     """Pre-establish connections in background so first call is fast."""
     try:
-        get_http_session()
+        session = get_http_session()
+        # Pre-connect to TTS endpoint (TCP + TLS handshake) so first POST is instant
+        if CONFIG.get("region"):
+            tts_host = f"https://{CONFIG['region']}.tts.speech.microsoft.com"
+            session.head(tts_host, timeout=5)
     except Exception:
         pass
     try:
@@ -1790,6 +1794,10 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
     stop_hum()
     play_done()
     send_progress(progress_token, 100, 100, "✅ Done")
+
+    # Pre-warm TTS connection for next call (saves ~150ms on next talk)
+    threading.Thread(target=_prewarm, daemon=True).start()
+
     return {"spoken": True, "text": user_text}
 
 
