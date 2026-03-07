@@ -164,6 +164,14 @@ def load_config():
         "region": os.environ.get("AZURE_SPEECH_REGION") or cfg.get("region", "westus2"),
         "voice": os.environ.get("AZURE_SPEECH_VOICE") or cfg.get("voice", "en-US-Ava:DragonHDLatestNeural"),
         "fast_voice": cfg.get("fast_voice", "en-US-AvaNeural"),
+        # Audio device settings
+        "player": cfg.get("player", "auto"),           # aplay, pw-cat, ffplay, or auto
+        "recorder": cfg.get("recorder", "auto"),       # pw-record, arecord, or auto
+        "mic_source": cfg.get("mic_source", None),     # PipeWire node name or ALSA device, None=default
+        "speaker_sink": cfg.get("speaker_sink", None), # PipeWire node name or ALSA device, None=default
+        "silence_timeout": cfg.get("silence_timeout", SILENCE_TIMEOUT),
+        "talk_silence_timeout": cfg.get("talk_silence_timeout", 1.5),
+        # UI settings
         "chime_ready": cfg.get("chime_ready", True),
         "chime_processing": cfg.get("chime_processing", False),
         "chime_speak": cfg.get("chime_speak", False),
@@ -200,6 +208,64 @@ def _prewarm():
             _get_stt_ws()  # noqa: defined below
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Audio device helpers
+# ---------------------------------------------------------------------------
+
+def _build_player_cmd(tts_rate, target=None):
+    """Build a player command list based on config. Returns list of fallback commands to try.
+
+    Players: aplay (best for streaming), pw-play/pw-cat (buffer stdin — only good for
+    short/complete audio), ffplay (universal fallback). Default 'auto' uses aplay → ffplay.
+    """
+    player = CONFIG.get("player", "auto")
+    sink = target or CONFIG.get("speaker_sink")
+    cmds = []
+
+    if player in ("aplay", "auto"):
+        cmd = ["aplay", "-f", "S16_LE", "-r", str(tts_rate), "-c", "1", "-t", "raw", "-q"]
+        if sink:
+            cmd = ["aplay", "-f", "S16_LE", "-r", str(tts_rate), "-c", "1", "-t", "raw",
+                   "-D", f"pipewire:NODE={sink}", "-q"]
+        cmds.append(cmd)
+    if player in ("pw-play", "pw-cat"):
+        # Note: pw-play/pw-cat buffer stdin — audio won't play until stdin closes.
+        # Only use if you know audio is written all at once (not streamed).
+        cmd = ["pw-cat", "--playback", "--format", "s16", "--rate", str(tts_rate), "--channels", "1"]
+        if sink:
+            cmd += ["--target", sink]
+        cmd.append("-")
+        cmds.append(cmd)
+    if player in ("ffplay", "auto"):
+        cmds.append(["ffplay", "-f", "s16le", "-ar", str(tts_rate), "-ac", "1",
+                      "-nodisp", "-autoexit", "-loglevel", "quiet", "-i", "pipe:0"])
+
+    if not cmds:
+        cmds.append(["aplay", "-f", "S16_LE", "-r", str(tts_rate), "-c", "1", "-t", "raw", "-q"])
+
+    return cmds
+
+
+def _build_rec_cmd(max_seconds=None, raw=True):
+    """Build a recorder command list based on config. Returns a single command."""
+    recorder = CONFIG.get("recorder", "auto")
+    mic = CONFIG.get("mic_source")
+
+    if recorder == "pw-record" or (recorder == "auto" and shutil.which("pw-record")):
+        cmd = ["pw-record", "--format", "s16", "--rate", "16000", "--channels", "1"]
+        if mic:
+            cmd += ["--target", mic]
+        cmd.append("-")
+        return cmd
+
+    # arecord fallback
+    device = mic or "default"
+    cmd = ["arecord", "-D", device, "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "raw"]
+    if max_seconds:
+        cmd += ["-d", str(max_seconds)]
+    return cmd
 
 
 # ---------------------------------------------------------------------------
@@ -614,8 +680,7 @@ def stt_streaming(max_seconds=30, progress_token=None):
         play_chime()
         send_progress(progress_token, 0, 100, "🎤 Listening...")
         proc = subprocess.Popen(
-            ["arecord", "-D", "default", "-f", "S16_LE", "-r", "16000", "-c", "1",
-             "-t", "raw", "-d", str(max_seconds)],
+            _build_rec_cmd(max_seconds=max_seconds),
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
         register_proc(proc)
@@ -785,7 +850,7 @@ def stt_vad(max_seconds=30, progress_token=None):
         play_chime()
         send_progress(progress_token, 10, 100, "🎤 Listening...")
         proc = subprocess.Popen(
-            ["arecord", "-D", "default", "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "raw"],
+            _build_rec_cmd(),
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
         register_proc(proc)
@@ -838,7 +903,7 @@ def stt_whisper(max_seconds=30, progress_token=None):
         play_chime()
         send_progress(progress_token, 0, 100, "🎤 Listening...")
         proc = subprocess.Popen(
-            ["arecord", "-D", "default", "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "raw"],
+            _build_rec_cmd(),
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
         register_proc(proc)
@@ -883,8 +948,16 @@ def stt_fixed(seconds=5, progress_token=None):
     try:
         play_chime()
         send_progress(progress_token, 0, 100, "🎤 Listening...")
-        cmd = ["arecord", "-D", "default", "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "wav",
-               "-d", str(seconds), tmp_path]
+        rec = CONFIG.get("recorder", "auto")
+        mic = CONFIG.get("mic_source") or "default"
+        if rec == "arecord" or rec == "auto":
+            cmd = ["arecord", "-D", mic, "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "wav",
+                   "-d", str(seconds), tmp_path]
+        else:
+            cmd = ["pw-record", "--format", "s16", "--rate", "16000", "--channels", "1"]
+            if CONFIG.get("mic_source"):
+                cmd += ["--target", CONFIG["mic_source"]]
+            cmd.append(tmp_path)
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         register_proc(proc)
         try:
@@ -1044,13 +1117,8 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
     send_progress(progress_token, 5, 100, "🔊 Speaking...")
     play_speak()
 
-    # Stream raw PCM via aplay (handles real-time streaming) with ffplay fallback
-    # Note: pw-cat buffers internally and won't play until stdin closes — unusable for streaming
-    for player_cmd in [
-        ["aplay", "-f", "S16_LE", "-r", str(tts_rate), "-c", "1", "-t", "raw", "-q"],
-        ["ffplay", "-f", "s16le", "-ar", str(tts_rate), "-ac", "1",
-         "-nodisp", "-autoexit", "-loglevel", "quiet", "-i", "pipe:0"],
-    ]:
+    # Stream raw PCM to configured player
+    for player_cmd in _build_player_cmd(tts_rate):
         try:
             proc = subprocess.Popen(
                 player_cmd,
@@ -1060,7 +1128,7 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
         except FileNotFoundError:
             continue
     else:
-        return {"error": "No audio player found (need aplay or ffplay)"}
+        return {"error": "No audio player found — set 'player' in config"}
 
     register_proc(proc)
     try:
@@ -1213,12 +1281,14 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
 
     # --- Start STT recording (use echo-cancelled source if available, else default mic) ---
     max_seconds = max(1, min(int(seconds or 30), 30))
-    stt_silence = float(silence_timeout) if silence_timeout else 1.5  # faster turnaround for conversation
+    stt_silence = float(silence_timeout) if silence_timeout else CONFIG.get("talk_silence_timeout", 1.5)
 
-    rec_cmd = ["pw-record", "--format", "s16", "--rate", "16000", "--channels", "1"]
-    if has_echo_cancel():
-        rec_cmd += ["--target", EC_SOURCE]
-    rec_cmd.append("-")
+    rec_cmd = _build_rec_cmd()
+    if has_echo_cancel() and "--target" not in rec_cmd:
+        # Override mic source to echo-cancelled source if available
+        if "pw-record" in rec_cmd[0]:
+            idx = rec_cmd.index("-")
+            rec_cmd[idx:idx] = ["--target", EC_SOURCE]
 
     rec_proc = subprocess.Popen(
         rec_cmd,
@@ -1244,22 +1314,10 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
     # Audio buffer for repeat support
     tts_audio_buf = []
 
-    # --- Helper: start an aplay (or ffplay) process ---
+    # --- Helper: start a player process ---
     def _start_player():
-        if has_echo_cancel():
-            try:
-                return subprocess.Popen(
-                    ["aplay", "-f", "S16_LE", "-r", str(tts_rate), "-c", "1", "-t", "raw",
-                     "-D", "pipewire:NODE=echo_cancel_sink", "-q"],
-                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
-            except FileNotFoundError:
-                pass
-        for cmd in [
-            ["aplay", "-f", "S16_LE", "-r", str(tts_rate), "-c", "1", "-t", "raw", "-q"],
-            ["ffplay", "-f", "s16le", "-ar", str(tts_rate), "-ac", "1",
-             "-nodisp", "-autoexit", "-loglevel", "quiet", "-i", "pipe:0"],
-        ]:
+        target = EC_SINK if has_echo_cancel() else None
+        for cmd in _build_player_cmd(tts_rate, target=target):
             try:
                 return subprocess.Popen(
                     cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -1865,6 +1923,31 @@ TOOLS = [
         },
     },
     {
+        "name": "configure",
+        "description": (
+            "View or change audio settings on the fly. Call with no arguments to see current settings. "
+            "Pass any setting as a key-value pair to update it. Changes are saved to disk and take "
+            "effect immediately. Settings: player (aplay/pw-play/pw-cat/ffplay/auto), "
+            "recorder (pw-record/arecord/auto), mic_source (PipeWire node name or null), "
+            "speaker_sink (PipeWire node name or null), silence_timeout (seconds), "
+            "talk_silence_timeout (seconds), voice, fast_voice, bt_profile (a2dp/hfp)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "player": {"type": "string", "description": "Audio player: aplay, pw-play, pw-cat, ffplay, or auto."},
+                "recorder": {"type": "string", "description": "Audio recorder: pw-record, arecord, or auto."},
+                "mic_source": {"type": "string", "description": "PipeWire node name for mic input, or 'null' for default."},
+                "speaker_sink": {"type": "string", "description": "PipeWire node name for speaker output, or 'null' for default."},
+                "silence_timeout": {"type": "number", "description": "Silence timeout for listen tool (seconds)."},
+                "talk_silence_timeout": {"type": "number", "description": "Silence timeout for talk tool (seconds)."},
+                "voice": {"type": "string", "description": "Azure TTS voice name."},
+                "fast_voice": {"type": "string", "description": "Azure TTS voice name for fast quality."},
+                "bt_profile": {"type": "string", "description": "Bluetooth profile: a2dp (output only, hi-fi) or hfp (mic+speaker, lower quality)."},
+            },
+        },
+    },
+    {
         "name": "talk",
         "description": (
             "Say something out loud and listen for the user's reply at the same time. "
@@ -2119,6 +2202,80 @@ def handle_request(req):
                 "jsonrpc": "2.0", "id": req_id,
                 "result": {"content": [{"type": "text", "text": content_text}]},
             }
+        elif tool_name == "configure":
+            # Handle Bluetooth profile switching
+            bt_profile = args.pop("bt_profile", None)
+            bt_msg = ""
+            if bt_profile:
+                try:
+                    # Find the Galaxy Buds device ID
+                    dev_id = None
+                    wp_out = subprocess.run(["pw-dump"], capture_output=True, text=True, timeout=3)
+                    import json as _json
+                    for obj in _json.loads(wp_out.stdout):
+                        props = obj.get("info", {}).get("props", {})
+                        if "Galaxy" in str(props.get("device.description", "")):
+                            dev_id = obj.get("id")
+                            profiles = {p["name"]: p["index"]
+                                        for p in obj.get("info", {}).get("params", {}).get("EnumProfile", [])}
+                            break
+                    if dev_id and profiles:
+                        if bt_profile == "hfp":
+                            idx = profiles.get("headset-head-unit-msbc") or profiles.get("headset-head-unit")
+                        else:
+                            idx = profiles.get("a2dp-sink-sbc_xq") or profiles.get("a2dp-sink")
+                        if idx is not None:
+                            subprocess.run(["wpctl", "set-profile", str(dev_id), str(idx)], timeout=5)
+                            bt_msg = f"Bluetooth profile → {bt_profile} (index {idx}). "
+                        else:
+                            bt_msg = f"Profile '{bt_profile}' not found. "
+                    else:
+                        bt_msg = "No Bluetooth audio device found. "
+                except Exception as e:
+                    bt_msg = f"Bluetooth profile switch failed: {e}. "
+
+            # Update config settings
+            settable = {"player", "recorder", "mic_source", "speaker_sink",
+                        "silence_timeout", "talk_silence_timeout", "voice", "fast_voice"}
+            updated = []
+            for k, v in args.items():
+                if k in settable:
+                    if v == "null" or v is None:
+                        CONFIG[k] = None
+                    elif k in ("silence_timeout", "talk_silence_timeout"):
+                        CONFIG[k] = max(0.1, min(float(v), 10.0))
+                    else:
+                        CONFIG[k] = v
+                    updated.append(f"{k}={CONFIG[k]}")
+
+            # Save to disk
+            if updated:
+                cfg_path = DEFAULTS_PATH
+                os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+                disk_cfg = {}
+                if os.path.exists(cfg_path):
+                    with open(cfg_path) as f:
+                        disk_cfg = json.load(f)
+                for k, v in args.items():
+                    if k in settable:
+                        disk_cfg[k] = CONFIG[k]
+                with open(cfg_path, "w") as f:
+                    json.dump(disk_cfg, f, indent=4)
+
+            # Build response
+            if updated or bt_msg:
+                text = bt_msg + ("Updated: " + ", ".join(updated) if updated else "")
+            else:
+                # Show current settings
+                show_keys = ["player", "recorder", "mic_source", "speaker_sink",
+                             "silence_timeout", "talk_silence_timeout", "voice", "fast_voice"]
+                lines = [f"  {k}: {CONFIG.get(k)}" for k in show_keys]
+                text = "Current audio settings:\n" + "\n".join(lines)
+            return {
+                "jsonrpc": "2.0", "id": req_id,
+                "result": {"content": [{"type": "text", "text": text.strip()}]},
+            }
+
         elif tool_name == "get_voices":
             voices = get_voices()
             if isinstance(voices, dict) and "error" in voices:
