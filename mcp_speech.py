@@ -130,11 +130,15 @@ def cancel_active():
 
 def pause_active():
     """Pause playback by setting the pause event (data feed stops, no SIGSTOP)."""
+    if not CONFIG.get("enable_pause", True):
+        return
     _pause_event.set()
 
 
 def resume_active():
     """Resume playback by clearing the pause event."""
+    if not CONFIG.get("enable_pause", True):
+        return
     _pause_event.clear()
 
 
@@ -183,6 +187,8 @@ def load_config():
         "barge_in_frames": cfg.get("barge_in_frames", 3),
         "barge_in_silence": cfg.get("barge_in_silence", 1.0),
         "chime_barge_in": cfg.get("chime_barge_in", True),
+        "enable_pause": cfg.get("enable_pause", True),
+        "enable_barge_in": cfg.get("enable_barge_in", False),
     }
 
 
@@ -1174,11 +1180,10 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
                 proc.terminate()
                 break
 
-            # Kill hung player (e.g. Bluetooth out of range)
-            if not dl_thread.is_alive() and not _pause_event.is_set():
-                if time.time() - start_time > player_timeout:
-                    proc.terminate()
-                    break
+            # Kill hung player (e.g. Bluetooth stall mid-stream or out of range)
+            if not _pause_event.is_set() and (time.time() - start_time) > player_timeout:
+                proc.terminate()
+                break
 
             if _pause_event.is_set():
                 if pause_start is None:
@@ -1305,9 +1310,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
     rec_done = threading.Event()
     rec_speech_detected = threading.Event()
     tts_done = threading.Event()
-    # Voice command barge-in state
-    barge_in_evt = threading.Event()   # set when user speaks during TTS
-    voice_cmd = [None]                 # "resume", "stop", "pause", "repeat", or "reply"
+    tts_paused = threading.Event()  # set when user speaks during TTS — pauses data feed
 
     # Streaming STT state — stream audio to WebSocket during post-TTS recording
     stt_ws = [None]           # WebSocket connection (set when STT starts)
@@ -1340,14 +1343,55 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
     register_proc(player_proc)
     send_progress(progress_token, 5, 100, "🔊🎤 Speaking + listening...")
 
+    # --- Set up streaming STT WebSocket early so we capture speech during TTS ---
+    use_streaming_stt = HAS_WS
+    if use_streaming_stt:
+        try:
+            ws = _get_stt_ws()
+            rid = uuid.uuid4().hex
+            stt_request_id[0] = rid
+            try:
+                ws.settimeout(0.05)
+                while True:
+                    ws.recv()
+            except Exception:
+                pass
+            speech_config = {
+                "context": {
+                    "system": {"version": "1.0.00000"},
+                    "os": {"platform": "Linux", "name": "speech-to-cli"},
+                    "audio": {"source": {"connectivity": "Unknown", "manufacturer": "Unknown",
+                                         "model": "Unknown", "type": "Unknown"}},
+                }
+            }
+            ws.send(
+                f"Path: speech.config\r\nX-RequestId: {rid}\r\n"
+                f"X-Timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())}\r\n"
+                f"Content-Type: application/json\r\n\r\n" + json.dumps(speech_config)
+            )
+            wav_header = struct.pack('<4sI4s4sIHHIIHH4sI',
+                b'RIFF', 0, b'WAVE', b'fmt ', 16, 1, 1, 16000, 32000, 2, 16, b'data', 0)
+            hdr_str = (
+                f"Path: audio\r\nX-RequestId: {rid}\r\n"
+                f"X-Timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())}\r\n"
+                f"Content-Type: audio/x-wav\r\n"
+            )
+            hdr_bytes = hdr_str.encode('ascii')
+            ws.send(struct.pack('>H', len(hdr_bytes)) + hdr_bytes + wav_header,
+                    opcode=websocket.ABNF.OPCODE_BINARY)
+            stt_ws[0] = ws  # recording thread streams all frames from now on
+        except Exception:
+            use_streaming_stt = False
+            _invalidate_stt_ws()
+
     # --- Barge-in config ---
     barge_trigger_frames = max(1, int(CONFIG.get("barge_in_frames", 3)))
     barge_silence_sec = max(0.3, float(CONFIG.get("barge_in_silence", 1.0)))
-    chime_on_barge = CONFIG.get("chime_barge_in", True)
 
-    # --- Background: read mic frames with VAD + barge-in ---
+    # --- Background: read mic frames with VAD + simple barge-in ---
     def record_with_vad_bg():
-        """Record from mic with barge-in detection during TTS."""
+        """Record from mic. During TTS: pause playback when user speaks, resume on silence.
+        All speech frames are saved for transcription at the end."""
         try:
             vad = webrtcvad.Vad(VAD_AGGRESSIVENESS) if HAS_VAD else None
             energy_threshold, cal_frames = calibrate_noise(rec_proc)
@@ -1360,10 +1404,8 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
             min_speech = int(MIN_SPEECH_DURATION * 1000 / FRAME_MS)
             max_total = int(max_seconds * 1000 / FRAME_MS)
             total_frames = 0
-            barge_buf = []
             barge_speech = 0
             barge_silence = 0
-            in_barge = False
             barge_silence_frames = int(barge_silence_sec * 1000 / FRAME_MS)
 
             post_tts_frames = 0  # separate counter for after TTS ends
@@ -1377,43 +1419,38 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                 total_frames += 1
                 is_speech = is_speech_energy(chunk, vad, energy_threshold)
 
-                # --- During TTS playback: detect barge-in ---
+                # --- During TTS playback: stream to WS + optional barge-in ---
                 if not tts_done.is_set():
-                    if is_speech:
-                        barge_buf.append(chunk)
+                    # Stream all frames to WebSocket during TTS for early transcription
+                    ws = stt_ws[0]
+                    rid = stt_request_id[0]
+                    if ws and rid:
+                        try:
+                            hdr_str = (
+                                f"Path: audio\r\nX-RequestId: {rid}\r\n"
+                                f"X-Timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())}\r\n"
+                                f"Content-Type: audio/x-wav\r\n"
+                            )
+                            hdr_bytes = hdr_str.encode('ascii')
+                            ws.send(struct.pack('>H', len(hdr_bytes)) + hdr_bytes + chunk,
+                                    opcode=websocket.ABNF.OPCODE_BINARY)
+                        except Exception:
+                            pass
+
+                    if CONFIG.get("enable_barge_in", False) and is_speech:
                         barge_speech += 1
                         barge_silence = 0
-                        if not in_barge and barge_speech >= barge_trigger_frames:
-                            in_barge = True
-                            barge_in_evt.set()  # signal main thread to pause player
-                    elif in_barge:
-                        barge_buf.append(chunk)
+                        rec_frames.append(chunk)
+                        if barge_speech >= barge_trigger_frames and not tts_paused.is_set():
+                            tts_paused.set()
+                    elif tts_paused.is_set():
                         barge_silence += 1
+                        rec_frames.append(chunk)
                         if barge_silence >= barge_silence_frames:
-                            # Barge-in utterance complete — classify via Azure STT
-                            cmd = _classify_voice_cmd(barge_buf)
-                            voice_cmd[0] = cmd
-                            if cmd in ("resume", "repeat"):
-                                barge_in_evt.clear()
-                                in_barge = False
-                                barge_buf = []
-                                barge_speech = 0
-                                barge_silence = 0
-                                voice_cmd[0] = cmd
-                            elif cmd == "pause":
-                                # Stay paused, reset for next utterance
-                                in_barge = False
-                                barge_buf = []
-                                barge_speech = 0
-                                barge_silence = 0
-                                voice_cmd[0] = None
-                            else:
-                                # "stop" or "reply" — save audio and exit
-                                if cmd == "reply":
-                                    rec_frames.extend(barge_buf)
-                                break
+                            tts_paused.clear()
+                            barge_speech = 0
+                            barge_silence = 0
                     else:
-                        barge_buf = []
                         barge_speech = 0
                         barge_silence = 0
                     continue
@@ -1469,9 +1506,13 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                     break
                 if chunk:
                     tts_audio_buf.append(chunk)
-                    # Wait while paused (barge-in or MCP pause)
-                    while _pause_event.is_set() and not is_cancelled():
-                        time.sleep(0.05)
+                    # Feed silence to keep player alive while user is speaking
+                    while tts_paused.is_set() and not is_cancelled():
+                        try:
+                            player_proc.stdin.write(b'\x00' * 4800)
+                        except (BrokenPipeError, OSError):
+                            break
+                        time.sleep(0.1)
                     try:
                         player_proc.stdin.write(chunk)
                     except (BrokenPipeError, OSError):
@@ -1516,79 +1557,16 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
     show_vu = CONFIG.get("vu_meter", True)
     show_subs = CONFIG.get("live_subtitles", True)
     current_pct = 0
-    pause_start = None
-    player_paused = False
 
     while player_proc.poll() is None:
         if is_cancelled():
             player_proc.terminate()
             break
 
-        # Kill hung player (e.g. Bluetooth out of range)
-        if dl_done.is_set() and not player_paused:
-            elapsed_since_dl = time.time() - start_time
-            if elapsed_since_dl > player_timeout:
-                player_proc.terminate()
-                break
-
-        # --- Voice-triggered barge-in ---
-        if barge_in_evt.is_set() and not player_paused:
-            # Pause by stopping data feed (no SIGSTOP — that kills Bluetooth)
-            _pause_event.set()
-            player_paused = True
-            if pause_start is None:
-                pause_start = time.time()
-            if chime_on_barge:
-                _play_sound(CHIME_PAUSE)
-            send_progress(progress_token, current_pct, 100, "⏸ You spoke — paused (listening...)")
-
-        # Wait for voice command resolution
-        if player_paused:
-            if voice_cmd[0] == "resume":
-                _pause_event.clear()
-                player_paused = False
-                barge_in_evt.clear()
-                voice_cmd[0] = None
-                if pause_start is not None:
-                    start_time += time.time() - pause_start
-                    pause_start = None
-                if chime_on_barge:
-                    _play_sound(CHIME_RESUME)
-                send_progress(progress_token, current_pct, 100, "🔊🎤 Resumed")
-            elif voice_cmd[0] == "repeat":
-                # Kill current player, replay from buffer
-                player_proc.terminate()
-                player_proc.wait()
-                player_paused = False
-                barge_in_evt.clear()
-                voice_cmd[0] = None
-                if pause_start is not None:
-                    pause_start = None
-                if chime_on_barge:
-                    _play_sound(CHIME_RESUME)
-                send_progress(progress_token, current_pct, 100, "🔊🎤 Repeating...")
-                if not _replay_audio():
-                    break
-                start_time = time.time()
-                current_pct = 0
-            elif voice_cmd[0] in ("stop", "reply"):
-                player_proc.terminate()
-                break
-            else:
-                # Still waiting for barge-in classification or "pause" (stay paused)
-                time.sleep(0.1)
-                continue
-
-        # --- MCP pause tool ---
-        if _pause_event.is_set():
-            if pause_start is None:
-                pause_start = time.time()
-                send_progress(progress_token, current_pct, 100, "⏸ Paused")
-            time.sleep(0.2)
-            continue
-        elif pause_start is not None and not player_paused:
-            start_time += time.time() - pause_start
-            pause_start = None
+        # Kill hung player (e.g. Bluetooth stall mid-stream or out of range)
+        if (time.time() - start_time) > player_timeout:
+            player_proc.terminate()
+            break
 
         elapsed = time.time() - start_time
         current_pct = int(min(1.0, elapsed / estimated_duration) * 100)
@@ -1606,9 +1584,9 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
         send_progress(progress_token, current_pct, 100, f"🔊🎤 {vu_prefix}{base_msg}")
         time.sleep(0.1)
 
+    tts_done.set()  # signal recording thread immediately
     dl_thread.join(timeout=2)
     unregister_proc(player_proc)
-    tts_done.set()
 
     if is_cancelled():
         rec_proc.terminate()
@@ -1617,58 +1595,6 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
         stop_hum()
         send_progress(progress_token, 100, 100, "⏹ Cancelled")
         return {"spoken": False, "cancelled": True, "text": ""}
-
-    # --- TTS done. Set up streaming STT WebSocket for real-time transcription ---
-    use_streaming_stt = HAS_WS
-    if use_streaming_stt:
-        try:
-            ws = _get_stt_ws()
-            rid = uuid.uuid4().hex
-            stt_request_id[0] = rid
-
-            # Drain stale messages
-            try:
-                ws.settimeout(0.05)
-                while True:
-                    ws.recv()
-            except Exception:
-                pass
-
-            # Send speech config
-            speech_config = {
-                "context": {
-                    "system": {"version": "1.0.00000"},
-                    "os": {"platform": "Linux", "name": "speech-to-cli"},
-                    "audio": {"source": {"connectivity": "Unknown", "manufacturer": "Unknown",
-                                         "model": "Unknown", "type": "Unknown"}},
-                }
-            }
-            config_msg = (
-                f"Path: speech.config\r\n"
-                f"X-RequestId: {rid}\r\n"
-                f"X-Timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())}\r\n"
-                f"Content-Type: application/json\r\n\r\n"
-                + json.dumps(speech_config)
-            )
-            ws.send(config_msg)
-
-            # Send WAV header
-            wav_header = struct.pack('<4sI4s4sIHHIIHH4sI',
-                b'RIFF', 0, b'WAVE', b'fmt ', 16, 1, 1, 16000, 32000, 2, 16, b'data', 0)
-            hdr_str = (
-                f"Path: audio\r\n"
-                f"X-RequestId: {rid}\r\n"
-                f"X-Timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())}\r\n"
-                f"Content-Type: audio/x-wav\r\n"
-            )
-            hdr_bytes = hdr_str.encode('ascii')
-            ws.send(struct.pack('>H', len(hdr_bytes)) + hdr_bytes + wav_header,
-                    opcode=websocket.ABNF.OPCODE_BINARY)
-
-            stt_ws[0] = ws  # recording thread will now stream frames to this WS
-        except Exception:
-            use_streaming_stt = False
-            _invalidate_stt_ws()
 
     # --- Wait for recording thread to finish (user speech + silence) ---
     # tts_done was already set above after player finished — recording thread uses it
@@ -1958,13 +1884,15 @@ TOOLS = [
     {
         "name": "talk",
         "description": (
-            "Say something out loud and listen for the user's reply at the same time. "
-            "This is the PRIMARY tool for voice conversations — it speaks your response "
-            "while simultaneously listening, so the user can interrupt or reply naturally. "
-            "The user can say 'pause', 'resume', 'stop', or 'repeat' during playback. "
-            "Just pass your message as 'text' and you'll get back what the user said. "
-            "Keep calling 'talk' each turn to continue the conversation. "
-            "Use 'speak' instead only when you want to say something final with no reply expected."
+            "Say something out loud and listen for the user's reply. "
+            "This is the PRIMARY tool for voice conversations. "
+            "CONVERSATION RULES: "
+            "(1) ALWAYS call 'talk' again after getting a result — NEVER drop to text mid-conversation. "
+            "(2) If '(no speech detected)', call 'talk' again with a short prompt — do NOT give up. "
+            "(3) Keep messages short and conversational (1-3 sentences). Long messages delay the user's reply. "
+            "(4) Treat this like a phone call — the user is on earbuds/speakers talking to a mic. "
+            "(5) Only use 'speak' for a true final goodbye. "
+            "(6) When the user types 'talk' in chat, start the voice conversation immediately."
         ),
         "inputSchema": {
             "type": "object",
@@ -2166,7 +2094,10 @@ def handle_request(req):
                     }
                 user_said = result.get("text", "")
                 content_text = user_said or "(no speech detected)"
-                content_text += "\n\n[Voice conversation active — call 'talk' again with your response to continue, or 'speak' for a final message with no reply needed.]"
+                if user_said:
+                    content_text += "\n\n[RESPOND NOW: call 'talk' with a short spoken reply. Do NOT type text to the user — they are listening on earbuds. Keep it conversational, 1-3 sentences.]"
+                else:
+                    content_text += "\n\n[No speech detected — the user may still be there. Call 'talk' again with a brief check-in like 'Hey, are you still there?' Do NOT drop to text.]"
                 return {
                     "jsonrpc": "2.0", "id": req_id,
                     "result": {"content": [{"type": "text", "text": content_text}]},
@@ -2205,7 +2136,10 @@ def handle_request(req):
                 }
             user_said = stt_result.get("text", stt_result.get("error", "")) if isinstance(stt_result, dict) else str(stt_result)
             content_text = user_said or "(no speech detected)"
-            content_text += "\n\n[Voice conversation active — call 'talk' again with your response to continue, or 'speak' for a final message with no reply needed.]"
+            if user_said:
+                content_text += "\n\n[RESPOND NOW: call 'talk' with a short spoken reply. Do NOT type text to the user — they are listening on earbuds. Keep it conversational, 1-3 sentences.]"
+            else:
+                content_text += "\n\n[No speech detected — the user may still be there. Call 'talk' again with a brief check-in like 'Hey, are you still there?' Do NOT drop to text.]"
             return {
                 "jsonrpc": "2.0", "id": req_id,
                 "result": {"content": [{"type": "text", "text": content_text}]},
