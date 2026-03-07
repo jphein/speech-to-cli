@@ -63,6 +63,11 @@ SAMPLE_RATE = 16000
 FRAME_MS = 30
 FRAME_BYTES = SAMPLE_RATE * 2 * FRAME_MS // 1000  # 960 bytes per 30ms frame
 
+# Echo cancellation (PipeWire)
+EC_SOURCE = "echo_cancel_source"  # cleaned mic (AEC output)
+EC_SINK = "echo_cancel_sink"      # TTS audio routes here so AEC can subtract it
+_has_echo_cancel = None  # lazy-detected
+
 # VAD + energy gate settings
 SILENCE_TIMEOUT = 3.0  # seconds of silence before stopping (increased for longer pauses)
 NO_SPEECH_TIMEOUT = 7.0  # bail out if no speech detected at all for this long
@@ -143,6 +148,22 @@ def resume_active():
                 os.kill(proc.pid, _sig.SIGCONT)
             except Exception:
                 pass
+
+
+def has_echo_cancel():
+    """Check if PipeWire echo cancellation nodes exist."""
+    global _has_echo_cancel
+    if _has_echo_cancel is not None:
+        return _has_echo_cancel
+    try:
+        result = subprocess.run(
+            ["pw-cli", "list-objects"],
+            capture_output=True, text=True, timeout=3,
+        )
+        _has_echo_cancel = EC_SOURCE in result.stdout
+    except Exception:
+        _has_echo_cancel = False
+    return _has_echo_cancel
 
 
 def load_config():
@@ -1087,6 +1108,289 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
     return {"spoken": True, "chars": len(text)}
 
 
+def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default",
+                    volume="default", seconds=30, mode=None, silence_timeout=None,
+                    progress_token=None):
+    """Speak and listen simultaneously using PipeWire echo cancellation.
+
+    TTS plays through the echo cancel sink; STT records from the echo cancel
+    source (which has the TTS audio subtracted). The user can speak at any
+    time — even while the AI is still talking.
+    """
+    stop_hum()
+
+    if not text or not isinstance(text, str):
+        return {"spoken": False, "error": "No text provided", "text": ""}
+    text = text[:_MAX_TTS_CHARS]
+
+    # --- Prepare TTS ---
+    if not voice:
+        voice = CONFIG["fast_voice"] if quality == "fast" else CONFIG["voice"]
+    voice = _sanitize_ssml_attr(voice, CONFIG["fast_voice"])
+    pitch = _sanitize_ssml_attr(pitch, "default")
+    volume = _sanitize_ssml_attr(volume, "default")
+
+    safe_text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    url = f"https://{CONFIG['region']}.tts.speech.microsoft.com/cognitiveservices/v1"
+
+    prosody_attrs = []
+    if quality == "fast":
+        prosody_attrs.append('rate="+15%"')
+    elif speed != 1.0:
+        rate_pct = int((speed - 1.0) * 100)
+        sign = "+" if rate_pct >= 0 else ""
+        prosody_attrs.append(f'rate="{sign}{rate_pct}%"')
+    if pitch != "default":
+        prosody_attrs.append(f'pitch="{pitch}"')
+    if volume != "default":
+        prosody_attrs.append(f'volume="{volume}"')
+
+    prosody_str = " ".join(prosody_attrs)
+    body_ssml = f'<prosody {prosody_str}>{safe_text}</prosody>' if prosody_str else safe_text
+    ssml = (
+        f'<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US">'
+        f'<voice name="{voice}">{body_ssml}</voice></speak>'
+    )
+    headers = {
+        "Ocp-Apim-Subscription-Key": CONFIG["key"],
+        "Content-Type": "application/ssml+xml",
+        "X-Microsoft-OutputFormat": "audio-16khz-32kbitrate-mono-mp3",
+    }
+
+    send_progress(progress_token, 0, 100, "🔊 Synthesizing...")
+    resp = get_http_session().post(url, headers=headers, data=ssml.encode("utf-8"), timeout=60, stream=True)
+    if resp.status_code != 200:
+        return {"spoken": False, "error": f"Azure TTS error {resp.status_code}: {resp.text}", "text": ""}
+
+    # --- Start STT recording from echo-cancelled source (piped for real-time VAD) ---
+    max_seconds = max(1, min(int(seconds or 30), 30))
+    stt_silence = float(silence_timeout) if silence_timeout else SILENCE_TIMEOUT
+
+    rec_proc = subprocess.Popen(
+        ["pw-record", "--target", EC_SOURCE,
+         "--format", "s16", "--rate", "16000", "--channels", "1",
+         "-"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    register_proc(rec_proc)
+
+    # Shared state for the recording thread
+    rec_frames = []
+    rec_done = threading.Event()
+    rec_speech_detected = threading.Event()
+    tts_done = threading.Event()
+
+    # --- Start TTS playback through echo cancel sink ---
+    # Use mpv with PipeWire target to route through AEC
+    player_proc = None
+    for player_cmd in [
+        ["mpv", "--no-terminal", "--no-video",
+         f"--audio-device=pipewire/{EC_SINK}", "-"],
+        ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-i", "pipe:0"],
+    ]:
+        try:
+            player_proc = subprocess.Popen(
+                player_cmd,
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            break
+        except FileNotFoundError:
+            continue
+
+    if player_proc is None:
+        rec_proc.terminate()
+        rec_proc.wait()
+        unregister_proc(rec_proc)
+        try:
+            os.unlink(rec_path)
+        except OSError:
+            pass
+        return {"spoken": False, "error": "No audio player found", "text": ""}
+
+    register_proc(player_proc)
+    send_progress(progress_token, 5, 100, "🔊🎤 Speaking + listening...")
+
+    # --- Background: read mic frames with VAD ---
+    def record_with_vad_bg():
+        """Record from echo-cancelled source, collecting frames until speech+silence."""
+        try:
+            vad = webrtcvad.Vad(VAD_AGGRESSIVENESS) if HAS_VAD else None
+            # Calibrate noise floor from first few frames
+            energy_threshold, cal_frames = calibrate_noise(rec_proc)
+            rec_frames.extend(cal_frames)
+
+            silence_frames = 0
+            speech_frames = 0
+            max_silence = int(stt_silence * 1000 / FRAME_MS)
+            max_no_speech = int(NO_SPEECH_TIMEOUT * 1000 / FRAME_MS)
+            min_speech = int(MIN_SPEECH_DURATION * 1000 / FRAME_MS)
+            max_total = int(max_seconds * 1000 / FRAME_MS)
+            total_frames = 0
+
+            while total_frames < max_total:
+                if is_cancelled():
+                    break
+                chunk = rec_proc.stdout.read(FRAME_BYTES)
+                if not chunk or len(chunk) < FRAME_BYTES:
+                    break
+                rec_frames.append(chunk)
+                total_frames += 1
+
+                if is_speech_energy(chunk, vad, energy_threshold):
+                    speech_frames += 1
+                    silence_frames = 0
+                    if not rec_speech_detected.is_set():
+                        rec_speech_detected.set()
+                else:
+                    silence_frames += 1
+
+                # Stop if user spoke then went silent
+                if speech_frames >= min_speech and silence_frames >= max_silence:
+                    break
+                # Bail out if no speech at all for too long (only after TTS done)
+                if speech_frames == 0 and tts_done.is_set() and total_frames >= max_no_speech:
+                    break
+        except Exception:
+            pass
+        finally:
+            rec_done.set()
+
+    rec_thread = threading.Thread(target=record_with_vad_bg, daemon=True)
+    rec_thread.start()
+
+    # --- Download TTS audio and pipe to player in background ---
+    def download_audio():
+        try:
+            for chunk in resp.iter_content(chunk_size=16384):
+                if is_cancelled():
+                    break
+                if chunk:
+                    player_proc.stdin.write(chunk)
+            player_proc.stdin.close()
+        except Exception:
+            pass
+
+    dl_thread = threading.Thread(target=download_audio, daemon=True)
+    dl_thread.start()
+
+    # --- Wait for TTS to finish playing, showing progress ---
+    speed_factor = 22.0 if quality == "fast" else 15.0
+    estimated_duration = max(1.0, len(text) / speed_factor)
+    start_time = time.time()
+    bars = [" ", "▂", "▃", "▄", "▅"]
+    show_vu = CONFIG.get("vu_meter", True)
+    show_subs = CONFIG.get("live_subtitles", True)
+    current_pct = 0
+    pause_start = None
+
+    while player_proc.poll() is None:
+        if is_cancelled():
+            player_proc.terminate()
+            break
+        if _pause_event.is_set():
+            if pause_start is None:
+                pause_start = time.time()
+                send_progress(progress_token, current_pct, 100, "⏸ Paused")
+            time.sleep(0.2)
+            continue
+        elif pause_start is not None:
+            start_time += time.time() - pause_start
+            pause_start = None
+
+        elapsed = time.time() - start_time
+        current_pct = int(min(1.0, elapsed / estimated_duration) * 100)
+        vu_prefix = f"{random.choice(bars)} " if show_vu else ""
+
+        if show_subs and len(text) > 0:
+            char_idx = int((current_pct / 100.0) * len(text))
+            window_size = max(40, _get_tty_width() - 25)
+            start_idx = max(0, char_idx - window_size)
+            snippet = text[start_idx:char_idx]
+            base_msg = f"Speaking+Listening: {snippet}"
+        else:
+            base_msg = "Speaking + Listening..."
+
+        send_progress(progress_token, current_pct, 100, f"🔊🎤 {vu_prefix}{base_msg}")
+        time.sleep(0.1)
+
+    dl_thread.join(timeout=2)
+    unregister_proc(player_proc)
+    tts_done.set()
+
+    if is_cancelled():
+        rec_proc.terminate()
+        rec_proc.wait()
+        unregister_proc(rec_proc)
+        stop_hum()
+        send_progress(progress_token, 100, 100, "⏹ Cancelled")
+        return {"spoken": False, "cancelled": True, "text": ""}
+
+    # --- TTS done. Wait for recording thread to finish (user speech + silence) ---
+    send_progress(progress_token, 70, 100, "🎤 Listening for your reply...")
+    # tts_done was already set above after player finished — recording thread uses it
+    # to activate the no-speech timeout (don't bail early while TTS is still playing)
+    rec_thread.join(timeout=max_seconds)
+
+    # Stop recording if still running
+    try:
+        rec_proc.terminate()
+        rec_proc.wait(timeout=1)
+    except Exception:
+        pass
+    unregister_proc(rec_proc)
+
+    if is_cancelled():
+        stop_hum()
+        send_progress(progress_token, 100, 100, "⏹ Cancelled")
+        return {"spoken": True, "cancelled": True, "text": ""}
+
+    # --- Transcribe the collected audio ---
+    send_progress(progress_token, 85, 100, "🧠 Transcribing...")
+
+    raw_data = b"".join(rec_frames)
+    if not raw_data or len(raw_data) < FRAME_BYTES:
+        stop_hum()
+        play_done()
+        send_progress(progress_token, 100, 100, "✅ Done")
+        return {"spoken": True, "text": ""}
+
+    wav_path = tempfile.mktemp(suffix=".wav")
+    try:
+        write_wav(wav_path, raw_data)
+
+        stt_url = f"https://{CONFIG['region']}.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1"
+        stt_headers = {
+            "Ocp-Apim-Subscription-Key": CONFIG["key"],
+            "Content-Type": "audio/wav; codecs=audio/pcm; samplerate=16000",
+        }
+        with open(wav_path, "rb") as f:
+            stt_resp = get_http_session().post(
+                stt_url, params={"language": "en-US", "format": "detailed"},
+                headers=stt_headers, data=f, timeout=30,
+            )
+        if stt_resp.status_code != 200:
+            user_text = ""
+        else:
+            result = stt_resp.json()
+            if result.get("RecognitionStatus") == "Success":
+                nbest = result.get("NBest", [])
+                user_text = nbest[0]["Display"] if nbest else result.get("DisplayText", "")
+            else:
+                user_text = ""
+    except Exception:
+        user_text = ""
+    finally:
+        try:
+            os.unlink(wav_path)
+        except OSError:
+            pass
+
+    stop_hum()
+    play_done()
+    send_progress(progress_token, 100, 100, "✅ Done")
+    return {"spoken": True, "text": user_text}
+
+
 def get_voices():
     """Fetch available voices from Azure."""
     url = f"https://{CONFIG['region']}.tts.speech.microsoft.com/cognitiveservices/voices/list"
@@ -1219,9 +1523,9 @@ TOOLS = [
     {
         "name": "talk",
         "description": (
-            "Say something out loud, then immediately listen for the user's reply. "
+            "Say something out loud and listen for the user's reply at the same time. "
             "This is the PRIMARY tool for voice conversations — it speaks your response "
-            "and waits for the user to talk back, all in one fast step. "
+            "while simultaneously listening, so the user can interrupt or reply naturally. "
             "Just pass your message as 'text' and you'll get back what the user said. "
             "Keep calling 'talk' each turn to continue the conversation. "
             "Use 'speak' instead only when you want to say something final with no reply expected."
@@ -1327,7 +1631,7 @@ def handle_request(req):
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {"listChanged": True}},
-                "serverInfo": {"name": "azure-speech", "version": "3.6.0"},
+                "serverInfo": {"name": "azure-speech", "version": "4.0.0"},
             },
         }
     elif method == "notifications/initialized":
@@ -1391,7 +1695,6 @@ def handle_request(req):
                 "result": {"content": [{"type": "text", "text": msg}]},
             }
         elif tool_name == "talk":
-            # Combo: speak then immediately listen — eliminates round-trip latency
             speak_text = args.get("text", "")
             if not speak_text or not isinstance(speak_text, str):
                 return {
@@ -1405,6 +1708,35 @@ def handle_request(req):
             if not isinstance(speed_val, (int, float)):
                 speed_val = 1.0
             speed_val = max(0.5, min(float(speed_val), 3.0))
+
+            # Use full-duplex if echo cancellation is available
+            if has_echo_cancel():
+                result = talk_fullduplex(
+                    speak_text,
+                    quality=quality,
+                    speed=speed_val,
+                    voice=args.get("voice"),
+                    pitch=args.get("pitch", "default"),
+                    volume=args.get("volume", "default"),
+                    seconds=args.get("seconds"),
+                    mode=args.get("mode"),
+                    silence_timeout=args.get("silence_timeout"),
+                    progress_token=progress_token,
+                )
+                if result.get("cancelled"):
+                    return {
+                        "jsonrpc": "2.0", "id": req_id,
+                        "result": {"content": [{"type": "text", "text": "(cancelled)"}]},
+                    }
+                user_said = result.get("text", "")
+                content_text = user_said or "(no speech detected)"
+                content_text += "\n\n[Voice conversation active — call 'talk' again with your response to continue, or 'speak' for a final message with no reply needed.]"
+                return {
+                    "jsonrpc": "2.0", "id": req_id,
+                    "result": {"content": [{"type": "text", "text": content_text}]},
+                }
+
+            # Fallback: sequential speak then listen
             tts_result = tts(
                 speak_text,
                 quality=quality,
@@ -1424,7 +1756,6 @@ def handle_request(req):
                     "jsonrpc": "2.0", "id": req_id,
                     "result": {"content": [{"type": "text", "text": tts_result.get("error", "TTS failed")}]},
                 }
-            # Now immediately listen
             stt_result = stt(
                 seconds=args.get("seconds"),
                 mode=args.get("mode"),
