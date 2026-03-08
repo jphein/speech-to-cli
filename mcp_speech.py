@@ -1294,6 +1294,14 @@ def stt(seconds=None, mode=None, silence_timeout=None, vad_aggressiveness=None, 
 # ---------------------------------------------------------------------------
 
 _SSML_SAFE_RE = re.compile(r'^[a-zA-Z0-9\-_.:+%() ]+$')
+_last_tts_end = 0.0  # monotonic timestamp of last TTS playback end
+
+
+def _tts_lead_in_ms():
+    """Lead-in only on first TTS call (device cold). Zero afterwards."""
+    if _last_tts_end == 0.0:
+        return 200  # First call — device needs to wake up
+    return 0
 
 def _sanitize_ssml_attr(value, default="default"):
     """Reject values that could inject SSML markup."""
@@ -1386,9 +1394,9 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
 
         def download_audio():
             try:
-                # Lead-in silence (~150ms) prevents first-syllable clipping
-                # when audio device needs to wake up (Bluetooth, HDMI, etc.)
-                silence_bytes = b"\x00" * (tts_rate * 2 * 150 // 1000)  # 150ms of 16-bit silence
+                # Adaptive lead-in silence prevents first-syllable clipping
+                lead_ms = _tts_lead_in_ms()
+                silence_bytes = b"\x00" * (tts_rate * 2 * lead_ms // 1000)
                 proc.stdin.write(silence_bytes)
                 proc.stdin.flush()
                 for chunk in resp.iter_content(chunk_size=16384):
@@ -1473,6 +1481,8 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
             return {"spoken": False, "cancelled": True}
         send_progress(progress_token, 100, 100, "✅ Done")
     play_done()
+    global _last_tts_end
+    _last_tts_end = time.monotonic()
     return {"spoken": True, "chars": len(text)}
 
 
@@ -1745,8 +1755,9 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
 
     def download_audio():
         try:
-            # Lead-in silence (~150ms) prevents first-syllable clipping
-            silence_bytes = b"\x00" * (tts_rate * 2 * 150 // 1000)
+            # Adaptive lead-in silence prevents first-syllable clipping
+            lead_ms = _tts_lead_in_ms()
+            silence_bytes = b"\x00" * (tts_rate * 2 * lead_ms // 1000)
             try:
                 player_proc.stdin.write(silence_bytes)
                 player_proc.stdin.flush()
@@ -1902,6 +1913,8 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                 pass
         stop_hum()
         play_done()
+        global _last_tts_end
+        _last_tts_end = time.monotonic()
         send_progress(progress_token, 100, 100, "✅ Done")
         return {"spoken": True, "text": ""}
 
@@ -1975,6 +1988,8 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
 
     stop_hum()
     play_done()
+    global _last_tts_end
+    _last_tts_end = time.monotonic()
     send_progress(progress_token, 100, 100, "✅ Done")
 
     # Pre-warm TTS connection for next call (saves ~150ms on next talk)
