@@ -2036,9 +2036,10 @@ TOOLS = [
     {
         "name": "configure",
         "description": (
-            "View or change audio settings on the fly. Call with no arguments to see current settings. "
+            "View or change audio settings on the fly. Call with no arguments to see current settings "
+            "(includes detected audio output device and echo cancel status). "
             "Pass any setting as a key-value pair to update it. Changes are saved to disk and take "
-            "effect immediately."
+            "effect immediately. half_duplex defaults to 'auto' which detects headphones vs speakers."
         ),
         "inputSchema": {
             "type": "object",
@@ -2077,7 +2078,7 @@ TOOLS = [
             "(1) ALWAYS call 'talk' again after getting a result — NEVER drop to text mid-conversation. "
             "(2) If '(no speech detected)', call 'talk' again with a short prompt — do NOT give up. "
             "(3) Keep messages short and conversational (1-3 sentences). Long messages delay the user's reply. "
-            "(4) Treat this like a phone call — the user is on earbuds/speakers talking to a mic. "
+            "(4) Treat this like a phone call — the user is talking to a mic. Half-duplex auto-detects speakers vs headphones. "
             "(5) Only use 'speak' for a true final goodbye. "
             "(6) When the user types 'talk' in chat, start the voice conversation immediately. "
             "TOKEN ECONOMY: "
