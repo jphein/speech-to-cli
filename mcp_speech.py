@@ -1303,6 +1303,13 @@ def _tts_lead_in_ms():
         return 200
     return 0
 
+
+def _mark_tts_end():
+    """Record when TTS playback finished (for adaptive lead-in)."""
+    global _last_tts_end
+    _last_tts_end = time.monotonic()
+
+
 def _sanitize_ssml_attr(value, default="default"):
     """Reject values that could inject SSML markup."""
     if not value or not isinstance(value, str):
@@ -1481,8 +1488,7 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
             return {"spoken": False, "cancelled": True}
         send_progress(progress_token, 100, 100, "✅ Done")
     play_done()
-    global _last_tts_end
-    _last_tts_end = time.monotonic()
+    _mark_tts_end()
     return {"spoken": True, "chars": len(text)}
 
 
@@ -1913,8 +1919,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                 pass
         stop_hum()
         play_done()
-        global _last_tts_end
-        _last_tts_end = time.monotonic()
+        _mark_tts_end()
         send_progress(progress_token, 100, 100, "✅ Done")
         return {"spoken": True, "text": ""}
 
@@ -1988,8 +1993,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
 
     stop_hum()
     play_done()
-    global _last_tts_end
-    _last_tts_end = time.monotonic()
+    _mark_tts_end()
     send_progress(progress_token, 100, 100, "✅ Done")
 
     # Pre-warm TTS connection for next call (saves ~150ms on next talk)
