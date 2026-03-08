@@ -1610,64 +1610,44 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
             use_streaming_stt = False
             _invalidate_stt_ws()
 
-    # --- Background WS reader for live subtitles + early result ---
-    stt_partial = [""]  # live hypothesis text, updated by reader thread
+    # --- Live subtitle state (updated by recording thread via inline WS recv) ---
+    stt_partial = [""]  # live hypothesis text
     stt_phrase_done = threading.Event()
 
-    def _ws_reader():
-        """Read STT WebSocket in background for live subtitles during full-duplex."""
-        ws = stt_ws[0]
-        if not ws:
-            sys.stderr.write("[ws_reader] no ws, exiting\n"); sys.stderr.flush()
+    def _try_recv_ws(ws):
+        """Non-blocking read of WS hypothesis/phrase messages (inline in recording thread)."""
+        try:
+            ws.settimeout(0.001)
+            msg = ws.recv()
+        except Exception:
             return
-        sys.stderr.write("[ws_reader] started\n"); sys.stderr.flush()
-        msg_count = 0
-        while not rec_done.is_set() and not is_cancelled():
+        if not isinstance(msg, str):
+            return
+        parts = msg.split("\r\n\r\n", 1)
+        if len(parts) < 2:
+            return
+        hdr, body = parts
+        hdr_lower = hdr.lower()
+        if "speech.hypothesis" in hdr_lower:
             try:
-                ws.settimeout(0.3)
-                msg = ws.recv()
-            except Exception as e:
-                if rec_done.is_set() or is_cancelled():
-                    break
-                continue
-            msg_count += 1
-            if isinstance(msg, bytes):
-                sys.stderr.write(f"[ws_reader] binary msg #{msg_count} ({len(msg)} bytes)\n"); sys.stderr.flush()
-                continue
-            if isinstance(msg, str):
-                parts = msg.split("\r\n\r\n", 1)
-                if len(parts) < 2:
-                    continue
-                hdr, body = parts
-                hdr_lower = hdr.lower()
-                sys.stderr.write(f"[ws_reader] msg #{msg_count}: {hdr.splitlines()[0]}\n"); sys.stderr.flush()
-                if "speech.hypothesis" in hdr_lower:
-                    try:
-                        partial = json.loads(body).get("Text", "")
-                        if partial:
-                            sys.stderr.write(f"[ws_reader] hypothesis: {partial}\n"); sys.stderr.flush()
-                            term_width = _get_tty_width()
-                            window = max(40, term_width - 25)
-                            stt_partial[0] = partial if len(partial) < window else "..." + partial[-(window-3):]
-                    except Exception:
-                        pass
-                elif "speech.phrase" in hdr.lower():
-                    try:
-                        data = json.loads(body)
-                        if data.get("RecognitionStatus") == "Success":
-                            nbest = data.get("NBest", [])
-                            stt_result[0] = nbest[0]["Display"] if nbest else data.get("DisplayText", "")
-                    except Exception:
-                        pass
-                    stt_phrase_done.set()
-                    break
-                elif "turn.end" in hdr.lower():
-                    stt_phrase_done.set()
-                    break
-
-    if use_streaming_stt and stt_ws[0]:
-        ws_reader = threading.Thread(target=_ws_reader, daemon=True)
-        ws_reader.start()
+                partial = json.loads(body).get("Text", "")
+                if partial:
+                    term_width = _get_tty_width()
+                    window = max(40, term_width - 25)
+                    stt_partial[0] = partial if len(partial) < window else "..." + partial[-(window-3):]
+            except Exception:
+                pass
+        elif "speech.phrase" in hdr_lower:
+            try:
+                data = json.loads(body)
+                if data.get("RecognitionStatus") == "Success":
+                    nbest = data.get("NBest", [])
+                    stt_result[0] = nbest[0]["Display"] if nbest else data.get("DisplayText", "")
+            except Exception:
+                pass
+            stt_phrase_done.set()
+        elif "turn.end" in hdr_lower:
+            stt_phrase_done.set()
 
     # --- Barge-in config ---
     barge_trigger_frames = max(1, int(CONFIG.get("barge_in_frames", 3)))
@@ -1713,6 +1693,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                         try:
                             ws.send(_make_ws_audio_msg(rid, chunk),
                                     opcode=websocket.ABNF.OPCODE_BINARY)
+                            _try_recv_ws(ws)
                         except Exception:
                             pass
 
@@ -1745,6 +1726,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                     try:
                         ws.send(_make_ws_audio_msg(rid, chunk),
                                 opcode=websocket.ABNF.OPCODE_BINARY)
+                        _try_recv_ws(ws)
                     except Exception:
                         pass
 
@@ -1941,8 +1923,32 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                            opcode=websocket.ABNF.OPCODE_BINARY)
         except Exception:
             pass
-        # Wait for WS reader thread to get the final phrase (most work already done)
-        stt_phrase_done.wait(timeout=5)
+        # Drain remaining WS messages to get final phrase (most work already done inline)
+        if not stt_phrase_done.is_set():
+            deadline = time.time() + 5
+            ws = stt_ws[0]
+            while time.time() < deadline:
+                try:
+                    ws.settimeout(1.0)
+                    msg = ws.recv()
+                except Exception:
+                    break
+                if isinstance(msg, str):
+                    parts = msg.split("\r\n\r\n", 1)
+                    if len(parts) < 2:
+                        continue
+                    hdr, body = parts
+                    if "speech.phrase" in hdr.lower():
+                        try:
+                            data = json.loads(body)
+                            if data.get("RecognitionStatus") == "Success":
+                                nbest = data.get("NBest", [])
+                                stt_result[0] = nbest[0]["Display"] if nbest else data.get("DisplayText", "")
+                        except Exception:
+                            pass
+                        break
+                    elif "turn.end" in hdr.lower():
+                        break
         user_text = stt_result[0]
     else:
         # Fallback: REST STT
