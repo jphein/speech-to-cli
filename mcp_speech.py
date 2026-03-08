@@ -312,7 +312,7 @@ def _generate_chimes():
     _make(CHIME_PATH, [(880, 0.03, 0.3), (1175, 0.05, 0.4)])          # ready: ascending
     _make(CHIME_PROCESSING, [(1320, 0.025, 0.2)])                       # processing: soft blip
     _make(CHIME_SPEAK, [(1175, 0.03, 0.25), (880, 0.04, 0.3)])         # speak: descending
-    _make(CHIME_DONE, [(1047, 0.02, 0.15), (0, 0.02, 0), (1047, 0.02, 0.15)])  # done: double tap
+    _make(CHIME_DONE, [(1175, 0.03, 0.2), (880, 0.05, 0.15)])                    # done: soft descending (mirrors ready)
     _make(CHIME_HUM, [(150, 1.0, 0.1)])                                # hum: 150Hz steady
     _make(CHIME_PAUSE, [(660, 0.04, 0.25), (440, 0.06, 0.2)])         # pause: descending low
     _make(CHIME_RESUME, [(440, 0.04, 0.2), (660, 0.06, 0.25)])        # resume: ascending low
@@ -1844,8 +1844,11 @@ TOOLS = [
         "name": "converse",
         "description": (
             "Listen to the user through their microphone and return what they said as text. "
-            "Use this to START a voice conversation (listen first, then respond with 'talk'). "
-            "For ongoing back-and-forth, prefer 'talk' which speaks AND listens in one step."
+            "Use this to START a voice conversation. After getting the user's words, respond "
+            "with 'speak' (to say something) then 'converse' again (to listen for their reply). "
+            "This speak→converse loop lets you call other tools between turns — research, "
+            "edit files, query APIs — then speak results and listen for the next instruction. "
+            "Use 'talk' only when you need a fast atomic speak+listen with no tools in between."
         ),
         "inputSchema": {
             "type": "object",
@@ -2049,7 +2052,7 @@ def handle_request(req):
             text = result.get("text", result.get("error", ""))
             content_text = text or "(no speech detected)"
             if tool_name == "converse":
-                content_text += "\n\n[Voice conversation active — call 'talk' with your response to speak and listen in one step, or call 'speak' for a final message with no reply needed.]"
+                content_text += "\n\n[Voice conversation active — call 'speak' to reply, then call 'converse' to listen again. You may call other tools (search, edit, query) between speak and converse. Keep spoken replies short (1-3 sentences). Use 'speak' for a final goodbye with no reply needed.]"
             return {
                 "jsonrpc": "2.0", "id": req_id,
                 "result": {"content": [{"type": "text", "text": content_text}]},
