@@ -222,6 +222,52 @@ def _prewarm():
 
 
 # ---------------------------------------------------------------------------
+# Pre-warmed recorder (cuts ~500ms from listen/converse startup)
+# ---------------------------------------------------------------------------
+_prewarmed_rec = None  # subprocess.Popen or None
+_prewarmed_rec_lock = threading.Lock()
+
+
+def _prewarm_recorder():
+    """Start a recorder process in background so next listen/converse is instant."""
+    global _prewarmed_rec
+    with _prewarmed_rec_lock:
+        if _prewarmed_rec is not None:
+            return  # already pre-warmed
+        try:
+            proc = subprocess.Popen(
+                _build_rec_cmd(),
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
+            _prewarmed_rec = proc
+        except Exception:
+            pass
+
+
+def _take_prewarmed_rec():
+    """Take the pre-warmed recorder if available, or return None."""
+    global _prewarmed_rec
+    with _prewarmed_rec_lock:
+        proc = _prewarmed_rec
+        _prewarmed_rec = None
+        return proc
+
+
+def _discard_prewarmed_rec():
+    """Kill and discard any pre-warmed recorder (e.g. on shutdown)."""
+    global _prewarmed_rec
+    with _prewarmed_rec_lock:
+        proc = _prewarmed_rec
+        _prewarmed_rec = None
+    if proc:
+        try:
+            proc.terminate()
+            proc.wait(timeout=1)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Audio device helpers
 # ---------------------------------------------------------------------------
 
@@ -690,10 +736,12 @@ def stt_streaming(max_seconds=30, progress_token=None):
 
         play_chime()
         send_progress(progress_token, 0, 100, "🎤 Listening...")
-        proc = subprocess.Popen(
-            _build_rec_cmd(max_seconds=max_seconds),
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        )
+        proc = _take_prewarmed_rec()
+        if proc is None:
+            proc = subprocess.Popen(
+                _build_rec_cmd(max_seconds=max_seconds),
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
         register_proc(proc)
 
         result_text = []
@@ -860,10 +908,12 @@ def stt_vad(max_seconds=30, progress_token=None):
     try:
         play_chime()
         send_progress(progress_token, 10, 100, "🎤 Listening...")
-        proc = subprocess.Popen(
-            _build_rec_cmd(),
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        )
+        proc = _take_prewarmed_rec()
+        if proc is None:
+            proc = subprocess.Popen(
+                _build_rec_cmd(),
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
         register_proc(proc)
 
         frames, _ = record_with_vad(proc, max_seconds)
@@ -913,10 +963,12 @@ def stt_whisper(max_seconds=30, progress_token=None):
     try:
         play_chime()
         send_progress(progress_token, 0, 100, "🎤 Listening...")
-        proc = subprocess.Popen(
-            _build_rec_cmd(),
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        )
+        proc = _take_prewarmed_rec()
+        if proc is None:
+            proc = subprocess.Popen(
+                _build_rec_cmd(),
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
         register_proc(proc)
 
         if HAS_VAD:
@@ -2087,6 +2139,8 @@ def handle_request(req):
                 msg = "(cancelled)"
             else:
                 msg = "Spoke the text aloud." if result.get("spoken") else result.get("error", "Failed")
+                # Pre-warm recorder so next converse/listen starts ~500ms faster
+                threading.Thread(target=_prewarm_recorder, daemon=True).start()
             return {
                 "jsonrpc": "2.0", "id": req_id,
                 "result": {"content": [{"type": "text", "text": msg}]},
@@ -2156,6 +2210,8 @@ def handle_request(req):
                     "jsonrpc": "2.0", "id": req_id,
                     "result": {"content": [{"type": "text", "text": tts_result.get("error", "TTS failed")}]},
                 }
+            # Pre-warm recorder so stt() starts ~500ms faster
+            _prewarm_recorder()
             stt_result = stt(
                 seconds=args.get("seconds"),
                 mode=args.get("mode"),
