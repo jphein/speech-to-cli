@@ -2430,7 +2430,8 @@ def handle_request(req):
                     bt_msg = f"Bluetooth profile switch failed: {e}. "
 
             # Update config settings
-            settable = {"player", "recorder", "mic_source", "speaker_sink",
+            settable = {"key", "region",
+                        "player", "recorder", "mic_source", "speaker_sink",
                         "silence_timeout", "talk_silence_timeout", "voice", "fast_voice",
                         "half_duplex", "chime_ready", "chime_processing", "chime_speak",
                         "chime_done", "chime_hum", "chime_barge_in", "visual_indicator",
@@ -2441,6 +2442,12 @@ def handle_request(req):
                 if k in settable:
                     if v == "null" or v is None:
                         CONFIG[k] = None
+                    elif k in ("key", "region"):
+                        CONFIG[k] = str(v)
+                        # Invalidate cached connections so they reconnect to new endpoint
+                        global _http_session, _persistent_ws
+                        _http_session = None
+                        _invalidate_stt_ws()
                     elif k == "half_duplex":
                         global _half_duplex_setting, _last_detected_sink_id
                         if isinstance(v, str) and v.lower() == "auto":
