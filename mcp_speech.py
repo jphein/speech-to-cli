@@ -347,9 +347,12 @@ def _refresh_audio_detection():
     CONFIG["_detected_output"] = dev_type
     CONFIG["_detected_output_info"] = dev_info
     if new_half_duplex != old_half_duplex:
-        _print_status(
-            f"Audio: {dev_info.get('description', '?')} → {'half' if new_half_duplex else 'full'}-duplex",
-            "93")  # Yellow
+        try:
+            _print_status(
+                f"Audio: {dev_info.get('description', '?')} \u2192 {'half' if new_half_duplex else 'full'}-duplex",
+                "93")  # Yellow
+        except NameError:
+            pass  # _print_status not yet defined during module startup
 
 
 # Initial detection on startup
