@@ -1908,8 +1908,7 @@ TOOLS = [
     {
         "name": "talk",
         "description": (
-            "Say something out loud and listen for the user's reply. "
-            "This is the PRIMARY tool for voice conversations. "
+            "Say something out loud and listen for the user's reply. This is the PRIMARY tool for voice conversations. "
             "CONVERSATION RULES: "
             "(1) ALWAYS call 'talk' again after getting a result — NEVER drop to text mid-conversation. "
             "(2) If '(no speech detected)', call 'talk' again with a short prompt — do NOT give up. "
@@ -1922,7 +1921,11 @@ TOOLS = [
             "(B) Never echo back what the user said — they already know. "
             "(C) Do NOT output any text to the chat between talk calls — the user cannot see it while on earbuds. "
             "(D) Skip preamble like 'Sure!' or 'Great question!' — just answer directly. "
-            "TYPED INPUT: If this call is cancelled and the user typed a message, respond to their text normally — do not call talk again unless they ask."
+            "TYPED INPUT: If this call is cancelled and the user typed a message, respond to their text normally — do not call talk again unless they ask. "
+            "SWITCHING MODES: If the user asks you to do something that requires calling other tools (search, edit, "
+            "query APIs, read files), switch to the speak→converse pattern: call 'speak' with your response, do your "
+            "tool calls, then call 'speak' with results and 'converse' to listen. Switch back to 'talk' for quick "
+            "back-and-forth that doesn't need tool calls in between."
         ),
         "inputSchema": {
             "type": "object",
@@ -2052,7 +2055,7 @@ def handle_request(req):
             text = result.get("text", result.get("error", ""))
             content_text = text or "(no speech detected)"
             if tool_name == "converse":
-                content_text += "\n\n[Voice conversation active — call 'speak' to reply, then call 'converse' to listen again. You may call other tools (search, edit, query) between speak and converse. Keep spoken replies short (1-3 sentences). Use 'speak' for a final goodbye with no reply needed.]"
+                content_text += "\n\n[Voice conversation active — call 'speak' to reply, then call 'converse' to listen again. You may call other tools (search, edit, query) between speak and converse. Keep spoken replies short (1-3 sentences). For quick back-and-forth with no tools needed, switch to 'talk'. Use 'speak' for a final goodbye with no reply needed.]"
             return {
                 "jsonrpc": "2.0", "id": req_id,
                 "result": {"content": [{"type": "text", "text": content_text}]},
@@ -2125,7 +2128,7 @@ def handle_request(req):
                 user_said = result.get("text", "")
                 content_text = user_said or "(no speech detected)"
                 if user_said:
-                    content_text += "\n\n[Call 'talk' now. Keep reply under 2 sentences. No chat text — user is on earbuds.]"
+                    content_text += "\n\n[Call 'talk' now. Keep reply under 2 sentences. No chat text — user is on earbuds. If you need to call tools first, switch to speak→converse pattern.]"
                 else:
                     content_text += "\n\n[No speech — call 'talk' with a short check-in. Don't drop to text.]"
                 return {
@@ -2167,7 +2170,7 @@ def handle_request(req):
             user_said = stt_result.get("text", stt_result.get("error", "")) if isinstance(stt_result, dict) else str(stt_result)
             content_text = user_said or "(no speech detected)"
             if user_said:
-                content_text += "\n\n[RESPOND NOW: call 'talk' with a short spoken reply. Do NOT type text to the user — they are listening on earbuds. Keep it conversational, 1-3 sentences.]"
+                content_text += "\n\n[RESPOND NOW: call 'talk' with a short spoken reply. Do NOT type text to the user — they are listening on earbuds. Keep it conversational, 1-3 sentences. If you need to call tools first, switch to speak→converse pattern.]"
             else:
                 content_text += "\n\n[No speech detected — the user may still be there. Call 'talk' again with a brief check-in like 'Hey, are you still there?' Do NOT drop to text.]"
             return {
