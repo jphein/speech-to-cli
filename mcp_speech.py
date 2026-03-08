@@ -1330,12 +1330,13 @@ def multi_speak(segments, quality="fast", progress_token=None):
     if not segments:
         return {"error": "No segments"}
 
-    send_progress(progress_token, 0, 100, "🔊 Synthesizing all voices...")
+    send_progress(progress_token, 1, 100, "🔊 Starting...")
 
     tts_rate = 48000 if quality == "hd" else 24000
     session = get_http_session()
-    audio_buffers = [None] * len(segments)
-    errors = [None] * len(segments)
+    n_seg = len(segments)
+    audio_buffers = [None] * n_seg
+    errors = [None] * n_seg
 
     def fetch_one(idx, seg):
         text = seg.get("text", "")[:_MAX_TTS_CHARS]
@@ -1353,7 +1354,7 @@ def multi_speak(segments, quality="fast", progress_token=None):
         except Exception as e:
             errors[idx] = str(e)
 
-    # Fire all TTS requests in parallel
+    # Fire all TTS requests in parallel — synthesis is fast, don't poll
     threads = []
     for i, seg in enumerate(segments):
         t = threading.Thread(target=fetch_one, args=(i, seg), daemon=True)
@@ -1362,14 +1363,11 @@ def multi_speak(segments, quality="fast", progress_token=None):
     for t in threads:
         t.join(timeout=35)
 
-    send_progress(progress_token, 50, 100, "🔊 Playing...")
-
-    # Play each audio buffer sequentially
+    # Unified smooth progress 0→100% during playback
     spoken = 0
     lead_ms = _tts_lead_in_ms()
     silence_bytes = b"\x00" * (tts_rate * 2 * lead_ms // 1000)
-    # Small gap between segments (100ms silence)
-    gap_bytes = b"\x00" * (tts_rate * 2 * 100 // 1000)
+    pct = 1
 
     for i, audio in enumerate(audio_buffers):
         if is_cancelled():
@@ -1386,7 +1384,12 @@ def multi_speak(segments, quality="fast", progress_token=None):
             proc.stdin.write(silence_bytes)
             proc.stdin.write(audio)
             proc.stdin.close()
-            proc.wait(timeout=30)
+            # Poll proc — creep +1% per tick while audio plays
+            seg_target = int(((i + 1) / n_seg) * 99)
+            while proc.poll() is None:
+                pct = min(pct + 2, seg_target)
+                send_progress(progress_token, pct, 100, f"🔊 Playing {i + 1}/{n_seg}...")
+                time.sleep(0.2)
             spoken += 1
         except Exception:
             try:
@@ -1396,9 +1399,10 @@ def multi_speak(segments, quality="fast", progress_token=None):
         finally:
             unregister_proc(proc)
 
-        pct = 50 + int(50 * (i + 1) / len(segments))
-        send_progress(progress_token, pct, 100, f"🔊 Played {i + 1}/{len(segments)}")
+        pct = seg_target
+        send_progress(progress_token, pct, 100, f"🔊 Played {i + 1}/{n_seg}")
 
+    send_progress(progress_token, 100, 100, f"🔊 Done — {spoken} segments")
     return {"spoken": spoken}
 
 
