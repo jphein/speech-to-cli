@@ -1354,14 +1354,16 @@ def multi_speak(segments, quality="fast", progress_token=None):
         except Exception as e:
             errors[idx] = str(e)
 
-    # Fire all TTS requests in parallel — synthesis is fast, don't poll
+    # Fire all TTS requests in parallel — wait only until all finish (not 35s worst case)
     threads = []
     for i, seg in enumerate(segments):
         t = threading.Thread(target=fetch_one, args=(i, seg), daemon=True)
         t.start()
         threads.append(t)
-    for t in threads:
-        t.join(timeout=35)
+    # Poll threads every 50ms instead of blocking 35s per thread
+    deadline = time.time() + 30
+    while time.time() < deadline and any(t.is_alive() for t in threads):
+        time.sleep(0.05)
 
     # Unified smooth progress 0→100% during playback
     spoken = 0
