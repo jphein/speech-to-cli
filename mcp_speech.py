@@ -2154,7 +2154,7 @@ TOOLS = [
             "TOKEN ECONOMY: "
             "(A) Keep 'text' under 2 sentences — speech is slower than reading, so less is more. "
             "(B) Never echo back what the user said — they already know. "
-            "(C) Do NOT output any text to the chat between talk calls — the user cannot see it while on earbuds. "
+            "(C) Do NOT output any text to the chat between talk calls — the user is listening via audio. "
             "(D) Skip preamble like 'Sure!' or 'Great question!' — just answer directly. "
             "TYPED INPUT: If this call is cancelled and the user typed a message, respond to their text normally — do not call talk again unless they ask. "
             "SWITCHING MODES: If the user asks you to do something that requires calling other tools (search, edit, "
@@ -2273,9 +2273,9 @@ def handle_request(req):
     elif method == "tools/call":
         tool_name = params.get("name")
         args = params.get("arguments", {})
-        # Auto-refresh audio detection in background (~12ms, non-blocking)
+        # Auto-refresh audio detection synchronously (~12ms, ~35ms on change)
         if tool_name in ("listen", "converse", "speak", "talk"):
-            threading.Thread(target=_refresh_audio_detection, daemon=True).start()
+            _refresh_audio_detection()
         if tool_name in ("listen", "converse"):
             result = stt(
                 seconds=args.get("seconds"),
@@ -2376,8 +2376,9 @@ def handle_request(req):
                     }
                 user_said = result.get("text", "")
                 content_text = user_said or "(no speech detected)"
+                _audio_hint = "on earbuds" if CONFIG.get("_detected_output") == "headphones" else "on speakers"
                 if user_said:
-                    content_text += "\n\n[Call 'talk' now. Keep reply under 2 sentences. No chat text — user is on earbuds. If you need to call tools first, switch to speak→converse pattern.]"
+                    content_text += f"\n\n[Call 'talk' now. Keep reply under 2 sentences. No chat text — user is {_audio_hint}. If you need to call tools first, switch to speak→converse pattern.]"
                 else:
                     content_text += "\n\n[No speech — call 'talk' with a short check-in. Don't drop to text.]"
                 return {
@@ -2435,8 +2436,9 @@ def handle_request(req):
                 except Exception:
                     pass
             threading.Thread(target=_keep_tts_alive_talk, daemon=True).start()
+            _audio_hint2 = "on earbuds" if CONFIG.get("_detected_output") == "headphones" else "on speakers"
             if user_said:
-                content_text += "\n\n[RESPOND NOW: call 'talk' with a short spoken reply. Do NOT type text to the user — they are listening on earbuds. Keep it conversational, 1-3 sentences. If you need to call tools first, switch to speak→converse pattern.]"
+                content_text += f"\n\n[RESPOND NOW: call 'talk' with a short spoken reply. Do NOT type text to the user — they are {_audio_hint2}. Keep it conversational, 1-3 sentences. If you need to call tools first, switch to speak→converse pattern.]"
             else:
                 content_text += "\n\n[No speech detected — the user may still be there. Call 'talk' again with a brief check-in like 'Hey, are you still there?' Do NOT drop to text.]"
             return {
