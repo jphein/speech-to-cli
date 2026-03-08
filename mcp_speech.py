@@ -1846,7 +1846,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
             snippet = text[start_idx:char_idx]
             user_partial = stt_partial[0]
             if user_partial:
-                base_msg = f"🗣 {user_partial} | 🔊 {snippet}"
+                base_msg = f"🗣 {user_partial}\n🔊 {snippet}"
             else:
                 base_msg = f"Speaking: {snippet}"
         else:
