@@ -186,7 +186,7 @@ Or add manually to your `~/.gemini/settings.json`:
 
 ---
 
-Restart your CLI — it will now have `listen`, `speak`, and `converse` tools available. Just say "listen" and your AI will record your voice, transcribe it, and respond. Ask it to "speak" and it'll read its response aloud. Use "converse" for a continuous voice chat loop.
+Restart your CLI — it will now have `listen`, `speak`, `multi_speak`, and `converse` tools available. Just say "listen" and your AI will record your voice, transcribe it, and respond. Ask it to "speak" and it'll read its response aloud. Use "converse" for a continuous voice chat loop. Use `multi_speak` for multi-agent conversations where each agent speaks with a different voice.
 
 **MCP Tools:**
 
@@ -195,6 +195,7 @@ Restart your CLI — it will now have `listen`, `speak`, and `converse` tools av
 | `listen` | `seconds` (1-30), `mode` (streaming/vad/whisper/fixed) | Records from mic, returns transcribed text |
 | `speak` | `text` (required), `quality` (fast/hd) | Speaks text aloud via Azure TTS |
 | `converse` | `seconds`, `mode` | Like `listen`, but signals conversational intent — Copilot will speak its reply then listen again |
+| `multi_speak` | `segments` (array of {text, voice}), `quality` (fast/hd) | Speak multiple text+voice segments in one call — TTS requests fire in parallel, audio plays back-to-back |
 
 **STT Modes** (auto-selected by default):
 
@@ -271,7 +272,7 @@ This project handles audio data and API credentials. Please review:
 - Audio data and API keys are sent over encrypted connections only.
 
 ### MCP server scope
-- The MCP server exposes three tools (`listen`, `speak`, `converse`). It cannot read files, execute commands, or access anything beyond the microphone and Azure API.
+- The MCP server exposes tools (`listen`, `speak`, `multi_speak`, `converse`, `configure`, `get_voices`, `pause`, `resume`). It cannot read files, execute commands, or access anything beyond the microphone and Azure API.
 - The server communicates with Copilot CLI over local stdio only — no network listeners are opened.
 
 ### Recommendations

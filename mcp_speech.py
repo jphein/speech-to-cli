@@ -1324,6 +1324,84 @@ def _sanitize_ssml_attr(value, default="default"):
 _MAX_TTS_CHARS = 5000
 
 
+def multi_speak(segments, quality="fast", progress_token=None):
+    """Speak multiple text+voice segments. TTS requests fire in parallel, playback is sequential."""
+    stop_hum()
+    if not segments:
+        return {"error": "No segments"}
+
+    send_progress(progress_token, 0, 100, "🔊 Synthesizing all voices...")
+
+    tts_rate = 48000 if quality == "hd" else 24000
+    session = get_http_session()
+    audio_buffers = [None] * len(segments)
+    errors = [None] * len(segments)
+
+    def fetch_one(idx, seg):
+        text = seg.get("text", "")[:_MAX_TTS_CHARS]
+        voice = seg.get("voice")
+        if not text:
+            errors[idx] = "empty text"
+            return
+        ssml, _, headers, url = _prepare_tts(text, quality, 1.0, voice, "default", "default")
+        try:
+            resp = session.post(url, headers=headers, data=ssml.encode("utf-8"), timeout=30)
+            if resp.status_code != 200:
+                errors[idx] = f"TTS error {resp.status_code}"
+                return
+            audio_buffers[idx] = resp.content
+        except Exception as e:
+            errors[idx] = str(e)
+
+    # Fire all TTS requests in parallel
+    threads = []
+    for i, seg in enumerate(segments):
+        t = threading.Thread(target=fetch_one, args=(i, seg), daemon=True)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join(timeout=35)
+
+    send_progress(progress_token, 50, 100, "🔊 Playing...")
+
+    # Play each audio buffer sequentially
+    spoken = 0
+    lead_ms = _tts_lead_in_ms()
+    silence_bytes = b"\x00" * (tts_rate * 2 * lead_ms // 1000)
+    # Small gap between segments (100ms silence)
+    gap_bytes = b"\x00" * (tts_rate * 2 * 100 // 1000)
+
+    for i, audio in enumerate(audio_buffers):
+        if is_cancelled():
+            return {"cancelled": True}
+        if audio is None:
+            continue
+
+        proc = _start_player(tts_rate)
+        if proc is None:
+            return {"error": "No audio player found"}
+
+        register_proc(proc)
+        try:
+            proc.stdin.write(silence_bytes)
+            proc.stdin.write(audio)
+            proc.stdin.close()
+            proc.wait(timeout=30)
+            spoken += 1
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        finally:
+            unregister_proc(proc)
+
+        pct = 50 + int(50 * (i + 1) / len(segments))
+        send_progress(progress_token, pct, 100, f"🔊 Played {i + 1}/{len(segments)}")
+
+    return {"spoken": spoken}
+
+
 def _build_ssml(text, voice, quality, speed, pitch, volume):
     """Build SSML payload for Azure TTS."""
     safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
@@ -2093,6 +2171,37 @@ TOOLS = [
         },
     },
     {
+        "name": "multi_speak",
+        "description": (
+            "Speak multiple text segments with different voices in one call. "
+            "Azure TTS requests are fired in parallel for speed, then audio plays back-to-back. "
+            "Use this for multi-agent conversations to avoid multiple round trips."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "segments": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string", "description": "Text to speak."},
+                            "voice": {"type": "string", "description": "Azure voice name."},
+                        },
+                        "required": ["text"],
+                    },
+                    "description": "List of {text, voice} segments to speak back-to-back.",
+                },
+                "quality": {
+                    "type": "string",
+                    "enum": ["fast", "hd"],
+                    "default": "fast",
+                },
+            },
+            "required": ["segments"],
+        },
+    },
+    {
         "name": "get_voices",
         "description": "List available Azure Speech voices for the current region.",
         "inputSchema": {"type": "object", "properties": {}},
@@ -2321,6 +2430,27 @@ def handle_request(req):
             return {
                 "jsonrpc": "2.0", "id": req_id,
                 "result": {"content": [{"type": "text", "text": content_text}]},
+            }
+        elif tool_name == "multi_speak":
+            segments = args.get("segments", [])
+            if not segments:
+                return {
+                    "jsonrpc": "2.0", "id": req_id,
+                    "result": {"content": [{"type": "text", "text": "Error: 'segments' is required."}]},
+                }
+            quality = args.get("quality", "fast")
+            if quality not in ("fast", "hd"):
+                quality = "fast"
+            result = multi_speak(segments, quality=quality, progress_token=progress_token)
+            if result.get("cancelled"):
+                msg = "(cancelled)"
+            else:
+                count = result.get("spoken", 0)
+                msg = f"Spoke {count} segment{'s' if count != 1 else ''} aloud." if count else result.get("error", "Failed")
+            threading.Thread(target=_prewarm_all, daemon=True).start()
+            return {
+                "jsonrpc": "2.0", "id": req_id,
+                "result": {"content": [{"type": "text", "text": msg}]},
             }
         elif tool_name == "speak":
             speak_text = args.get("text", "")
