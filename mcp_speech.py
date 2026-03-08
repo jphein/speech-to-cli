@@ -1844,7 +1844,11 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
             window_size = max(40, _get_tty_width() - 25)
             start_idx = max(0, char_idx - window_size)
             snippet = text[start_idx:char_idx]
-            base_msg = f"Speaking+Listening: {snippet}"
+            user_partial = stt_partial[0]
+            if user_partial:
+                base_msg = f"🗣 {user_partial} | 🔊 {snippet}"
+            else:
+                base_msg = f"Speaking: {snippet}"
         else:
             base_msg = "Speaking + Listening..."
 
