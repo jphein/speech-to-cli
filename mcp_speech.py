@@ -1618,24 +1618,34 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
         """Read STT WebSocket in background for live subtitles during full-duplex."""
         ws = stt_ws[0]
         if not ws:
+            sys.stderr.write("[ws_reader] no ws, exiting\n"); sys.stderr.flush()
             return
+        sys.stderr.write("[ws_reader] started\n"); sys.stderr.flush()
+        msg_count = 0
         while not rec_done.is_set() and not is_cancelled():
             try:
                 ws.settimeout(0.3)
                 msg = ws.recv()
-            except Exception:
+            except Exception as e:
                 if rec_done.is_set() or is_cancelled():
                     break
+                continue
+            msg_count += 1
+            if isinstance(msg, bytes):
+                sys.stderr.write(f"[ws_reader] binary msg #{msg_count} ({len(msg)} bytes)\n"); sys.stderr.flush()
                 continue
             if isinstance(msg, str):
                 parts = msg.split("\r\n\r\n", 1)
                 if len(parts) < 2:
                     continue
                 hdr, body = parts
-                if "speech.hypothesis" in hdr.lower():
+                hdr_lower = hdr.lower()
+                sys.stderr.write(f"[ws_reader] msg #{msg_count}: {hdr.splitlines()[0]}\n"); sys.stderr.flush()
+                if "speech.hypothesis" in hdr_lower:
                     try:
                         partial = json.loads(body).get("Text", "")
                         if partial:
+                            sys.stderr.write(f"[ws_reader] hypothesis: {partial}\n"); sys.stderr.flush()
                             term_width = _get_tty_width()
                             window = max(40, term_width - 25)
                             stt_partial[0] = partial if len(partial) < window else "..." + partial[-(window-3):]
