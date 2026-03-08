@@ -244,6 +244,25 @@ def _prewarm_recorder():
             pass
 
 
+def _prewarm_all():
+    """Pre-warm recorder + refresh STT WebSocket + TTS connection in one shot."""
+    _prewarm_recorder()
+    # Refresh STT WebSocket if it might have timed out
+    try:
+        if HAS_WS:
+            _get_stt_ws()
+    except Exception:
+        pass
+    # Keep TTS HTTP connection alive
+    try:
+        session = get_http_session()
+        region = CONFIG.get("region")
+        if region:
+            session.head(f"https://{region}.tts.speech.microsoft.com", timeout=3)
+    except Exception:
+        pass
+
+
 def _take_prewarmed_rec():
     """Take the pre-warmed recorder if available, or return None."""
     global _prewarmed_rec
@@ -696,9 +715,16 @@ def stt_streaming(max_seconds=30, progress_token=None):
 
     def _do_streaming(ws, max_seconds):
         request_id = uuid.uuid4().hex
-        send_progress(progress_token, 0, 100, "🎤 Ready...")
 
-        # Drain any stale messages from previous turn
+        # Take pre-warmed recorder FIRST (gives it max time while we set up WS)
+        proc = _take_prewarmed_rec()
+        if proc is None:
+            proc = subprocess.Popen(
+                _build_rec_cmd(max_seconds=max_seconds),
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
+
+        # Drain stale WS messages + send config while recorder initializes
         try:
             ws.settimeout(0.05)
             while True:
@@ -722,7 +748,6 @@ def stt_streaming(max_seconds=30, progress_token=None):
             + json.dumps(speech_config)
         )
         ws.send(config_msg)
-        send_progress(progress_token, 5, 100, "🎤 Calibrating...")
 
         def make_audio_binary(audio_data):
             header_str = (
@@ -736,12 +761,6 @@ def stt_streaming(max_seconds=30, progress_token=None):
 
         play_chime()
         send_progress(progress_token, 0, 100, "🎤 Listening...")
-        proc = _take_prewarmed_rec()
-        if proc is None:
-            proc = subprocess.Popen(
-                _build_rec_cmd(max_seconds=max_seconds),
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            )
         register_proc(proc)
 
         result_text = []
@@ -2106,6 +2125,15 @@ def handle_request(req):
                 }
             text = result.get("text", result.get("error", ""))
             content_text = text or "(no speech detected)"
+            # Keep TTS connection warm so next speak starts fast
+            def _keep_tts_alive():
+                try:
+                    region = CONFIG.get("region")
+                    if region:
+                        get_http_session().head(f"https://{region}.tts.speech.microsoft.com", timeout=3)
+                except Exception:
+                    pass
+            threading.Thread(target=_keep_tts_alive, daemon=True).start()
             if tool_name == "converse":
                 content_text += "\n\n[Voice conversation active — call 'speak' to reply, then call 'converse' to listen again. You may call other tools (search, edit, query) between speak and converse. Keep spoken replies short (1-3 sentences). For quick back-and-forth with no tools needed, switch to 'talk'. Use 'speak' for a final goodbye with no reply needed.]"
             return {
@@ -2139,8 +2167,8 @@ def handle_request(req):
                 msg = "(cancelled)"
             else:
                 msg = "Spoke the text aloud." if result.get("spoken") else result.get("error", "Failed")
-                # Pre-warm recorder so next converse/listen starts ~500ms faster
-                threading.Thread(target=_prewarm_recorder, daemon=True).start()
+                # Pre-warm recorder + STT WebSocket + TTS connection
+                threading.Thread(target=_prewarm_all, daemon=True).start()
             return {
                 "jsonrpc": "2.0", "id": req_id,
                 "result": {"content": [{"type": "text", "text": msg}]},
@@ -2210,8 +2238,14 @@ def handle_request(req):
                     "jsonrpc": "2.0", "id": req_id,
                     "result": {"content": [{"type": "text", "text": tts_result.get("error", "TTS failed")}]},
                 }
-            # Pre-warm recorder so stt() starts ~500ms faster
+            # Pre-warm recorder + refresh STT WebSocket
             _prewarm_recorder()
+            # Refresh STT WebSocket in parallel (non-blocking)
+            try:
+                if HAS_WS:
+                    _get_stt_ws()
+            except Exception:
+                pass
             stt_result = stt(
                 seconds=args.get("seconds"),
                 mode=args.get("mode"),
@@ -2225,6 +2259,15 @@ def handle_request(req):
                 }
             user_said = stt_result.get("text", stt_result.get("error", "")) if isinstance(stt_result, dict) else str(stt_result)
             content_text = user_said or "(no speech detected)"
+            # Keep TTS connection warm for next talk call
+            def _keep_tts_alive_talk():
+                try:
+                    region = CONFIG.get("region")
+                    if region:
+                        get_http_session().head(f"https://{region}.tts.speech.microsoft.com", timeout=3)
+                except Exception:
+                    pass
+            threading.Thread(target=_keep_tts_alive_talk, daemon=True).start()
             if user_said:
                 content_text += "\n\n[RESPOND NOW: call 'talk' with a short spoken reply. Do NOT type text to the user — they are listening on earbuds. Keep it conversational, 1-3 sentences. If you need to call tools first, switch to speak→converse pattern.]"
             else:
