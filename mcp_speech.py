@@ -281,12 +281,79 @@ def load_config():
 
 CONFIG = load_config()
 
-# Auto-detect half_duplex based on audio output device
-if CONFIG["half_duplex"] == "auto":
-    _dev_type, _dev_info = detect_audio_output()
-    CONFIG["half_duplex"] = (_dev_type == "speakers")
-    CONFIG["_detected_output"] = _dev_type
-    CONFIG["_detected_output_info"] = _dev_info
+# ---------------------------------------------------------------------------
+# Live audio output detection (re-checks on each talk/speak/converse call)
+# ---------------------------------------------------------------------------
+_last_detected_sink_id = None  # tracks default sink ID for change detection
+_auto_detect_lock = threading.Lock()
+
+
+def _refresh_audio_detection():
+    """Re-detect audio output if default sink changed. Non-blocking (~12ms).
+
+    Only does full detection (~35ms) when the default sink ID changes.
+    Called in background thread before talk/speak/converse.
+    """
+    global _last_detected_sink_id
+    # Only relevant if half_duplex is set to "auto" on disk
+    disk_cfg = {}
+    if os.path.exists(DEFAULTS_PATH):
+        try:
+            with open(DEFAULTS_PATH) as f:
+                disk_cfg = json.load(f)
+        except Exception:
+            pass
+    if disk_cfg.get("half_duplex", "auto") != "auto":
+        return  # User forced a specific mode, don't override
+
+    # Quick check: get default sink ID from wpctl status (~12ms)
+    try:
+        status = subprocess.run(
+            ["wpctl", "status"], capture_output=True, text=True, timeout=3)
+        if status.returncode != 0:
+            return
+    except Exception:
+        return
+
+    in_sinks = False
+    current_sink_id = None
+    for line in status.stdout.splitlines():
+        if "Sinks:" in line:
+            in_sinks = True
+            continue
+        if in_sinks:
+            stripped = line.strip()
+            if stripped.startswith(("\u251c", "\u2514")) or not stripped:
+                in_sinks = False
+                continue
+            if "*" in line:
+                parts = line.split("*")[1].strip().split(".")
+                current_sink_id = parts[0].strip()
+                break
+
+    if current_sink_id is None:
+        return
+
+    with _auto_detect_lock:
+        if current_sink_id == _last_detected_sink_id:
+            return  # Same sink, no change needed
+        _last_detected_sink_id = current_sink_id
+
+    # Sink changed — do full detection (~22ms more for pw-dump)
+    dev_type, dev_info = detect_audio_output()
+    new_half_duplex = (dev_type == "speakers")
+    old_half_duplex = CONFIG.get("half_duplex", False)
+    CONFIG["half_duplex"] = new_half_duplex
+    CONFIG["_detected_output"] = dev_type
+    CONFIG["_detected_output_info"] = dev_info
+    if new_half_duplex != old_half_duplex:
+        _print_status(
+            f"Audio: {dev_info.get('description', '?')} → {'half' if new_half_duplex else 'full'}-duplex",
+            "93")  # Yellow
+
+
+# Initial detection on startup
+_refresh_audio_detection()
 
 
 def get_http_session():
@@ -2203,6 +2270,9 @@ def handle_request(req):
     elif method == "tools/call":
         tool_name = params.get("name")
         args = params.get("arguments", {})
+        # Auto-refresh audio detection in background (~12ms, non-blocking)
+        if tool_name in ("listen", "converse", "speak", "talk"):
+            threading.Thread(target=_refresh_audio_detection, daemon=True).start()
         if tool_name in ("listen", "converse"):
             result = stt(
                 seconds=args.get("seconds"),
@@ -2416,10 +2486,9 @@ def handle_request(req):
                         CONFIG[k] = None
                     elif k == "half_duplex":
                         if isinstance(v, str) and v.lower() == "auto":
-                            dev_type, dev_info = detect_audio_output()
-                            CONFIG[k] = (dev_type == "speakers")
-                            CONFIG["_detected_output"] = dev_type
-                            CONFIG["_detected_output_info"] = dev_info
+                            global _last_detected_sink_id
+                            _last_detected_sink_id = None  # Force re-detect
+                            _refresh_audio_detection()
                         else:
                             CONFIG[k] = v if isinstance(v, bool) else str(v).lower() in ("true", "1", "yes")
                     elif k in ("chime_ready", "chime_processing", "chime_speak",
