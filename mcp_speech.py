@@ -14,7 +14,6 @@ STT modes (selected automatically):
 TTS: Streams audio playback as chunks arrive from Azure for lower latency.
 """
 
-import array
 import json
 import math
 import os
@@ -158,25 +157,16 @@ def has_echo_cancel():
     return _has_echo_cancel
 
 
-def detect_audio_output():
-    """Detect default audio sink type via PipeWire.
-
-    Returns (device_type, info_dict) where device_type is one of:
-      'headphones' — headset/headphone/earbuds (safe for full-duplex)
-      'speakers'   — built-in/HDMI/external speakers (needs half-duplex)
-      'unknown'    — detection failed
-    """
+def _get_default_sink_id():
+    """Parse wpctl status to find the default sink ID (~12ms)."""
     try:
         status = subprocess.run(
             ["wpctl", "status"], capture_output=True, text=True, timeout=3)
         if status.returncode != 0:
-            return "unknown", {}
+            return None
     except Exception:
-        return "unknown", {}
-
-    # Find default sink (marked with *)
+        return None
     in_sinks = False
-    default_sink_id = None
     for line in status.stdout.splitlines():
         if "Sinks:" in line:
             in_sinks = True
@@ -188,10 +178,21 @@ def detect_audio_output():
                 continue
             if "*" in line:
                 parts = line.split("*")[1].strip().split(".")
-                default_sink_id = parts[0].strip()
-                break
+                return parts[0].strip()
+    return None
 
-    if not default_sink_id:
+
+def detect_audio_output(sink_id=None):
+    """Detect default audio sink type via PipeWire.
+
+    Returns (device_type, info_dict) where device_type is one of:
+      'headphones' — headset/headphone/earbuds (safe for full-duplex)
+      'speakers'   — built-in/HDMI/external speakers (needs half-duplex)
+      'unknown'    — detection failed
+    """
+    if sink_id is None:
+        sink_id = _get_default_sink_id()
+    if not sink_id:
         return "unknown", {}
 
     try:
@@ -204,7 +205,7 @@ def detect_audio_output():
     # Find the sink node
     sink_props = None
     for obj in data:
-        if str(obj.get("id", "")) == default_sink_id:
+        if str(obj.get("id", "")) == sink_id:
             sink_props = obj.get("info", {}).get("props", {})
             break
     if not sink_props:
@@ -280,6 +281,8 @@ def load_config():
 
 
 CONFIG = load_config()
+# Track whether half_duplex is "auto" without re-reading disk every call
+_half_duplex_setting = CONFIG.get("half_duplex", "auto")
 
 # ---------------------------------------------------------------------------
 # Live audio output detection (re-checks on each talk/speak/converse call)
@@ -292,45 +295,13 @@ def _refresh_audio_detection():
     """Re-detect audio output if default sink changed. Non-blocking (~12ms).
 
     Only does full detection (~35ms) when the default sink ID changes.
-    Called in background thread before talk/speak/converse.
+    Called synchronously before talk/speak/converse.
     """
     global _last_detected_sink_id
-    # Only relevant if half_duplex is set to "auto" on disk
-    disk_cfg = {}
-    if os.path.exists(DEFAULTS_PATH):
-        try:
-            with open(DEFAULTS_PATH) as f:
-                disk_cfg = json.load(f)
-        except Exception:
-            pass
-    if disk_cfg.get("half_duplex", "auto") != "auto":
+    if _half_duplex_setting != "auto":
         return  # User forced a specific mode, don't override
 
-    # Quick check: get default sink ID from wpctl status (~12ms)
-    try:
-        status = subprocess.run(
-            ["wpctl", "status"], capture_output=True, text=True, timeout=3)
-        if status.returncode != 0:
-            return
-    except Exception:
-        return
-
-    in_sinks = False
-    current_sink_id = None
-    for line in status.stdout.splitlines():
-        if "Sinks:" in line:
-            in_sinks = True
-            continue
-        if in_sinks:
-            stripped = line.strip()
-            if stripped.startswith(("\u251c", "\u2514")) or not stripped:
-                in_sinks = False
-                continue
-            if "*" in line:
-                parts = line.split("*")[1].strip().split(".")
-                current_sink_id = parts[0].strip()
-                break
-
+    current_sink_id = _get_default_sink_id()
     if current_sink_id is None:
         return
 
@@ -339,8 +310,8 @@ def _refresh_audio_detection():
             return  # Same sink, no change needed
         _last_detected_sink_id = current_sink_id
 
-    # Sink changed — do full detection (~22ms more for pw-dump)
-    dev_type, dev_info = detect_audio_output()
+    # Sink changed — do full detection (~22ms for pw-dump, skip repeat wpctl)
+    dev_type, dev_info = detect_audio_output(sink_id=current_sink_id)
     new_half_duplex = (dev_type == "speakers")
     old_half_duplex = CONFIG.get("half_duplex", False)
     CONFIG["half_duplex"] = new_half_duplex
@@ -365,23 +336,6 @@ def get_http_session():
     if _http_session is None:
         _http_session = requests.Session()
     return _http_session
-
-
-def _prewarm():
-    """Pre-establish connections in background so first call is fast."""
-    try:
-        session = get_http_session()
-        # Pre-connect to TTS endpoint (TCP + TLS handshake) so first POST is instant
-        if CONFIG.get("region"):
-            tts_host = f"https://{CONFIG['region']}.tts.speech.microsoft.com"
-            session.head(tts_host, timeout=5)
-    except Exception:
-        pass
-    try:
-        if HAS_WS:
-            _get_stt_ws()  # noqa: defined below
-    except Exception:
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -726,13 +680,12 @@ def play_done():
 
 
 def rms_energy(frame_bytes):
-    """Calculate RMS energy of a 16-bit PCM frame (array module for speed)."""
-    n_samples = len(frame_bytes) // 2
-    if n_samples == 0:
+    """Calculate RMS energy of a 16-bit PCM frame."""
+    n = len(frame_bytes) // 2
+    if n == 0:
         return 0.0
-    a = array.array("h")
-    a.frombytes(frame_bytes[:n_samples * 2])
-    return math.sqrt(sum(s * s for s in a) / n_samples)
+    samples = memoryview(frame_bytes[:n * 2]).cast('h')
+    return math.sqrt(sum(s * s for s in samples) / n)
 
 
 def calibrate_noise(proc, n_frames=ENERGY_CALIBRATION_FRAMES):
@@ -878,6 +831,17 @@ def record_with_vad(proc, max_seconds):
 # STT backends
 # ---------------------------------------------------------------------------
 
+def _make_ws_audio_msg(request_id, audio_data):
+    """Build a binary WebSocket message for Azure STT audio streaming."""
+    hdr = (
+        f"Path: audio\r\n"
+        f"X-RequestId: {request_id}\r\n"
+        f"X-Timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())}\r\n"
+        f"Content-Type: audio/x-wav\r\n"
+    ).encode('ascii')
+    return struct.pack('>H', len(hdr)) + hdr + audio_data
+
+
 def _get_stt_ws():
     """Get or create persistent WebSocket to Azure STT (saves ~230ms on reuse)."""
     global _persistent_ws, _persistent_ws_time
@@ -918,7 +882,7 @@ def _invalidate_stt_ws():
 
 
 # Pre-warm connections in background on module load
-threading.Thread(target=_prewarm, daemon=True).start()
+threading.Thread(target=_prewarm_all, daemon=True).start()
 
 
 def stt_streaming(max_seconds=30, progress_token=None):
@@ -960,16 +924,6 @@ def stt_streaming(max_seconds=30, progress_token=None):
         )
         ws.send(config_msg)
 
-        def make_audio_binary(audio_data):
-            header_str = (
-                f"Path: audio\r\n"
-                f"X-RequestId: {request_id}\r\n"
-                f"X-Timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())}\r\n"
-                f"Content-Type: audio/x-wav\r\n"
-            )
-            header_bytes = header_str.encode('ascii')
-            return struct.pack('>H', len(header_bytes)) + header_bytes + audio_data
-
         play_chime()
         send_progress(progress_token, 0, 100, "🎤 Listening...")
         register_proc(proc)
@@ -983,10 +937,10 @@ def stt_streaming(max_seconds=30, progress_token=None):
                 energy_threshold, calibration_frames = calibrate_noise(proc)
                 wav_header = struct.pack('<4sI4s4sIHHIIHH4sI',
                     b'RIFF', 0, b'WAVE', b'fmt ', 16, 1, 1, 16000, 32000, 2, 16, b'data', 0)
-                ws.send(make_audio_binary(wav_header), opcode=websocket.ABNF.OPCODE_BINARY)
+                ws.send(_make_ws_audio_msg(request_id, wav_header), opcode=websocket.ABNF.OPCODE_BINARY)
 
                 for frame in calibration_frames:
-                    ws.send(make_audio_binary(frame), opcode=websocket.ABNF.OPCODE_BINARY)
+                    ws.send(_make_ws_audio_msg(request_id, frame), opcode=websocket.ABNF.OPCODE_BINARY)
 
                 vad = webrtcvad.Vad(VAD_AGGRESSIVENESS) if HAS_VAD else None
                 silence_frames = 0
@@ -1006,7 +960,7 @@ def stt_streaming(max_seconds=30, progress_token=None):
                     chunk = proc.stdout.read(FRAME_BYTES)
                     if not chunk:
                         break
-                    ws.send(make_audio_binary(chunk), opcode=websocket.ABNF.OPCODE_BINARY)
+                    ws.send(_make_ws_audio_msg(request_id, chunk), opcode=websocket.ABNF.OPCODE_BINARY)
                     if len(chunk) == FRAME_BYTES:
                         total_frames += 1
                         
@@ -1050,7 +1004,7 @@ def stt_streaming(max_seconds=30, progress_token=None):
                 proc.wait()
                 unregister_proc(proc)
                 try:
-                    ws.send(make_audio_binary(b""), opcode=websocket.ABNF.OPCODE_BINARY)
+                    ws.send(_make_ws_audio_msg(request_id, b""), opcode=websocket.ABNF.OPCODE_BINARY)
                 except Exception:
                     pass
                 sender_done.set()
@@ -1369,6 +1323,58 @@ def _sanitize_ssml_attr(value, default="default"):
 
 _MAX_TTS_CHARS = 5000
 
+
+def _build_ssml(text, voice, quality, speed, pitch, volume):
+    """Build SSML payload for Azure TTS."""
+    safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    attrs = []
+    if quality == "fast":
+        attrs.append('rate="+15%"')
+    elif speed != 1.0:
+        pct = int((speed - 1.0) * 100)
+        attrs.append(f'rate="{("+" if pct >= 0 else "")}{pct}%"')
+    if pitch != "default":
+        attrs.append(f'pitch="{pitch}"')
+    if volume != "default":
+        attrs.append(f'volume="{volume}"')
+    body = f'<prosody {" ".join(attrs)}>{safe}</prosody>' if attrs else safe
+    return (
+        f'<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US">'
+        f'<voice name="{voice}">{body}</voice></speak>'
+    )
+
+
+def _prepare_tts(text, quality, speed, voice, pitch, volume):
+    """Common TTS preparation: sanitize inputs, build SSML, return (ssml, tts_rate, headers, url)."""
+    if not voice:
+        voice = CONFIG["fast_voice"] if quality == "fast" else CONFIG["voice"]
+    voice = _sanitize_ssml_attr(voice, CONFIG["fast_voice"])
+    pitch = _sanitize_ssml_attr(pitch, "default")
+    volume = _sanitize_ssml_attr(volume, "default")
+    ssml = _build_ssml(text, voice, quality, speed, pitch, volume)
+    tts_rate = 48000 if quality == "hd" else 24000
+    url = f"https://{CONFIG['region']}.tts.speech.microsoft.com/cognitiveservices/v1"
+    headers = {
+        "Ocp-Apim-Subscription-Key": CONFIG["key"],
+        "Content-Type": "application/ssml+xml",
+        "X-Microsoft-OutputFormat": f"raw-{tts_rate // 1000}khz-16bit-mono-pcm",
+    }
+    return ssml, tts_rate, headers, url
+
+
+def _start_player(tts_rate, target=None):
+    """Start a fresh player process, trying each configured command."""
+    for cmd in _build_player_cmd(tts_rate, target=target):
+        try:
+            return subprocess.Popen(
+                cmd, stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            continue
+    return None
+
+
 def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="default", progress_token=None):
     """Speak text aloud via Azure TTS with streaming playback."""
     stop_hum()
@@ -1378,61 +1384,12 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
         return {"error": "No text provided"}
     text = text[:_MAX_TTS_CHARS]
 
-    if not voice:
-        voice = CONFIG["fast_voice"] if quality == "fast" else CONFIG["voice"]
-    voice = _sanitize_ssml_attr(voice, CONFIG["fast_voice"])
-    pitch = _sanitize_ssml_attr(pitch, "default")
-    volume = _sanitize_ssml_attr(volume, "default")
-
-    safe_text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
-    url = f"https://{CONFIG['region']}.tts.speech.microsoft.com/cognitiveservices/v1"
-    
-    # Construct prosody tag with all modifiers
-    prosody_attrs = []
-    if quality == "fast":
-        prosody_attrs.append('rate="+15%"')
-    elif speed != 1.0:
-        rate_pct = int((speed - 1.0) * 100)
-        sign = "+" if rate_pct >= 0 else ""
-        prosody_attrs.append(f'rate="{sign}{rate_pct}%"')
-    
-    if pitch != "default":
-        prosody_attrs.append(f'pitch="{pitch}"')
-    if volume != "default":
-        prosody_attrs.append(f'volume="{volume}"')
-    
-    prosody_str = " ".join(prosody_attrs)
-    if prosody_str:
-        body_ssml = f'<prosody {prosody_str}>{safe_text}</prosody>'
-    else:
-        body_ssml = safe_text
-
-    ssml = (
-        f'<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US">'
-        f'<voice name="{voice}">{body_ssml}</voice></speak>'
-    )
-    tts_rate = 48000 if quality == "hd" else 24000
-    output_fmt = f"raw-{tts_rate // 1000}khz-16bit-mono-pcm"
-    headers = {
-        "Ocp-Apim-Subscription-Key": CONFIG["key"],
-        "Content-Type": "application/ssml+xml",
-        "X-Microsoft-OutputFormat": output_fmt,
-    }
+    ssml, tts_rate, headers, url = _prepare_tts(text, quality, speed, voice, pitch, volume)
 
     # Take pre-warmed player or start fresh (overlaps with TTS API latency)
-    proc = _take_prewarmed_player(tts_rate)
+    proc = _take_prewarmed_player(tts_rate) or _start_player(tts_rate)
     if proc is None:
-        for player_cmd in _build_player_cmd(tts_rate):
-            try:
-                proc = subprocess.Popen(
-                    player_cmd,
-                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
-                break
-            except FileNotFoundError:
-                continue
-        else:
-            return {"error": "No audio player found — set 'player' in config"}
+        return {"error": "No audio player found — set 'player' in config"}
 
     # Fire TTS request (player is already waiting for stdin data)
     resp = get_http_session().post(url, headers=headers, data=ssml.encode("utf-8"), timeout=60, stream=True)
@@ -1561,41 +1518,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
         return {"spoken": False, "error": "No text provided", "text": ""}
     text = text[:_MAX_TTS_CHARS]
 
-    # --- Prepare TTS ---
-    if not voice:
-        voice = CONFIG["fast_voice"] if quality == "fast" else CONFIG["voice"]
-    voice = _sanitize_ssml_attr(voice, CONFIG["fast_voice"])
-    pitch = _sanitize_ssml_attr(pitch, "default")
-    volume = _sanitize_ssml_attr(volume, "default")
-
-    safe_text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
-    url = f"https://{CONFIG['region']}.tts.speech.microsoft.com/cognitiveservices/v1"
-
-    prosody_attrs = []
-    if quality == "fast":
-        prosody_attrs.append('rate="+15%"')
-    elif speed != 1.0:
-        rate_pct = int((speed - 1.0) * 100)
-        sign = "+" if rate_pct >= 0 else ""
-        prosody_attrs.append(f'rate="{sign}{rate_pct}%"')
-    if pitch != "default":
-        prosody_attrs.append(f'pitch="{pitch}"')
-    if volume != "default":
-        prosody_attrs.append(f'volume="{volume}"')
-
-    prosody_str = " ".join(prosody_attrs)
-    body_ssml = f'<prosody {prosody_str}>{safe_text}</prosody>' if prosody_str else safe_text
-    ssml = (
-        f'<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US">'
-        f'<voice name="{voice}">{body_ssml}</voice></speak>'
-    )
-    tts_rate = 48000 if quality == "hd" else 24000
-    output_fmt = f"raw-{tts_rate // 1000}khz-16bit-mono-pcm"
-    headers = {
-        "Ocp-Apim-Subscription-Key": CONFIG["key"],
-        "Content-Type": "application/ssml+xml",
-        "X-Microsoft-OutputFormat": output_fmt,
-    }
+    ssml, tts_rate, headers, url = _prepare_tts(text, quality, speed, voice, pitch, volume)
 
     # --- Start STT recording (use echo-cancelled source if available, else default mic) ---
     max_seconds = max(1, min(int(seconds or 30), 30))
@@ -1613,20 +1536,9 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
     )
     register_proc(rec_proc)
 
-    # --- Helper: start a player process ---
-    def _start_player():
-        target = EC_SINK if has_echo_cancel() else None
-        for cmd in _build_player_cmd(tts_rate, target=target):
-            try:
-                return subprocess.Popen(
-                    cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
-            except FileNotFoundError:
-                continue
-        return None
-
     # Start player FIRST so it's ready when TTS audio arrives
-    player_proc = _start_player()
+    ec_target = EC_SINK if has_echo_cancel() else None
+    player_proc = _start_player(tts_rate, target=ec_target)
     if player_proc is None:
         rec_proc.terminate()
         rec_proc.wait()
@@ -1691,13 +1603,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
             )
             wav_header = struct.pack('<4sI4s4sIHHIIHH4sI',
                 b'RIFF', 0, b'WAVE', b'fmt ', 16, 1, 1, 16000, 32000, 2, 16, b'data', 0)
-            hdr_str = (
-                f"Path: audio\r\nX-RequestId: {rid}\r\n"
-                f"X-Timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())}\r\n"
-                f"Content-Type: audio/x-wav\r\n"
-            )
-            hdr_bytes = hdr_str.encode('ascii')
-            ws.send(struct.pack('>H', len(hdr_bytes)) + hdr_bytes + wav_header,
+            ws.send(_make_ws_audio_msg(rid, wav_header),
                     opcode=websocket.ABNF.OPCODE_BINARY)
             stt_ws[0] = ws  # recording thread streams all frames from now on
         except Exception:
@@ -1746,13 +1652,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                     rid = stt_request_id[0]
                     if ws and rid:
                         try:
-                            hdr_str = (
-                                f"Path: audio\r\nX-RequestId: {rid}\r\n"
-                                f"X-Timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())}\r\n"
-                                f"Content-Type: audio/x-wav\r\n"
-                            )
-                            hdr_bytes = hdr_str.encode('ascii')
-                            ws.send(struct.pack('>H', len(hdr_bytes)) + hdr_bytes + chunk,
+                            ws.send(_make_ws_audio_msg(rid, chunk),
                                     opcode=websocket.ABNF.OPCODE_BINARY)
                         except Exception:
                             pass
@@ -1784,14 +1684,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                 rid = stt_request_id[0]
                 if ws and rid:
                     try:
-                        hdr_str = (
-                            f"Path: audio\r\n"
-                            f"X-RequestId: {rid}\r\n"
-                            f"X-Timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())}\r\n"
-                            f"Content-Type: audio/x-wav\r\n"
-                        )
-                        hdr_bytes = hdr_str.encode('ascii')
-                        ws.send(struct.pack('>H', len(hdr_bytes)) + hdr_bytes + chunk,
+                        ws.send(_make_ws_audio_msg(rid, chunk),
                                 opcode=websocket.ABNF.OPCODE_BINARY)
                     except Exception:
                         pass
@@ -1865,7 +1758,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
     def _replay_audio():
         nonlocal player_proc
         unregister_proc(player_proc)
-        new_player = _start_player()
+        new_player = _start_player(tts_rate, target=ec_target)
         if new_player is None:
             return False
         player_proc = new_player
@@ -1966,14 +1859,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
         # No audio captured — close WS turn if open
         if use_streaming_stt and stt_ws[0]:
             try:
-                hdr_str = (
-                    f"Path: audio\r\n"
-                    f"X-RequestId: {stt_request_id[0]}\r\n"
-                    f"X-Timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())}\r\n"
-                    f"Content-Type: audio/x-wav\r\n"
-                )
-                hdr_bytes = hdr_str.encode('ascii')
-                stt_ws[0].send(struct.pack('>H', len(hdr_bytes)) + hdr_bytes + b"",
+                stt_ws[0].send(_make_ws_audio_msg(stt_request_id[0], b""),
                                opcode=websocket.ABNF.OPCODE_BINARY)
             except Exception:
                 pass
@@ -1988,15 +1874,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
         # Send empty audio frame to signal end of audio
         send_progress(progress_token, 88, 100, "🧠 Finishing transcription...")
         try:
-            rid = stt_request_id[0]
-            hdr_str = (
-                f"Path: audio\r\n"
-                f"X-RequestId: {rid}\r\n"
-                f"X-Timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())}\r\n"
-                f"Content-Type: audio/x-wav\r\n"
-            )
-            hdr_bytes = hdr_str.encode('ascii')
-            stt_ws[0].send(struct.pack('>H', len(hdr_bytes)) + hdr_bytes + b"",
+            stt_ws[0].send(_make_ws_audio_msg(stt_request_id[0], b""),
                            opcode=websocket.ABNF.OPCODE_BINARY)
 
             # Read result — most of the transcription is already done in real-time
@@ -2057,7 +1935,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
     send_progress(progress_token, 100, 100, "✅ Done")
 
     # Pre-warm TTS connection for next call (saves ~150ms on next talk)
-    threading.Thread(target=_prewarm, daemon=True).start()
+    threading.Thread(target=_prewarm_all, daemon=True).start()
 
     return {"spoken": True, "text": user_text}
 
@@ -2383,16 +2261,7 @@ def handle_request(req):
                 }
             text = result.get("text", result.get("error", ""))
             content_text = text or "(no speech detected)"
-            # Pre-warm player + keep TTS connection warm for next speak
-            def _prewarm_for_speak():
-                _prewarm_player()
-                try:
-                    region = CONFIG.get("region")
-                    if region:
-                        get_http_session().head(f"https://{region}.tts.speech.microsoft.com", timeout=3)
-                except Exception:
-                    pass
-            threading.Thread(target=_prewarm_for_speak, daemon=True).start()
+            threading.Thread(target=_prewarm_all, daemon=True).start()
             if tool_name == "converse":
                 content_text += "\n\n[Voice conversation active — call 'speak' to reply, then call 'converse' to listen again. You may call other tools (search, edit, query) between speak and converse. Keep spoken replies short (1-3 sentences). For quick back-and-forth with no tools needed, switch to 'talk'. Use 'speak' for a final goodbye with no reply needed.]"
             return {
@@ -2519,16 +2388,7 @@ def handle_request(req):
                 }
             user_said = stt_result.get("text", stt_result.get("error", "")) if isinstance(stt_result, dict) else str(stt_result)
             content_text = user_said or "(no speech detected)"
-            # Pre-warm player + keep TTS connection warm for next talk call
-            def _prewarm_for_talk():
-                _prewarm_player()
-                try:
-                    region = CONFIG.get("region")
-                    if region:
-                        get_http_session().head(f"https://{region}.tts.speech.microsoft.com", timeout=3)
-                except Exception:
-                    pass
-            threading.Thread(target=_prewarm_for_talk, daemon=True).start()
+            threading.Thread(target=_prewarm_all, daemon=True).start()
             _audio_hint2 = "on earbuds" if CONFIG.get("_detected_output") == "headphones" else "on speakers"
             if user_said:
                 content_text += f"\n\n[RESPOND NOW: call 'talk' with a short spoken reply. Do NOT type text to the user — they are {_audio_hint2}. Keep it conversational, 1-3 sentences. If you need to call tools first, switch to speak→converse pattern.]"
@@ -2547,8 +2407,7 @@ def handle_request(req):
                     # Find the Galaxy Buds device ID
                     dev_id = None
                     wp_out = subprocess.run(["pw-dump"], capture_output=True, text=True, timeout=3)
-                    import json as _json
-                    for obj in _json.loads(wp_out.stdout):
+                    for obj in json.loads(wp_out.stdout):
                         props = obj.get("info", {}).get("props", {})
                         if "Galaxy" in str(props.get("device.description", "")):
                             dev_id = obj.get("id")
@@ -2583,11 +2442,13 @@ def handle_request(req):
                     if v == "null" or v is None:
                         CONFIG[k] = None
                     elif k == "half_duplex":
+                        global _half_duplex_setting, _last_detected_sink_id
                         if isinstance(v, str) and v.lower() == "auto":
-                            global _last_detected_sink_id
+                            _half_duplex_setting = "auto"
                             _last_detected_sink_id = None  # Force re-detect
                             _refresh_audio_detection()
                         else:
+                            _half_duplex_setting = v
                             CONFIG[k] = v if isinstance(v, bool) else str(v).lower() in ("true", "1", "yes")
                     elif k in ("chime_ready", "chime_processing", "chime_speak",
                               "chime_done", "chime_hum", "chime_barge_in", "visual_indicator",
