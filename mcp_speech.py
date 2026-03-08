@@ -1610,6 +1610,55 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
             use_streaming_stt = False
             _invalidate_stt_ws()
 
+    # --- Background WS reader for live subtitles + early result ---
+    stt_partial = [""]  # live hypothesis text, updated by reader thread
+    stt_phrase_done = threading.Event()
+
+    def _ws_reader():
+        """Read STT WebSocket in background for live subtitles during full-duplex."""
+        ws = stt_ws[0]
+        if not ws:
+            return
+        while not rec_done.is_set() and not is_cancelled():
+            try:
+                ws.settimeout(0.3)
+                msg = ws.recv()
+            except Exception:
+                if rec_done.is_set() or is_cancelled():
+                    break
+                continue
+            if isinstance(msg, str):
+                parts = msg.split("\r\n\r\n", 1)
+                if len(parts) < 2:
+                    continue
+                hdr, body = parts
+                if "speech.hypothesis" in hdr.lower():
+                    try:
+                        partial = json.loads(body).get("Text", "")
+                        if partial:
+                            term_width = _get_tty_width()
+                            window = max(40, term_width - 25)
+                            stt_partial[0] = partial if len(partial) < window else "..." + partial[-(window-3):]
+                    except Exception:
+                        pass
+                elif "speech.phrase" in hdr.lower():
+                    try:
+                        data = json.loads(body)
+                        if data.get("RecognitionStatus") == "Success":
+                            nbest = data.get("NBest", [])
+                            stt_result[0] = nbest[0]["Display"] if nbest else data.get("DisplayText", "")
+                    except Exception:
+                        pass
+                    stt_phrase_done.set()
+                    break
+                elif "turn.end" in hdr.lower():
+                    stt_phrase_done.set()
+                    break
+
+    if use_streaming_stt and stt_ws[0]:
+        ws_reader = threading.Thread(target=_ws_reader, daemon=True)
+        ws_reader.start()
+
     # --- Barge-in config ---
     barge_trigger_frames = max(1, int(CONFIG.get("barge_in_frames", 3)))
     barge_silence_sec = max(0.3, float(CONFIG.get("barge_in_silence", 1.0)))
@@ -1835,7 +1884,11 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
         pct = int(70 + min(1.0, elapsed / listen_timeout) * 15)
         vu = random.choice(listen_bars) if show_vu else ""
         if rec_speech_detected.is_set():
-            send_progress(progress_token, pct, 100, f"🎤 {vu} Hearing you...")
+            partial = stt_partial[0]
+            if partial and show_subs:
+                send_progress(progress_token, pct, 100, f"🎤 {vu} {partial}")
+            else:
+                send_progress(progress_token, pct, 100, f"🎤 {vu} Hearing you...")
         else:
             send_progress(progress_token, pct, 100, f"🎤 {vu} Listening for your reply...")
         rec_thread.join(timeout=0.15)
@@ -1871,35 +1924,16 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
 
     user_text = ""
     if use_streaming_stt and stt_ws[0]:
-        # Send empty audio frame to signal end of audio
+        # Send empty audio frame to signal end of turn
         send_progress(progress_token, 88, 100, "🧠 Finishing transcription...")
         try:
             stt_ws[0].send(_make_ws_audio_msg(stt_request_id[0], b""),
                            opcode=websocket.ABNF.OPCODE_BINARY)
-
-            # Read result — most of the transcription is already done in real-time
-            deadline = time.time() + 5
-            while time.time() < deadline:
-                try:
-                    stt_ws[0].settimeout(1.0)
-                    msg = stt_ws[0].recv()
-                except Exception:
-                    break
-                if isinstance(msg, str):
-                    parts = msg.split("\r\n\r\n", 1)
-                    if len(parts) < 2:
-                        continue
-                    hdr, body = parts
-                    if "speech.phrase" in hdr.lower():
-                        data = json.loads(body)
-                        if data.get("RecognitionStatus") == "Success":
-                            nbest = data.get("NBest", [])
-                            user_text = nbest[0]["Display"] if nbest else data.get("DisplayText", "")
-                        break
-                    elif "turn.end" in hdr.lower():
-                        break
         except Exception:
             pass
+        # Wait for WS reader thread to get the final phrase (most work already done)
+        stt_phrase_done.wait(timeout=5)
+        user_text = stt_result[0]
     else:
         # Fallback: REST STT
         send_progress(progress_token, 85, 100, "🧠 Transcribing...")
