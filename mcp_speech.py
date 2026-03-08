@@ -408,8 +408,9 @@ def _prewarm_recorder():
 
 
 def _prewarm_all():
-    """Pre-warm recorder + refresh STT WebSocket + TTS connection in one shot."""
+    """Pre-warm recorder + player + refresh STT WebSocket + TTS connection."""
     _prewarm_recorder()
+    _prewarm_player()  # Pre-warm player at 24kHz (fast quality default)
     # Refresh STT WebSocket if it might have timed out
     try:
         if HAS_WS:
@@ -447,6 +448,53 @@ def _discard_prewarmed_rec():
             proc.wait(timeout=1)
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Pre-warmed player (ready for instant TTS playback)
+# ---------------------------------------------------------------------------
+_prewarmed_player = None  # subprocess.Popen or None
+_prewarmed_player_rate = 0  # sample rate the player was started with
+_prewarmed_player_lock = threading.Lock()
+
+
+def _prewarm_player(tts_rate=24000):
+    """Start a player process in background so next speak is instant."""
+    global _prewarmed_player, _prewarmed_player_rate
+    with _prewarmed_player_lock:
+        if _prewarmed_player is not None:
+            return
+        for cmd in _build_player_cmd(tts_rate):
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                _prewarmed_player = proc
+                _prewarmed_player_rate = tts_rate
+                return
+            except FileNotFoundError:
+                continue
+
+
+def _take_prewarmed_player(tts_rate):
+    """Take the pre-warmed player if rate matches, or return None."""
+    global _prewarmed_player, _prewarmed_player_rate
+    with _prewarmed_player_lock:
+        if _prewarmed_player is not None and _prewarmed_player_rate == tts_rate:
+            proc = _prewarmed_player
+            _prewarmed_player = None
+            return proc
+        # Rate mismatch — discard stale player
+        if _prewarmed_player is not None:
+            old = _prewarmed_player
+            _prewarmed_player = None
+            try:
+                old.stdin.close()
+                old.wait(timeout=1)
+            except Exception:
+                pass
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1370,25 +1418,31 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
         "Content-Type": "application/ssml+xml",
         "X-Microsoft-OutputFormat": output_fmt,
     }
+
+    # Take pre-warmed player or start fresh (overlaps with TTS API latency)
+    proc = _take_prewarmed_player(tts_rate)
+    if proc is None:
+        for player_cmd in _build_player_cmd(tts_rate):
+            try:
+                proc = subprocess.Popen(
+                    player_cmd,
+                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                break
+            except FileNotFoundError:
+                continue
+        else:
+            return {"error": "No audio player found — set 'player' in config"}
+
+    # Fire TTS request (player is already waiting for stdin data)
     resp = get_http_session().post(url, headers=headers, data=ssml.encode("utf-8"), timeout=60, stream=True)
     if resp.status_code != 200:
+        proc.stdin.close()
+        proc.wait()
         return {"error": f"Azure TTS error {resp.status_code}: {resp.text}"}
 
     send_progress(progress_token, 5, 100, "🔊 Speaking...")
     play_speak()
-
-    # Stream raw PCM to configured player
-    for player_cmd in _build_player_cmd(tts_rate):
-        try:
-            proc = subprocess.Popen(
-                player_cmd,
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-            break
-        except FileNotFoundError:
-            continue
-    else:
-        return {"error": "No audio player found — set 'player' in config"}
 
     register_proc(proc)
     try:
@@ -1543,18 +1597,12 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
         "X-Microsoft-OutputFormat": output_fmt,
     }
 
-    send_progress(progress_token, 0, 100, "🔊 Synthesizing...")
-    resp = get_http_session().post(url, headers=headers, data=ssml.encode("utf-8"), timeout=60, stream=True)
-    if resp.status_code != 200:
-        return {"spoken": False, "error": f"Azure TTS error {resp.status_code}: {resp.text}", "text": ""}
-
     # --- Start STT recording (use echo-cancelled source if available, else default mic) ---
     max_seconds = max(1, min(int(seconds or 30), 30))
     stt_silence = float(silence_timeout) if silence_timeout else CONFIG.get("talk_silence_timeout", 1.5)
 
     rec_cmd = _build_rec_cmd()
     if has_echo_cancel() and "--target" not in rec_cmd:
-        # Override mic source to echo-cancelled source if available
         if "pw-record" in rec_cmd[0]:
             idx = rec_cmd.index("-")
             rec_cmd[idx:idx] = ["--target", EC_SOURCE]
@@ -1564,6 +1612,37 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
     register_proc(rec_proc)
+
+    # --- Helper: start a player process ---
+    def _start_player():
+        target = EC_SINK if has_echo_cancel() else None
+        for cmd in _build_player_cmd(tts_rate, target=target):
+            try:
+                return subprocess.Popen(
+                    cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            except FileNotFoundError:
+                continue
+        return None
+
+    # Start player FIRST so it's ready when TTS audio arrives
+    player_proc = _start_player()
+    if player_proc is None:
+        rec_proc.terminate()
+        rec_proc.wait()
+        unregister_proc(rec_proc)
+        return {"spoken": False, "error": "No audio player found", "text": ""}
+
+    # Fire TTS request (player + recorder already running)
+    send_progress(progress_token, 0, 100, "🔊 Synthesizing...")
+    resp = get_http_session().post(url, headers=headers, data=ssml.encode("utf-8"), timeout=60, stream=True)
+    if resp.status_code != 200:
+        player_proc.stdin.close()
+        player_proc.wait()
+        rec_proc.terminate()
+        rec_proc.wait()
+        unregister_proc(rec_proc)
+        return {"spoken": False, "error": f"Azure TTS error {resp.status_code}: {resp.text}", "text": ""}
 
     # Shared state for the recording thread
     rec_frames = []
@@ -1580,25 +1659,6 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
 
     # Audio buffer for repeat support
     tts_audio_buf = []
-
-    # --- Helper: start a player process ---
-    def _start_player():
-        target = EC_SINK if has_echo_cancel() else None
-        for cmd in _build_player_cmd(tts_rate, target=target):
-            try:
-                return subprocess.Popen(
-                    cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
-            except FileNotFoundError:
-                continue
-        return None
-
-    player_proc = _start_player()
-    if player_proc is None:
-        rec_proc.terminate()
-        rec_proc.wait()
-        unregister_proc(rec_proc)
-        return {"spoken": False, "error": "No audio player found", "text": ""}
 
     register_proc(player_proc)
     send_progress(progress_token, 5, 100, "🔊🎤 Speaking + listening...")
@@ -2323,15 +2383,16 @@ def handle_request(req):
                 }
             text = result.get("text", result.get("error", ""))
             content_text = text or "(no speech detected)"
-            # Keep TTS connection warm so next speak starts fast
-            def _keep_tts_alive():
+            # Pre-warm player + keep TTS connection warm for next speak
+            def _prewarm_for_speak():
+                _prewarm_player()
                 try:
                     region = CONFIG.get("region")
                     if region:
                         get_http_session().head(f"https://{region}.tts.speech.microsoft.com", timeout=3)
                 except Exception:
                     pass
-            threading.Thread(target=_keep_tts_alive, daemon=True).start()
+            threading.Thread(target=_prewarm_for_speak, daemon=True).start()
             if tool_name == "converse":
                 content_text += "\n\n[Voice conversation active — call 'speak' to reply, then call 'converse' to listen again. You may call other tools (search, edit, query) between speak and converse. Keep spoken replies short (1-3 sentences). For quick back-and-forth with no tools needed, switch to 'talk'. Use 'speak' for a final goodbye with no reply needed.]"
             return {
@@ -2458,15 +2519,16 @@ def handle_request(req):
                 }
             user_said = stt_result.get("text", stt_result.get("error", "")) if isinstance(stt_result, dict) else str(stt_result)
             content_text = user_said or "(no speech detected)"
-            # Keep TTS connection warm for next talk call
-            def _keep_tts_alive_talk():
+            # Pre-warm player + keep TTS connection warm for next talk call
+            def _prewarm_for_talk():
+                _prewarm_player()
                 try:
                     region = CONFIG.get("region")
                     if region:
                         get_http_session().head(f"https://{region}.tts.speech.microsoft.com", timeout=3)
                 except Exception:
                     pass
-            threading.Thread(target=_keep_tts_alive_talk, daemon=True).start()
+            threading.Thread(target=_prewarm_for_talk, daemon=True).start()
             _audio_hint2 = "on earbuds" if CONFIG.get("_detected_output") == "headphones" else "on speakers"
             if user_said:
                 content_text += f"\n\n[RESPOND NOW: call 'talk' with a short spoken reply. Do NOT type text to the user — they are {_audio_hint2}. Keep it conversational, 1-3 sentences. If you need to call tools first, switch to speak→converse pattern.]"
