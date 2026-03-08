@@ -1298,9 +1298,9 @@ _last_tts_end = 0.0  # monotonic timestamp of last TTS playback end
 
 
 def _tts_lead_in_ms():
-    """Lead-in only on first TTS call (device cold). Zero afterwards."""
-    if _last_tts_end == 0.0:
-        return 200  # First call — device needs to wake up
+    """Lead-in when device is cold (first call or idle >10s)."""
+    if _last_tts_end == 0.0 or (time.monotonic() - _last_tts_end) > 10.0:
+        return 200
     return 0
 
 def _sanitize_ssml_attr(value, default="default"):
