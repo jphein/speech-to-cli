@@ -189,6 +189,7 @@ def load_config():
         "chime_barge_in": cfg.get("chime_barge_in", True),
         "enable_pause": cfg.get("enable_pause", True),
         "enable_barge_in": cfg.get("enable_barge_in", False),
+        "half_duplex": cfg.get("half_duplex", False),
     }
 
 
@@ -1159,10 +1160,13 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
                         time.sleep(0.05)
                     if chunk:
                         proc.stdin.write(chunk)
+                        proc.stdin.flush()
+                        last_write_time[0] = time.time()
                 proc.stdin.close()
             except Exception:
                 pass
 
+        last_write_time = [time.time()]
         dl_thread = threading.Thread(target=download_audio, daemon=True)
         dl_thread.start()
 
@@ -1181,7 +1185,8 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
                 break
 
             # Kill hung player (e.g. Bluetooth stall mid-stream or out of range)
-            if not _pause_event.is_set() and (time.time() - start_time) > player_timeout:
+            time_since_write = time.time() - last_write_time[0]
+            if not _pause_event.is_set() and (time.time() - start_time) > player_timeout and time_since_write > 10.0:
                 proc.terminate()
                 break
 
@@ -1510,11 +1515,14 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                     while tts_paused.is_set() and not is_cancelled():
                         try:
                             player_proc.stdin.write(b'\x00' * 4800)
+                            player_proc.stdin.flush()
                         except (BrokenPipeError, OSError):
                             break
                         time.sleep(0.1)
                     try:
                         player_proc.stdin.write(chunk)
+                        player_proc.stdin.flush()
+                        last_write_time[0] = time.time()
                     except (BrokenPipeError, OSError):
                         break
             try:
@@ -1526,6 +1534,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
         finally:
             dl_done.set()
 
+    last_write_time = [time.time()]
     dl_thread = threading.Thread(target=download_audio, daemon=True)
     dl_thread.start()
 
@@ -1564,7 +1573,8 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
             break
 
         # Kill hung player (e.g. Bluetooth stall mid-stream or out of range)
-        if (time.time() - start_time) > player_timeout:
+        time_since_write = time.time() - last_write_time[0]
+        if (time.time() - start_time) > player_timeout and time_since_write > 10.0:
             player_proc.terminate()
             break
 
@@ -1585,7 +1595,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
         time.sleep(0.1)
 
     tts_done.set()  # signal recording thread immediately
-    dl_thread.join(timeout=2)
+    dl_thread.join(timeout=max(5, estimated_duration * 0.5))
     unregister_proc(player_proc)
 
     if is_cancelled():
@@ -1861,10 +1871,7 @@ TOOLS = [
         "description": (
             "View or change audio settings on the fly. Call with no arguments to see current settings. "
             "Pass any setting as a key-value pair to update it. Changes are saved to disk and take "
-            "effect immediately. Settings: player (aplay/pw-play/pw-cat/ffplay/auto), "
-            "recorder (pw-record/arecord/auto), mic_source (PipeWire node name or null), "
-            "speaker_sink (PipeWire node name or null), silence_timeout (seconds), "
-            "talk_silence_timeout (seconds), voice, fast_voice, bt_profile (a2dp/hfp)."
+            "effect immediately."
         ),
         "inputSchema": {
             "type": "object",
@@ -1878,6 +1885,20 @@ TOOLS = [
                 "voice": {"type": "string", "description": "Azure TTS voice name."},
                 "fast_voice": {"type": "string", "description": "Azure TTS voice name for fast quality."},
                 "bt_profile": {"type": "string", "description": "Bluetooth profile: a2dp (output only, hi-fi) or hfp (mic+speaker, lower quality)."},
+                "half_duplex": {"type": "boolean", "description": "If true, speak finishes before mic starts listening (avoids echo on speakers). Default false (full-duplex)."},
+                "chime_ready": {"type": "boolean", "description": "Play chime when mic starts listening."},
+                "chime_processing": {"type": "boolean", "description": "Play chime when processing starts."},
+                "chime_speak": {"type": "boolean", "description": "Play chime before TTS speaks."},
+                "chime_done": {"type": "boolean", "description": "Play chime when done."},
+                "chime_hum": {"type": "boolean", "description": "Play ambient hum while waiting."},
+                "chime_barge_in": {"type": "boolean", "description": "Play chime on barge-in detection."},
+                "visual_indicator": {"type": "boolean", "description": "Show visual indicators in terminal."},
+                "live_subtitles": {"type": "boolean", "description": "Show live subtitles during TTS."},
+                "vu_meter": {"type": "boolean", "description": "Show VU meter animation during audio."},
+                "enable_pause": {"type": "boolean", "description": "Allow pausing/resuming playback and recording."},
+                "enable_barge_in": {"type": "boolean", "description": "Allow user speech to pause TTS (barge-in)."},
+                "barge_in_frames": {"type": "integer", "description": "Speech frames needed to trigger barge-in (default 3)."},
+                "barge_in_silence": {"type": "number", "description": "Silence seconds to resume TTS after barge-in (default 1.0)."},
             },
         },
     },
@@ -1897,7 +1918,8 @@ TOOLS = [
             "(A) Keep 'text' under 2 sentences — speech is slower than reading, so less is more. "
             "(B) Never echo back what the user said — they already know. "
             "(C) Do NOT output any text to the chat between talk calls — the user cannot see it while on earbuds. "
-            "(D) Skip preamble like 'Sure!' or 'Great question!' — just answer directly."
+            "(D) Skip preamble like 'Sure!' or 'Great question!' — just answer directly. "
+            "TYPED INPUT: If this call is cancelled and the user typed a message, respond to their text normally — do not call talk again unless they ask."
         ),
         "inputSchema": {
             "type": "object",
@@ -2022,7 +2044,7 @@ def handle_request(req):
             if result.get("cancelled"):
                 return {
                     "jsonrpc": "2.0", "id": req_id,
-                    "result": {"content": [{"type": "text", "text": "(cancelled)"}]},
+                    "result": {"content": [{"type": "text", "text": "(cancelled — if the user typed a message, respond to that instead of calling talk)"}]},
                 }
             text = result.get("text", result.get("error", ""))
             content_text = text or "(no speech detected)"
@@ -2078,8 +2100,8 @@ def handle_request(req):
                 speed_val = 1.0
             speed_val = max(0.5, min(float(speed_val), 3.0))
 
-            # Always use full-duplex (works with or without echo cancellation)
-            if True:
+            # Use half-duplex (speak then listen) when configured — avoids echo on speakers
+            if not CONFIG.get("half_duplex", False):
                 result = talk_fullduplex(
                     speak_text,
                     quality=quality,
@@ -2095,7 +2117,7 @@ def handle_request(req):
                 if result.get("cancelled"):
                     return {
                         "jsonrpc": "2.0", "id": req_id,
-                        "result": {"content": [{"type": "text", "text": "(cancelled)"}]},
+                        "result": {"content": [{"type": "text", "text": "(cancelled — if the user typed a message, respond to that instead of calling talk)"}]},
                     }
                 user_said = result.get("text", "")
                 content_text = user_said or "(no speech detected)"
@@ -2121,7 +2143,7 @@ def handle_request(req):
             if tts_result.get("cancelled"):
                 return {
                     "jsonrpc": "2.0", "id": req_id,
-                    "result": {"content": [{"type": "text", "text": "(cancelled)"}]},
+                    "result": {"content": [{"type": "text", "text": "(cancelled — if the user typed a message, respond to that instead of calling talk)"}]},
                 }
             if not tts_result.get("spoken"):
                 return {
@@ -2137,7 +2159,7 @@ def handle_request(req):
             if isinstance(stt_result, dict) and stt_result.get("cancelled"):
                 return {
                     "jsonrpc": "2.0", "id": req_id,
-                    "result": {"content": [{"type": "text", "text": "(cancelled)"}]},
+                    "result": {"content": [{"type": "text", "text": "(cancelled — if the user typed a message, respond to that instead of calling talk)"}]},
                 }
             user_said = stt_result.get("text", stt_result.get("error", "")) if isinstance(stt_result, dict) else str(stt_result)
             content_text = user_said or "(no speech detected)"
@@ -2183,14 +2205,24 @@ def handle_request(req):
 
             # Update config settings
             settable = {"player", "recorder", "mic_source", "speaker_sink",
-                        "silence_timeout", "talk_silence_timeout", "voice", "fast_voice"}
+                        "silence_timeout", "talk_silence_timeout", "voice", "fast_voice",
+                        "half_duplex", "chime_ready", "chime_processing", "chime_speak",
+                        "chime_done", "chime_hum", "chime_barge_in", "visual_indicator",
+                        "live_subtitles", "vu_meter", "enable_pause", "enable_barge_in",
+                        "barge_in_frames", "barge_in_silence"}
             updated = []
             for k, v in args.items():
                 if k in settable:
                     if v == "null" or v is None:
                         CONFIG[k] = None
-                    elif k in ("silence_timeout", "talk_silence_timeout"):
+                    elif k in ("half_duplex", "chime_ready", "chime_processing", "chime_speak",
+                              "chime_done", "chime_hum", "chime_barge_in", "visual_indicator",
+                              "live_subtitles", "vu_meter", "enable_pause", "enable_barge_in"):
+                        CONFIG[k] = v if isinstance(v, bool) else str(v).lower() in ("true", "1", "yes")
+                    elif k in ("silence_timeout", "talk_silence_timeout", "barge_in_silence"):
                         CONFIG[k] = max(0.1, min(float(v), 10.0))
+                    elif k == "barge_in_frames":
+                        CONFIG[k] = max(1, min(int(v), 20))
                     else:
                         CONFIG[k] = v
                     updated.append(f"{k}={CONFIG[k]}")
@@ -2214,10 +2246,22 @@ def handle_request(req):
                 text = bt_msg + ("Updated: " + ", ".join(updated) if updated else "")
             else:
                 # Show current settings
-                show_keys = ["player", "recorder", "mic_source", "speaker_sink",
-                             "silence_timeout", "talk_silence_timeout", "voice", "fast_voice"]
-                lines = [f"  {k}: {CONFIG.get(k)}" for k in show_keys]
-                text = "Current audio settings:\n" + "\n".join(lines)
+                sections = [
+                    ("Audio", ["player", "recorder", "mic_source", "speaker_sink"]),
+                    ("Voice", ["voice", "fast_voice"]),
+                    ("Timing", ["silence_timeout", "talk_silence_timeout"]),
+                    ("Mode", ["half_duplex", "enable_pause", "enable_barge_in",
+                              "barge_in_frames", "barge_in_silence"]),
+                    ("Chimes", ["chime_ready", "chime_processing", "chime_speak",
+                                "chime_done", "chime_hum", "chime_barge_in"]),
+                    ("UI", ["visual_indicator", "live_subtitles", "vu_meter"]),
+                ]
+                lines = []
+                for label, keys in sections:
+                    lines.append(f"[{label}]")
+                    for k in keys:
+                        lines.append(f"  {k}: {CONFIG.get(k)}")
+                text = "Current settings:\n" + "\n".join(lines)
             return {
                 "jsonrpc": "2.0", "id": req_id,
                 "result": {"content": [{"type": "text", "text": text.strip()}]},
