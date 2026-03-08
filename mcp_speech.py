@@ -1386,6 +1386,11 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
 
         def download_audio():
             try:
+                # Lead-in silence (~50ms) prevents first-syllable clipping
+                # when audio device needs to wake up (Bluetooth, HDMI, etc.)
+                silence_bytes = b"\x00" * (tts_rate * 2 * 50 // 1000)  # 50ms of 16-bit silence
+                proc.stdin.write(silence_bytes)
+                proc.stdin.flush()
                 for chunk in resp.iter_content(chunk_size=16384):
                     if is_cancelled():
                         break
@@ -1740,6 +1745,13 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
 
     def download_audio():
         try:
+            # Lead-in silence (~50ms) prevents first-syllable clipping
+            silence_bytes = b"\x00" * (tts_rate * 2 * 50 // 1000)
+            try:
+                player_proc.stdin.write(silence_bytes)
+                player_proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                pass
             for chunk in resp.iter_content(chunk_size=16384):
                 if is_cancelled():
                     break
