@@ -158,6 +158,92 @@ def has_echo_cancel():
     return _has_echo_cancel
 
 
+def detect_audio_output():
+    """Detect default audio sink type via PipeWire.
+
+    Returns (device_type, info_dict) where device_type is one of:
+      'headphones' — headset/headphone/earbuds (safe for full-duplex)
+      'speakers'   — built-in/HDMI/external speakers (needs half-duplex)
+      'unknown'    — detection failed
+    """
+    try:
+        status = subprocess.run(
+            ["wpctl", "status"], capture_output=True, text=True, timeout=3)
+        if status.returncode != 0:
+            return "unknown", {}
+    except Exception:
+        return "unknown", {}
+
+    # Find default sink (marked with *)
+    in_sinks = False
+    default_sink_id = None
+    for line in status.stdout.splitlines():
+        if "Sinks:" in line:
+            in_sinks = True
+            continue
+        if in_sinks:
+            stripped = line.strip()
+            if stripped.startswith(("\u251c", "\u2514")) or not stripped:
+                in_sinks = False
+                continue
+            if "*" in line:
+                parts = line.split("*")[1].strip().split(".")
+                default_sink_id = parts[0].strip()
+                break
+
+    if not default_sink_id:
+        return "unknown", {}
+
+    try:
+        dump = subprocess.run(
+            ["pw-dump"], capture_output=True, text=True, timeout=5)
+        data = json.loads(dump.stdout)
+    except Exception:
+        return "unknown", {}
+
+    # Find the sink node
+    sink_props = None
+    for obj in data:
+        if str(obj.get("id", "")) == default_sink_id:
+            sink_props = obj.get("info", {}).get("props", {})
+            break
+    if not sink_props:
+        return "unknown", {}
+
+    node_name = sink_props.get("node.name", "")
+    desc = sink_props.get("node.description", "")
+    is_bluez = node_name.startswith("bluez_")
+
+    # Get parent device form-factor
+    device_id = sink_props.get("device.id")
+    form_factor = ""
+    device_bus = ""
+    if device_id is not None:
+        for obj in data:
+            if obj.get("id") == device_id:
+                dprops = obj.get("info", {}).get("props", {})
+                form_factor = dprops.get("device.form-factor", "")
+                device_bus = dprops.get("device.bus", "")
+                break
+
+    info = {
+        "description": desc,
+        "form_factor": form_factor,
+        "bus": device_bus,
+        "bluetooth": is_bluez,
+    }
+
+    if form_factor in ("headset", "headphone"):
+        return "headphones", info
+    if is_bluez:
+        return "headphones", info
+    if form_factor == "internal":
+        return "speakers", info
+    if "hdmi" in node_name.lower():
+        return "speakers", info
+    return "speakers", info
+
+
 def load_config():
     cfg = {}
     if os.path.exists(DEFAULTS_PATH):
@@ -189,11 +275,18 @@ def load_config():
         "chime_barge_in": cfg.get("chime_barge_in", True),
         "enable_pause": cfg.get("enable_pause", True),
         "enable_barge_in": cfg.get("enable_barge_in", False),
-        "half_duplex": cfg.get("half_duplex", False),
+        "half_duplex": cfg.get("half_duplex", "auto"),
     }
 
 
 CONFIG = load_config()
+
+# Auto-detect half_duplex based on audio output device
+if CONFIG["half_duplex"] == "auto":
+    _dev_type, _dev_info = detect_audio_output()
+    CONFIG["half_duplex"] = (_dev_type == "speakers")
+    CONFIG["_detected_output"] = _dev_type
+    CONFIG["_detected_output_info"] = _dev_info
 
 
 def get_http_session():
@@ -1959,7 +2052,7 @@ TOOLS = [
                 "voice": {"type": "string", "description": "Azure TTS voice name."},
                 "fast_voice": {"type": "string", "description": "Azure TTS voice name for fast quality."},
                 "bt_profile": {"type": "string", "description": "Bluetooth profile: a2dp (output only, hi-fi) or hfp (mic+speaker, lower quality)."},
-                "half_duplex": {"type": "boolean", "description": "If true, speak finishes before mic starts listening (avoids echo on speakers). Default false (full-duplex)."},
+                "half_duplex": {"type": "string", "description": "Controls echo avoidance. 'auto' (default): auto-detects headphones vs speakers. 'true': force half-duplex (speakers). 'false': force full-duplex (headphones/earbuds)."},
                 "chime_ready": {"type": "boolean", "description": "Play chime when mic starts listening."},
                 "chime_processing": {"type": "boolean", "description": "Play chime when processing starts."},
                 "chime_speak": {"type": "boolean", "description": "Play chime before TTS speaks."},
@@ -2320,7 +2413,15 @@ def handle_request(req):
                 if k in settable:
                     if v == "null" or v is None:
                         CONFIG[k] = None
-                    elif k in ("half_duplex", "chime_ready", "chime_processing", "chime_speak",
+                    elif k == "half_duplex":
+                        if isinstance(v, str) and v.lower() == "auto":
+                            dev_type, dev_info = detect_audio_output()
+                            CONFIG[k] = (dev_type == "speakers")
+                            CONFIG["_detected_output"] = dev_type
+                            CONFIG["_detected_output_info"] = dev_info
+                        else:
+                            CONFIG[k] = v if isinstance(v, bool) else str(v).lower() in ("true", "1", "yes")
+                    elif k in ("chime_ready", "chime_processing", "chime_speak",
                               "chime_done", "chime_hum", "chime_barge_in", "visual_indicator",
                               "live_subtitles", "vu_meter", "enable_pause", "enable_barge_in"):
                         CONFIG[k] = v if isinstance(v, bool) else str(v).lower() in ("true", "1", "yes")
@@ -2342,7 +2443,10 @@ def handle_request(req):
                         disk_cfg = json.load(f)
                 for k, v in args.items():
                     if k in settable:
-                        disk_cfg[k] = CONFIG[k]
+                        if k == "half_duplex" and isinstance(v, str) and v.lower() == "auto":
+                            disk_cfg[k] = "auto"
+                        else:
+                            disk_cfg[k] = CONFIG[k]
                 with open(cfg_path, "w") as f:
                     json.dump(disk_cfg, f, indent=4)
 
@@ -2366,6 +2470,13 @@ def handle_request(req):
                     lines.append(f"[{label}]")
                     for k in keys:
                         lines.append(f"  {k}: {CONFIG.get(k)}")
+                # Show detected audio output device
+                det_type = CONFIG.get("_detected_output", "unknown")
+                det_info = CONFIG.get("_detected_output_info", {})
+                det_desc = det_info.get("description", "unknown")
+                lines.append(f"[Detected]")
+                lines.append(f"  output_device: {det_desc} ({det_type})")
+                lines.append(f"  echo_cancel: {has_echo_cancel()}")
                 text = "Current settings:\n" + "\n".join(lines)
             return {
                 "jsonrpc": "2.0", "id": req_id,
