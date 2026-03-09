@@ -503,10 +503,11 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
     barge_silence_sec = max(0.3, float(CONFIG.get("barge_in_silence", 1.0)))
 
     # --- Background: read mic frames with VAD ---
-    _dbg_file = "/tmp/speech-debug.log"
+    _dbg_file = "/tmp/speech-debug.log" if os.environ.get("SPEECH_DEBUG") else None
     def _log(msg):
-        with open(_dbg_file, "a") as _f:
-            _f.write(f"[talk-vad {time.strftime('%H:%M:%S')}] {msg}\n")
+        if _dbg_file:
+            with open(_dbg_file, "a") as _f:
+                _f.write(f"[talk-vad {time.strftime('%H:%M:%S')}] {msg}\n")
 
     def record_with_vad_bg():
         try:
