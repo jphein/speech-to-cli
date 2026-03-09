@@ -23,7 +23,10 @@ from audio import (has_echo_cancel, play_chime, play_speak, play_done, stop_hum,
                    rms_energy, _build_rec_cmd, _build_player_cmd,
                    _start_player, _take_prewarmed_player, _get_tty_width,
                    _schedule_warmup, _classify_voice_cmd, _colorize)
-from stt import _make_ws_audio_msg, _get_stt_ws, _invalidate_stt_ws
+from stt import (_make_ws_audio_msg, _get_stt_ws, _invalidate_stt_ws,
+                 _make_logger, _check_end_word, _strip_end_word,
+                 _silence_icon, _init_stt_ws_session, _parse_ws_msg,
+                 _rest_stt_fallback)
 
 if HAS_WS:
     import websocket
@@ -431,29 +434,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
             ws = _get_stt_ws()
             rid = uuid.uuid4().hex
             stt_request_id[0] = rid
-            try:
-                ws.settimeout(0.05)
-                while True:
-                    ws.recv()
-            except Exception:
-                pass
-            speech_config = {
-                "context": {
-                    "system": {"version": "1.0.00000"},
-                    "os": {"platform": "Linux", "name": "speech-to-cli"},
-                    "audio": {"source": {"connectivity": "Unknown", "manufacturer": "Unknown",
-                                         "model": "Unknown", "type": "Unknown"}},
-                }
-            }
-            ws.send(
-                f"Path: speech.config\r\nX-RequestId: {rid}\r\n"
-                f"X-Timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())}\r\n"
-                f"Content-Type: application/json\r\n\r\n" + json.dumps(speech_config)
-            )
-            wav_header = struct.pack('<4sI4s4sIHHIIHH4sI',
-                b'RIFF', 0, b'WAVE', b'fmt ', 16, 1, 1, 16000, 32000, 2, 16, b'data', 0)
-            ws.send(_make_ws_audio_msg(rid, wav_header),
-                    opcode=websocket.ABNF.OPCODE_BINARY)
+            _init_stt_ws_session(ws, rid)
             stt_ws[0] = ws
         except Exception:
             use_streaming_stt = False
@@ -467,69 +448,23 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
     end_word_detected = threading.Event()
     _end_word = CONFIG.get("end_word", "over")
 
-    def _check_end_word(text):
-        """Check if the end word appears at the end of the text."""
-        if not _end_word:
-            return False
-        words = text.lower().strip().rstrip(".!?,").split()
-        return len(words) > 0 and words[-1] == _end_word.lower()
-
-    def _try_recv_ws(ws):
-        """Non-blocking read of WS hypothesis/phrase messages."""
+    def _recv_ws():
+        """Non-blocking read of WS messages, using shared parser."""
+        ws = stt_ws[0]
+        if not ws:
+            return
         try:
             ws.settimeout(0.001)
             msg = ws.recv()
         except Exception:
             return
-        if not isinstance(msg, str):
-            return
-        parts = msg.split("\r\n\r\n", 1)
-        if len(parts) < 2:
-            return
-        hdr, body = parts
-        hdr_lower = hdr.lower()
-        if "speech.hypothesis" in hdr_lower:
-            try:
-                partial = json.loads(body).get("Text", "")
-                if partial:
-                    # Check for end word in hypothesis
-                    if _check_end_word(partial):
-                        end_word_detected.set()
-                    # Show accumulated phrases + current hypothesis
-                    full = (" ".join(stt_phrases) + " " + partial).strip() if stt_phrases else partial
-                    term_width = _get_tty_width()
-                    window = max(40, term_width - 25)
-                    stt_partial[0] = full if len(full) < window else "..." + full[-(window-3):]
-            except Exception:
-                pass
-        elif "speech.phrase" in hdr_lower:
-            try:
-                data = json.loads(body)
-                status = data.get("RecognitionStatus", "?")
-                if status == "Success":
-                    nbest = data.get("NBest", [])
-                    phrase = nbest[0]["Display"] if nbest else data.get("DisplayText", "")
-                    if phrase:
-                        stt_phrases.append(phrase)
-                        # Check end word on confirmed phrase only (not hypotheses)
-                        if _check_end_word(phrase):
-                            end_word_detected.set()
-                        # Update partial to show all confirmed text
-                        full = " ".join(stt_phrases)
-                        term_width = _get_tty_width()
-                        window = max(40, term_width - 25)
-                        stt_partial[0] = full if len(full) < window else "..." + full[-(window-3):]
-                else:
-                    _log(f"phrase status={status}: {body[:150]}")
-            except Exception:
-                pass
+        mtype = _parse_ws_msg(msg, stt_phrases, stt_partial, end_word_detected, _end_word, _log)
+        if mtype == "phrase":
             stt_phrase_done.set()
-        elif "turn.end" in hdr_lower:
-            _log(f"turn.end received during recording (phrases={len(stt_phrases)}) — Azure ended STT session")
+        elif mtype == "turn_end":
+            _log(f"turn.end during recording (phrases={len(stt_phrases)}) — Azure ended STT session")
             stt_turn_ended.set()
             stt_phrase_done.set()
-            # Azure won't process any more audio on this request.
-            # Mark WS dead so recording loop stops sending and we fall back to REST.
             stt_ws[0] = None
             _invalidate_stt_ws()
 
@@ -538,11 +473,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
     barge_silence_sec = max(0.3, float(CONFIG.get("barge_in_silence", 1.0)))
 
     # --- Background: read mic frames with VAD ---
-    _dbg_file = "/tmp/speech-debug.log" if (os.environ.get("SPEECH_DEBUG") or CONFIG.get("debug")) else None
-    def _log(msg):
-        if _dbg_file:
-            with open(_dbg_file, "a") as _f:
-                _f.write(f"[talk-vad {time.strftime('%H:%M:%S')}] {msg}\n")
+    _log = _make_logger("talk-vad")
 
     def record_with_vad_bg():
         try:
@@ -590,7 +521,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                         try:
                             ws.send(_make_ws_audio_msg(rid, chunk),
                                     opcode=websocket.ABNF.OPCODE_BINARY)
-                            _try_recv_ws(ws)
+                            _recv_ws()
                         except Exception as _e:
                             _log(f"WS send error during TTS (frame {total_frames}): {_e}")
                             stt_ws[0] = None  # mark dead so we don't keep trying
@@ -636,7 +567,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                     try:
                         ws.send(_make_ws_audio_msg(rid, chunk),
                                 opcode=websocket.ABNF.OPCODE_BINARY)
-                        _try_recv_ws(ws)
+                        _recv_ws()
                     except Exception as _e:
                         _log(f"WS send error post-TTS (frame {total_frames}): {_e}")
                         stt_ws[0] = None  # mark dead
@@ -648,29 +579,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                         ws_new = _get_stt_ws()
                         rid_new = uuid.uuid4().hex
                         stt_request_id[0] = rid_new
-                        try:
-                            ws_new.settimeout(0.05)
-                            while True:
-                                ws_new.recv()
-                        except Exception:
-                            pass
-                        speech_cfg = {
-                            "context": {
-                                "system": {"version": "1.0.00000"},
-                                "os": {"platform": "Linux", "name": "speech-to-cli"},
-                                "audio": {"source": {"connectivity": "Unknown", "manufacturer": "Unknown",
-                                                     "model": "Unknown", "type": "Unknown"}},
-                            }
-                        }
-                        ws_new.send(
-                            f"Path: speech.config\r\nX-RequestId: {rid_new}\r\n"
-                            f"X-Timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())}\r\n"
-                            f"Content-Type: application/json\r\n\r\n" + json.dumps(speech_cfg)
-                        )
-                        wav_hdr = struct.pack('<4sI4s4sIHHIIHH4sI',
-                            b'RIFF', 0, b'WAVE', b'fmt ', 16, 1, 1, 16000, 32000, 2, 16, b'data', 0)
-                        ws_new.send(_make_ws_audio_msg(rid_new, wav_hdr),
-                                    opcode=websocket.ABNF.OPCODE_BINARY)
+                        _init_stt_ws_session(ws_new, rid_new)
                         # Replay buffered frames: TTS-phase dead frames + post-TTS frames
                         replay = tts_dead_frames + rec_frames
                         for prev_frame in replay:
@@ -850,18 +759,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
             break
         pct = int(70 + min(1.0, elapsed / listen_timeout) * 15)
         vu = random.choice(listen_bars) if show_vu else ""
-        sr = silence_ratio[0]
-        # Silence countdown indicator: ○ (ok) → ◔ → ◑ → ◕ → ● (about to cut)
-        if sr < 0.25:
-            timer_icon = ""
-        elif sr < 0.50:
-            timer_icon = " ◔"
-        elif sr < 0.75:
-            timer_icon = " ◑"
-        elif sr < 0.90:
-            timer_icon = " ◕"
-        else:
-            timer_icon = " ●"
+        timer_icon = _silence_icon(silence_ratio[0])
         # Keep TTS text visible + show user's speech below it
         tts_line = f"🔊 {_colorize(text, tts_color)}" if show_subs else ""
         if rec_speech_detected.is_set():
@@ -956,47 +854,13 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
         # Fallback: REST STT (WS failed, died, or returned nothing)
         _log(f"WS returned nothing (ws_alive={stt_ws[0] is not None} turn_ended={stt_turn_ended.is_set()} raw_bytes={len(raw_data)}), falling back to REST STT")
         send_progress(progress_token, 85, 100, "🧠 Transcribing...")
-        wav_path = tempfile.mktemp(suffix=".wav")
-        try:
-            write_wav(wav_path, raw_data)
-            stt_url = f"https://{CONFIG['region']}.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1"
-            stt_headers = {
-                "Ocp-Apim-Subscription-Key": CONFIG["key"],
-                "Content-Type": "audio/wav; codecs=audio/pcm; samplerate=16000",
-            }
-            with open(wav_path, "rb") as f:
-                stt_resp = get_http_session().post(
-                    stt_url, params={"language": "en-US", "format": "detailed"},
-                    headers=stt_headers, data=f, timeout=30,
-                )
-            if stt_resp.status_code == 200:
-                result = stt_resp.json()
-                status = result.get("RecognitionStatus", "?")
-                _log(f"REST STT status={status}")
-                if status == "Success":
-                    nbest = result.get("NBest", [])
-                    user_text = nbest[0]["Display"] if nbest else result.get("DisplayText", "")
-                    _log(f"REST STT recovered: {repr(user_text[:100])}")
-                else:
-                    _log(f"REST STT non-success: {status}")
-            else:
-                _log(f"REST STT HTTP error: {stt_resp.status_code}")
-        except Exception as _e:
-            _log(f"REST STT exception: {_e}")
-        finally:
-            try:
-                os.unlink(wav_path)
-            except OSError:
-                pass
+        user_text = _rest_stt_fallback(rec_frames, _log)
 
     stop_hum()
     play_done()
     _mark_tts_end()
 
-    # Strip end word from result if it triggered the stop
-    if _end_word and user_text:
-        import re as _re
-        user_text = _re.sub(r'\s*\b' + _re.escape(_end_word) + r'[.!?,]*\s*$', '', user_text, flags=_re.IGNORECASE).strip()
+    user_text = _strip_end_word(user_text, _end_word)
 
     # Show final state: TTS text + user reply so subtitles persist
     tts_color = subtitle_color or CONFIG.get("subtitle_color_tts")
