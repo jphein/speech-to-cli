@@ -150,61 +150,33 @@ def multi_speak(segments, quality="fast", progress_token=None):
     _ms_default_color = CONFIG.get("subtitle_color_tts")
     _ms_window = max(40, _get_tty_width() - 25)
 
-    # Pre-warm next player while current is playing to eliminate inter-segment gap
-    next_proc = [None]
-
-    def _prewarm_next():
-        """Pre-start player with silence so it's hot when audio arrives."""
-        p = _start_player(tts_rate)
-        if p is None:
-            return
-        try:
-            # Write ~100ms of silence to warm up the audio pipeline
-            p.stdin.write(b"\x00" * (tts_rate * 2 // 10))
-            p.stdin.flush()
-        except (BrokenPipeError, OSError):
-            return
-        next_proc[0] = p
-
     for i, audio in enumerate(audio_buffers):
         if is_cancelled():
             return {"cancelled": True}
         if audio is None:
             continue
 
-        # Use pre-warmed player if available, otherwise start fresh
-        if next_proc[0] is not None:
-            proc = next_proc[0]
-            next_proc[0] = None
-        else:
-            proc = _start_player(tts_rate)
-            if proc is None:
-                return {"error": "No audio player found"}
-            try:
-                proc.stdin.write(silence_bytes)
-                proc.stdin.flush()
-            except (BrokenPipeError, OSError):
-                continue
+        proc = _start_player(tts_rate)
+        if proc is None:
+            return {"error": "No audio player found"}
 
         register_proc(proc)
-
         try:
+            if i == 0:
+                proc.stdin.write(silence_bytes)
             proc.stdin.write(audio)
             proc.stdin.close()
         except (BrokenPipeError, OSError):
             unregister_proc(proc)
             continue
 
-        # Pre-warm next player in background while this one plays
-        if i + 1 < n_seg:
-            threading.Thread(target=_prewarm_next, daemon=True).start()
+        seg_start = time.time()
 
         try:
             seg_text = segments[i].get("text", "")
             seg_color = segments[i].get("subtitle_color") or _ms_default_color
             seg_target = int(((i + 1) / n_seg) * 99)
-            seg_start = time.time()
-            seg_dur = max(1.0, len(seg_text) / 22.0)
+            seg_dur = max(1.0, len(seg_text) / 18.0)
             last_msg = ""
             while proc.poll() is None:
                 pct = min(pct + 2, seg_target)
