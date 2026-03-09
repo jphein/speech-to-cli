@@ -221,8 +221,11 @@ TOOLS = [
                 "enable_pause": {"type": "boolean", "description": "Allow pausing/resuming playback and recording."},
                 "enable_echo_cancel": {"type": "boolean", "description": "[Experimental] Use PipeWire echo cancellation nodes if available (default true)."},
                 "enable_barge_in": {"type": "boolean", "description": "[Experimental] Allow user speech to pause TTS (barge-in, default false)."},
-                "barge_in_frames": {"type": "integer", "description": "Speech frames needed to trigger barge-in (default 3)."},
-                "barge_in_silence": {"type": "number", "description": "Silence seconds to resume TTS after barge-in (default 1.0)."},
+                "no_speech_timeout": {"type": "number", "description": "Seconds to wait for any speech before giving up (default 7)."},
+                "energy_multiplier": {"type": "number", "description": "Energy threshold multiplier for noise gating (default 2.5). Lower = more sensitive."},
+                "barge_in_frames": {"type": "integer", "description": "[Experimental] Speech frames needed to trigger barge-in (default 3)."},
+                "barge_in_silence": {"type": "number", "description": "[Experimental] Silence seconds to resume TTS after barge-in (default 1.0)."},
+                "debug": {"type": "boolean", "description": "Write debug logs to /tmp/speech-debug.log."},
             },
         },
     },
@@ -616,13 +619,14 @@ def handle_request(req):
             # Update config settings
             settable = {"key", "region",
                         "player", "recorder", "mic_source", "speaker_sink",
-                        "silence_timeout", "talk_silence_timeout", "end_word", "voice", "fast_voice",
+                        "silence_timeout", "talk_silence_timeout", "no_speech_timeout",
+                        "energy_multiplier", "end_word", "voice", "fast_voice",
                         "half_duplex", "chime_ready", "chime_processing", "chime_speak",
                         "chime_done", "chime_hum", "chime_barge_in", "visual_indicator",
                         "live_subtitles", "subtitle_color_user", "subtitle_color_tts",
                         "vu_meter", "enable_pause",
                         "enable_echo_cancel", "enable_barge_in",
-                        "barge_in_frames", "barge_in_silence"}
+                        "barge_in_frames", "barge_in_silence", "debug"}
             updated = []
             for k, v in args.items():
                 if k in settable:
@@ -650,12 +654,20 @@ def handle_request(req):
                     elif k in ("chime_ready", "chime_processing", "chime_speak",
                               "chime_done", "chime_hum", "chime_barge_in", "visual_indicator",
                               "live_subtitles", "vu_meter", "enable_pause",
-                              "enable_echo_cancel", "enable_barge_in"):
+                              "enable_echo_cancel", "enable_barge_in", "debug"):
                         CONFIG[k] = v if isinstance(v, bool) else str(v).lower() in ("true", "1", "yes")
                         if k == "enable_echo_cancel":
                             state._has_echo_cancel = None  # force re-detection
                     elif k in ("silence_timeout", "talk_silence_timeout", "barge_in_silence"):
                         CONFIG[k] = max(0.1, min(float(v), 10.0))
+                    elif k == "no_speech_timeout":
+                        val = max(1.0, min(float(v), 30.0))
+                        state.NO_SPEECH_TIMEOUT = val
+                        CONFIG[k] = val
+                    elif k == "energy_multiplier":
+                        val = max(0.5, min(float(v), 20.0))
+                        state.ENERGY_THRESHOLD_MULTIPLIER = val
+                        CONFIG[k] = val
                     elif k == "barge_in_frames":
                         CONFIG[k] = max(1, min(int(v), 20))
                     else:
@@ -686,10 +698,11 @@ def handle_request(req):
                 sections = [
                     ("Audio", ["player", "recorder", "mic_source", "speaker_sink"]),
                     ("Voice", ["voice", "fast_voice"]),
-                    ("Timing", ["silence_timeout", "talk_silence_timeout", "end_word"]),
+                    ("Timing", ["silence_timeout", "talk_silence_timeout", "no_speech_timeout",
+                               "energy_multiplier", "end_word"]),
                     ("Mode", ["half_duplex", "enable_pause"]),
                     ("Experimental", ["enable_echo_cancel", "enable_barge_in",
-                                      "barge_in_frames", "barge_in_silence"]),
+                                      "barge_in_frames", "barge_in_silence", "debug"]),
                     ("Chimes", ["chime_ready", "chime_processing", "chime_speak",
                                 "chime_done", "chime_hum", "chime_barge_in"]),
                     ("UI", ["visual_indicator", "live_subtitles", "subtitle_color_user",

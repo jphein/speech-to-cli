@@ -170,6 +170,8 @@ def load_config():
         "speaker_sink": cfg.get("speaker_sink", None),
         "silence_timeout": cfg.get("silence_timeout", SILENCE_TIMEOUT),
         "talk_silence_timeout": cfg.get("talk_silence_timeout", 4.0),
+        "no_speech_timeout": cfg.get("no_speech_timeout", NO_SPEECH_TIMEOUT),
+        "energy_multiplier": cfg.get("energy_multiplier", ENERGY_THRESHOLD_MULTIPLIER),
         # UI settings
         "chime_ready": cfg.get("chime_ready", True),
         "chime_processing": cfg.get("chime_processing", False),
@@ -188,6 +190,7 @@ def load_config():
         "end_word": cfg.get("end_word", "over"),
         "enable_echo_cancel": cfg.get("enable_echo_cancel", False),
         "enable_barge_in": cfg.get("enable_barge_in", False),
+        "debug": cfg.get("debug", False),
         "half_duplex": cfg.get("half_duplex", "auto"),
     }
 

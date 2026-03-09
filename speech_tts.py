@@ -503,7 +503,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
     barge_silence_sec = max(0.3, float(CONFIG.get("barge_in_silence", 1.0)))
 
     # --- Background: read mic frames with VAD ---
-    _dbg_file = "/tmp/speech-debug.log" if os.environ.get("SPEECH_DEBUG") else None
+    _dbg_file = "/tmp/speech-debug.log" if (os.environ.get("SPEECH_DEBUG") or CONFIG.get("debug")) else None
     def _log(msg):
         if _dbg_file:
             with open(_dbg_file, "a") as _f:
@@ -578,21 +578,12 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                 # --- After TTS: normal recording ---
                 if post_tts_frames == 0:
                     _log(f"TTS done at frame {total_frames}, old threshold={energy_threshold:.0f}")
-                    # Skip a few frames to let TTS residual audio fade
-                    for _ in range(3):
-                        skip = rec_proc.stdout.read(state.FRAME_BYTES)
-                        if skip and len(skip) == state.FRAME_BYTES:
-                            total_frames += 1
-                    # Re-calibrate: TTS can inflate the noise threshold
-                    cal_energies = [rms_energy(chunk)]
-                    for _ in range(4):
-                        cal_chunk = rec_proc.stdout.read(state.FRAME_BYTES)
-                        if cal_chunk and len(cal_chunk) == state.FRAME_BYTES:
-                            cal_energies.append(rms_energy(cal_chunk))
-                            total_frames += 1
-                    ambient = sum(cal_energies) / len(cal_energies)
-                    energy_threshold = max(ambient * state.ENERGY_THRESHOLD_MULTIPLIER, 300.0)
-                    _log(f"re-calibrated: threshold={energy_threshold:.0f} ambient={ambient:.0f}")
+                    # Reset to minimum threshold — TTS inflates the calibrated value,
+                    # and re-calibration is unreliable (catches residual noise).
+                    # Ambient silence is ~40-100, speech is 300+, so 300 works reliably.
+                    # Let webrtcvad do the heavy lifting for speech detection.
+                    energy_threshold = 300.0
+                    _log(f"reset threshold to {energy_threshold:.0f}")
                 post_tts_frames += 1
                 rec_frames.append(chunk)
 
