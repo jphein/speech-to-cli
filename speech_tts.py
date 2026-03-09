@@ -161,15 +161,20 @@ def multi_speak(segments, quality="fast", progress_token=None):
             return {"error": "No audio player found"}
 
         register_proc(proc)
-        try:
-            if i == 0:
-                proc.stdin.write(silence_bytes)
-            proc.stdin.write(audio)
-            proc.stdin.close()
-        except (BrokenPipeError, OSError):
-            unregister_proc(proc)
-            continue
 
+        # Write audio in background thread — large buffers block on pipe,
+        # delaying seg_start and causing subtitle lag
+        def _write_audio(p, data, lead):
+            try:
+                if lead:
+                    p.stdin.write(lead)
+                p.stdin.write(data)
+                p.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+        threading.Thread(target=_write_audio,
+                         args=(proc, audio, silence_bytes if i == 0 else b""),
+                         daemon=True).start()
         seg_start = time.time()
 
         try:
