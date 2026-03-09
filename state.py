@@ -185,6 +185,7 @@ def load_config():
         "barge_in_silence": cfg.get("barge_in_silence", 1.0),
         "chime_barge_in": cfg.get("chime_barge_in", True),
         "enable_pause": cfg.get("enable_pause", True),
+        "end_word": cfg.get("end_word", "over"),
         "enable_echo_cancel": cfg.get("enable_echo_cancel", False),
         "enable_barge_in": cfg.get("enable_barge_in", False),
         "half_duplex": cfg.get("half_duplex", "auto"),

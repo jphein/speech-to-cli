@@ -441,6 +441,15 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
     stt_partial = [""]
     stt_phrase_done = threading.Event()
     silence_ratio = [0.0]  # 0.0 → 1.0 as silence approaches cutoff
+    end_word_detected = threading.Event()
+    _end_word = CONFIG.get("end_word", "over")
+
+    def _check_end_word(text):
+        """Check if the end word appears at the end of the text."""
+        if not _end_word:
+            return False
+        words = text.lower().strip().rstrip(".!?,").split()
+        return len(words) > 0 and words[-1] == _end_word.lower()
 
     def _try_recv_ws(ws):
         """Non-blocking read of WS hypothesis/phrase messages."""
@@ -460,6 +469,9 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
             try:
                 partial = json.loads(body).get("Text", "")
                 if partial:
+                    # Check for end word in hypothesis
+                    if _check_end_word(partial):
+                        end_word_detected.set()
                     # Show accumulated phrases + current hypothesis
                     full = (" ".join(stt_phrases) + " " + partial).strip() if stt_phrases else partial
                     term_width = _get_tty_width()
@@ -491,11 +503,17 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
     barge_silence_sec = max(0.3, float(CONFIG.get("barge_in_silence", 1.0)))
 
     # --- Background: read mic frames with VAD ---
+    _dbg_file = "/tmp/speech-debug.log"
+    def _log(msg):
+        with open(_dbg_file, "a") as _f:
+            _f.write(f"[talk-vad {time.strftime('%H:%M:%S')}] {msg}\n")
+
     def record_with_vad_bg():
         try:
             vad = webrtcvad.Vad(state.VAD_AGGRESSIVENESS) if HAS_VAD else None
             energy_threshold, cal_frames = calibrate_noise(rec_proc)
             rec_frames.extend(cal_frames)
+            _log(f"calibrated: threshold={energy_threshold:.0f}, cal_frames={len(cal_frames)}")
 
             # Ding as soon as mic is ready — even over TTS playback
             play_chime()
@@ -512,12 +530,15 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
             barge_silence_frames = int(barge_silence_sec * 1000 / state.FRAME_MS)
 
             post_tts_frames = 0
+            _log(f"limits: max_silence={max_silence} max_no_speech={max_no_speech} min_speech={min_speech} stt_silence={stt_silence}")
 
             while total_frames < max_total:
                 if is_cancelled():
+                    _log("cancelled")
                     break
                 chunk = rec_proc.stdout.read(state.FRAME_BYTES)
                 if not chunk or len(chunk) < state.FRAME_BYTES:
+                    _log(f"no data at frame {total_frames}")
                     break
                 total_frames += 1
                 is_speech = is_speech_energy(chunk, vad, energy_threshold)
@@ -554,6 +575,23 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                     continue
 
                 # --- After TTS: normal recording ---
+                if post_tts_frames == 0:
+                    _log(f"TTS done at frame {total_frames}, old threshold={energy_threshold:.0f}")
+                    # Skip a few frames to let TTS residual audio fade
+                    for _ in range(3):
+                        skip = rec_proc.stdout.read(state.FRAME_BYTES)
+                        if skip and len(skip) == state.FRAME_BYTES:
+                            total_frames += 1
+                    # Re-calibrate: TTS can inflate the noise threshold
+                    cal_energies = [rms_energy(chunk)]
+                    for _ in range(4):
+                        cal_chunk = rec_proc.stdout.read(state.FRAME_BYTES)
+                        if cal_chunk and len(cal_chunk) == state.FRAME_BYTES:
+                            cal_energies.append(rms_energy(cal_chunk))
+                            total_frames += 1
+                    ambient = sum(cal_energies) / len(cal_energies)
+                    energy_threshold = max(ambient * state.ENERGY_THRESHOLD_MULTIPLIER, 300.0)
+                    _log(f"re-calibrated: threshold={energy_threshold:.0f} ambient={ambient:.0f}")
                 post_tts_frames += 1
                 rec_frames.append(chunk)
 
@@ -579,12 +617,21 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                 if max_silence > 0:
                     silence_ratio[0] = silence_frames / max_silence
 
+                # Log every ~1 second of post-TTS recording
+                if post_tts_frames % 33 == 0:
+                    _log(f"post-TTS f={post_tts_frames} speech={speech_frames} silence={silence_frames} energy={rms_energy(chunk):.0f} thresh={energy_threshold:.0f}")
+
+                if end_word_detected.is_set():
+                    _log(f"STOP: end word '{_end_word}' detected. speech={speech_frames}")
+                    break
                 if speech_frames >= min_speech and silence_frames >= max_silence:
+                    _log(f"STOP: silence timeout. speech={speech_frames} silence={silence_frames}/{max_silence}")
                     break
                 if speech_frames == 0 and post_tts_frames >= max_no_speech:
+                    _log(f"STOP: no speech timeout. post_tts={post_tts_frames}/{max_no_speech}")
                     break
-        except Exception:
-            pass
+        except Exception as e:
+            _log(f"exception: {e}")
         finally:
             rec_done.set()
 
@@ -842,6 +889,11 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
     play_done()
     _mark_tts_end()
     send_progress(progress_token, 100, 100, "✅ Done")
+
+    # Strip end word from result if it triggered the stop
+    if _end_word and user_text:
+        import re as _re
+        user_text = _re.sub(r'\s*\b' + _re.escape(_end_word) + r'[.!?,]*\s*$', '', user_text, flags=_re.IGNORECASE).strip()
 
     # Pre-warm for next call
     _schedule_warmup()

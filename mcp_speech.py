@@ -202,6 +202,7 @@ TOOLS = [
                 "speaker_sink": {"type": "string", "description": "PipeWire node name for speaker output, or 'null' for default."},
                 "silence_timeout": {"type": "number", "description": "Silence timeout for listen tool (seconds)."},
                 "talk_silence_timeout": {"type": "number", "description": "Silence timeout for talk tool (seconds)."},
+                "end_word": {"type": "string", "description": "Word that immediately stops recording when said at end of sentence (default 'over'). Set to empty string to disable."},
                 "voice": {"type": "string", "description": "Azure TTS voice name."},
                 "fast_voice": {"type": "string", "description": "Azure TTS voice name for fast quality."},
                 "bt_profile": {"type": "string", "description": "Bluetooth profile: a2dp (output only, hi-fi) or hfp (mic+speaker, lower quality)."},
@@ -615,7 +616,7 @@ def handle_request(req):
             # Update config settings
             settable = {"key", "region",
                         "player", "recorder", "mic_source", "speaker_sink",
-                        "silence_timeout", "talk_silence_timeout", "voice", "fast_voice",
+                        "silence_timeout", "talk_silence_timeout", "end_word", "voice", "fast_voice",
                         "half_duplex", "chime_ready", "chime_processing", "chime_speak",
                         "chime_done", "chime_hum", "chime_barge_in", "visual_indicator",
                         "live_subtitles", "subtitle_color_user", "subtitle_color_tts",
@@ -631,6 +632,8 @@ def handle_request(req):
                         CONFIG[k] = str(v)
                         state._http_session = None
                         _invalidate_stt_ws()
+                    elif k == "end_word":
+                        CONFIG[k] = str(v).strip().lower() if v else ""
                     elif k == "half_duplex":
                         if isinstance(v, str) and v.lower() == "auto":
                             state._half_duplex_setting = "auto"
@@ -683,7 +686,7 @@ def handle_request(req):
                 sections = [
                     ("Audio", ["player", "recorder", "mic_source", "speaker_sink"]),
                     ("Voice", ["voice", "fast_voice"]),
-                    ("Timing", ["silence_timeout", "talk_silence_timeout"]),
+                    ("Timing", ["silence_timeout", "talk_silence_timeout", "end_word"]),
                     ("Mode", ["half_duplex", "enable_pause"]),
                     ("Experimental", ["enable_echo_cancel", "enable_barge_in",
                                       "barge_in_frames", "barge_in_silence"]),
