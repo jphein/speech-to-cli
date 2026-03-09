@@ -52,7 +52,9 @@ Live scrolling subtitles with ANSI color support:
 - Progress notification dedup to reduce MCP notification spam
 - Full-duplex plays a chime when TTS finishes to signal "your turn"
 - Silence countdown indicator (○→◔→◑→◕→●) shows how close to cutoff during listening
-- `talk_silence_timeout` default 3.0s (configurable) — time to think between phrases
+- `talk_silence_timeout` default 4.0s (configurable) — time to think between phrases
+- Dynamic agent hints: tool responses include `[AGENT HINTS]` suggesting config changes based on user behavior (repeated no-speech, short responses)
+- Agents guided to pass per-call `silence_timeout` (2s for yes/no, 6-8s for open-ended)
 
 ## Pairing with azure-chat-assistant
 For voice conversations with multiple Azure AI models, use alongside the

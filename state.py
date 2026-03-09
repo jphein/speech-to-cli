@@ -139,6 +139,10 @@ _half_duplex_setting = None  # set after load_config()
 _last_detected_sink_id = None
 _auto_detect_lock = threading.Lock()
 
+# Agent hint tracking
+_consecutive_no_speech = 0
+_consecutive_short_response = 0  # responses under 5 words
+
 # Stdout / request queue
 _stdout_lock = threading.Lock()
 _request_queue = []

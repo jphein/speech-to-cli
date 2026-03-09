@@ -245,7 +245,12 @@ TOOLS = [
             "SWITCHING MODES: If the user asks you to do something that requires calling other tools (search, edit, "
             "query APIs, read files), switch to the speak\u2192converse pattern: call 'speak' with your response, do your "
             "tool calls, then call 'speak' with results and 'converse' to listen. Switch back to 'talk' for quick "
-            "back-and-forth that doesn't need tool calls in between."
+            "back-and-forth that doesn't need tool calls in between. "
+            "DYNAMIC TUNING: "
+            "(1) For yes/no questions, pass silence_timeout=2. For open-ended questions, pass silence_timeout=6-8. "
+            "(2) If you get '(no speech detected)' twice, call configure(talk_silence_timeout=N) to increase the default. "
+            "(3) You can toggle chimes mid-conversation: configure(chime_ready=true/false). "
+            "(4) Watch for [AGENT HINTS] in responses \u2014 they suggest configuration changes based on the user's behavior."
         ),
         "inputSchema": {
             "type": "object",
@@ -364,8 +369,22 @@ def handle_request(req):
             text = result.get("text", result.get("error", ""))
             content_text = text or "(no speech detected)"
             _schedule_warmup()
+
+            # --- Dynamic agent hints for listen/converse ---
+            listen_hints = []
+            if not text:
+                state._consecutive_no_speech += 1
+                if state._consecutive_no_speech >= 2:
+                    cur_st = args.get("silence_timeout") or CONFIG.get("silence_timeout", 3.0)
+                    listen_hints.append(f"No speech {state._consecutive_no_speech}x in a row. "
+                                        f"Consider passing silence_timeout={min(cur_st + 2, 10):.0f} on your next call.")
+            else:
+                state._consecutive_no_speech = 0
+
             if tool_name == "converse":
                 content_text += "\n\n[Voice conversation active \u2014 call 'speak' to reply, then call 'converse' to listen again. You may call other tools (search, edit, query) between speak and converse. Keep spoken replies short (1-3 sentences). For quick back-and-forth with no tools needed, switch to 'talk'. Use 'speak' for a final goodbye with no reply needed.]"
+            if listen_hints:
+                content_text += "\n\n[AGENT HINTS: " + " ".join(listen_hints) + "]"
             return {
                 "jsonrpc": "2.0", "id": req_id,
                 "result": {"content": [{"type": "text", "text": content_text}]},
@@ -462,10 +481,32 @@ def handle_request(req):
                 user_said = result.get("text", "")
                 content_text = user_said or "(no speech detected)"
                 _audio_hint = "on earbuds" if CONFIG.get("_detected_output") == "headphones" else "on speakers"
+
+                # --- Dynamic agent hints ---
+                hints = []
+                cur_silence = args.get("silence_timeout") or CONFIG.get("talk_silence_timeout", 4.0)
                 if user_said:
+                    state._consecutive_no_speech = 0
+                    word_count = len(user_said.split())
+                    if word_count <= 4:
+                        state._consecutive_short_response += 1
+                        if state._consecutive_short_response >= 2:
+                            hints.append(f"User gave {state._consecutive_short_response} short replies in a row. "
+                                         f"They may be getting cut off. Consider passing silence_timeout={min(cur_silence + 2, 10):.0f} on your next call.")
+                    else:
+                        state._consecutive_short_response = 0
                     content_text += f"\n\n[Call 'talk' now. Keep reply under 2 sentences. No chat text \u2014 user is {_audio_hint}. If you need to call tools first, switch to speak\u2192converse pattern.]"
                 else:
+                    state._consecutive_no_speech += 1
+                    if state._consecutive_no_speech >= 2:
+                        hints.append(f"No speech {state._consecutive_no_speech}x in a row. "
+                                     f"Consider: configure(talk_silence_timeout={min(cur_silence + 2, 10):.0f}) to give the user more time, "
+                                     f"or ask if they're still there.")
                     content_text += "\n\n[No speech \u2014 call 'talk' with a short check-in. Don't drop to text.]"
+
+                if hints:
+                    content_text += "\n\n[AGENT HINTS: " + " ".join(hints) + "]"
+
                 return {
                     "jsonrpc": "2.0", "id": req_id,
                     "result": {"content": [{"type": "text", "text": content_text}]},
@@ -513,10 +554,30 @@ def handle_request(req):
             content_text = user_said or "(no speech detected)"
             _schedule_warmup()
             _audio_hint2 = "on earbuds" if CONFIG.get("_detected_output") == "headphones" else "on speakers"
+
+            # --- Dynamic agent hints (half-duplex path) ---
+            hd_hints = []
+            hd_cur_silence = args.get("silence_timeout") or CONFIG.get("talk_silence_timeout", 4.0)
             if user_said:
+                state._consecutive_no_speech = 0
+                word_count = len(user_said.split())
+                if word_count <= 4:
+                    state._consecutive_short_response += 1
+                    if state._consecutive_short_response >= 2:
+                        hd_hints.append(f"User gave {state._consecutive_short_response} short replies. "
+                                        f"Consider silence_timeout={min(hd_cur_silence + 2, 10):.0f}.")
+                else:
+                    state._consecutive_short_response = 0
                 content_text += f"\n\n[RESPOND NOW: call 'talk' with a short spoken reply. Do NOT type text to the user \u2014 they are {_audio_hint2}. Keep it conversational, 1-3 sentences. If you need to call tools first, switch to speak\u2192converse pattern.]"
             else:
+                state._consecutive_no_speech += 1
+                if state._consecutive_no_speech >= 2:
+                    hd_hints.append(f"No speech {state._consecutive_no_speech}x. "
+                                    f"Consider: configure(talk_silence_timeout={min(hd_cur_silence + 2, 10):.0f}).")
                 content_text += "\n\n[No speech detected \u2014 the user may still be there. Call 'talk' again with a brief check-in like 'Hey, are you still there?' Do NOT drop to text.]"
+
+            if hd_hints:
+                content_text += "\n\n[AGENT HINTS: " + " ".join(hd_hints) + "]"
             return {
                 "jsonrpc": "2.0", "id": req_id,
                 "result": {"content": [{"type": "text", "text": content_text}]},
