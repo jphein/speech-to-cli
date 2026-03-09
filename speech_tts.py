@@ -393,7 +393,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
     # Streaming STT state
     stt_ws = [None]
     stt_request_id = [None]
-    stt_result = [""]
+    stt_phrases = []  # Accumulate all recognized phrases
     stt_ws_ready = threading.Event()
 
     # Audio buffer for repeat support
@@ -440,6 +440,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
     # --- Live subtitle state ---
     stt_partial = [""]
     stt_phrase_done = threading.Event()
+    silence_ratio = [0.0]  # 0.0 → 1.0 as silence approaches cutoff
 
     def _try_recv_ws(ws):
         """Non-blocking read of WS hypothesis/phrase messages."""
@@ -459,9 +460,11 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
             try:
                 partial = json.loads(body).get("Text", "")
                 if partial:
+                    # Show accumulated phrases + current hypothesis
+                    full = (" ".join(stt_phrases) + " " + partial).strip() if stt_phrases else partial
                     term_width = _get_tty_width()
                     window = max(40, term_width - 25)
-                    stt_partial[0] = partial if len(partial) < window else "..." + partial[-(window-3):]
+                    stt_partial[0] = full if len(full) < window else "..." + full[-(window-3):]
             except Exception:
                 pass
         elif "speech.phrase" in hdr_lower:
@@ -469,23 +472,33 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                 data = json.loads(body)
                 if data.get("RecognitionStatus") == "Success":
                     nbest = data.get("NBest", [])
-                    stt_result[0] = nbest[0]["Display"] if nbest else data.get("DisplayText", "")
+                    phrase = nbest[0]["Display"] if nbest else data.get("DisplayText", "")
+                    if phrase:
+                        stt_phrases.append(phrase)
+                        # Update partial to show all confirmed text
+                        full = " ".join(stt_phrases)
+                        term_width = _get_tty_width()
+                        window = max(40, term_width - 25)
+                        stt_partial[0] = full if len(full) < window else "..." + full[-(window-3):]
             except Exception:
                 pass
             stt_phrase_done.set()
         elif "turn.end" in hdr_lower:
             stt_phrase_done.set()
 
-    # --- Barge-in config ---
+    # --- Barge-in config (experimental, disabled by default) ---
     barge_trigger_frames = max(1, int(CONFIG.get("barge_in_frames", 3)))
     barge_silence_sec = max(0.3, float(CONFIG.get("barge_in_silence", 1.0)))
 
-    # --- Background: read mic frames with VAD + simple barge-in ---
+    # --- Background: read mic frames with VAD ---
     def record_with_vad_bg():
         try:
             vad = webrtcvad.Vad(state.VAD_AGGRESSIVENESS) if HAS_VAD else None
             energy_threshold, cal_frames = calibrate_noise(rec_proc)
             rec_frames.extend(cal_frames)
+
+            # Ding as soon as mic is ready — even over TTS playback
+            play_chime()
 
             silence_frames = 0
             speech_frames = 0
@@ -521,6 +534,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                         except Exception:
                             pass
 
+                    # Experimental barge-in (disabled by default)
                     if CONFIG.get("enable_barge_in", False) and is_speech:
                         barge_speech += 1
                         barge_silence = 0
@@ -560,6 +574,10 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                         rec_speech_detected.set()
                 else:
                     silence_frames += 1
+
+                # Track silence ratio for countdown display
+                if max_silence > 0:
+                    silence_ratio[0] = silence_frames / max_silence
 
                 if speech_frames >= min_speech and silence_frames >= max_silence:
                     break
@@ -695,9 +713,6 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
         send_progress(progress_token, 100, 100, "⏹ Cancelled")
         return {"spoken": False, "cancelled": True, "text": ""}
 
-    # Signal "your turn" with a light chime when TTS finishes
-    play_chime()
-
     # --- Wait for recording thread to finish ---
     listen_start = time.time()
     listen_timeout = state.NO_SPEECH_TIMEOUT + stt_silence + 2
@@ -708,12 +723,24 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
             break
         pct = int(70 + min(1.0, elapsed / listen_timeout) * 15)
         vu = random.choice(listen_bars) if show_vu else ""
+        sr = silence_ratio[0]
+        # Silence countdown indicator: ○ (ok) → ◔ → ◑ → ◕ → ● (about to cut)
+        if sr < 0.25:
+            timer_icon = ""
+        elif sr < 0.50:
+            timer_icon = " ◔"
+        elif sr < 0.75:
+            timer_icon = " ◑"
+        elif sr < 0.90:
+            timer_icon = " ◕"
+        else:
+            timer_icon = " ●"
         if rec_speech_detected.is_set():
             partial = stt_partial[0]
             if partial and show_subs:
-                send_progress(progress_token, pct, 100, f"🎤 {vu} {_colorize(partial, user_color)}")
+                send_progress(progress_token, pct, 100, f"🎤 {vu} {_colorize(partial, user_color)}{timer_icon}")
             else:
-                send_progress(progress_token, pct, 100, f"🎤 {vu} Hearing you...")
+                send_progress(progress_token, pct, 100, f"🎤 {vu} Hearing you...{timer_icon}")
         else:
             send_progress(progress_token, pct, 100, f"🎤 {vu} Listening for your reply...")
         rec_thread.join(timeout=0.15)
@@ -773,13 +800,15 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                             data = json.loads(body)
                             if data.get("RecognitionStatus") == "Success":
                                 nbest = data.get("NBest", [])
-                                stt_result[0] = nbest[0]["Display"] if nbest else data.get("DisplayText", "")
+                                phrase = nbest[0]["Display"] if nbest else data.get("DisplayText", "")
+                                if phrase:
+                                    stt_phrases.append(phrase)
                         except Exception:
                             pass
                         break
                     elif "turn.end" in hdr.lower():
                         break
-        user_text = stt_result[0]
+        user_text = " ".join(stt_phrases)
     else:
         # Fallback: REST STT
         send_progress(progress_token, 85, 100, "🧠 Transcribing...")

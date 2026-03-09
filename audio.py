@@ -22,7 +22,9 @@ from state import (CONFIG, _cancel_event, _pause_event,
 # ---------------------------------------------------------------------------
 
 def has_echo_cancel():
-    """Check if PipeWire echo cancellation nodes exist."""
+    """Check if PipeWire echo cancellation nodes exist (and enabled in config)."""
+    if not CONFIG.get("enable_echo_cancel", True):
+        return False
     if state._has_echo_cancel is not None:
         return state._has_echo_cancel
     try:

@@ -218,7 +218,8 @@ TOOLS = [
                 "subtitle_color_tts": {"type": "string", "description": "Color for agent's TTS speech subtitles. Options: default, green, light_green, yellow, amber, red, blue, cyan, magenta, white, gray, light_red, light_blue, light_cyan, light_magenta."},
                 "vu_meter": {"type": "boolean", "description": "Show VU meter animation during audio."},
                 "enable_pause": {"type": "boolean", "description": "Allow pausing/resuming playback and recording."},
-                "enable_barge_in": {"type": "boolean", "description": "Allow user speech to pause TTS (barge-in)."},
+                "enable_echo_cancel": {"type": "boolean", "description": "[Experimental] Use PipeWire echo cancellation nodes if available (default true)."},
+                "enable_barge_in": {"type": "boolean", "description": "[Experimental] Allow user speech to pause TTS (barge-in, default false)."},
                 "barge_in_frames": {"type": "integer", "description": "Speech frames needed to trigger barge-in (default 3)."},
                 "barge_in_silence": {"type": "number", "description": "Silence seconds to resume TTS after barge-in (default 1.0)."},
             },
@@ -557,7 +558,8 @@ def handle_request(req):
                         "half_duplex", "chime_ready", "chime_processing", "chime_speak",
                         "chime_done", "chime_hum", "chime_barge_in", "visual_indicator",
                         "live_subtitles", "subtitle_color_user", "subtitle_color_tts",
-                        "vu_meter", "enable_pause", "enable_barge_in",
+                        "vu_meter", "enable_pause",
+                        "enable_echo_cancel", "enable_barge_in",
                         "barge_in_frames", "barge_in_silence"}
             updated = []
             for k, v in args.items():
@@ -583,8 +585,11 @@ def handle_request(req):
                         CONFIG[k] = color_val
                     elif k in ("chime_ready", "chime_processing", "chime_speak",
                               "chime_done", "chime_hum", "chime_barge_in", "visual_indicator",
-                              "live_subtitles", "vu_meter", "enable_pause", "enable_barge_in"):
+                              "live_subtitles", "vu_meter", "enable_pause",
+                              "enable_echo_cancel", "enable_barge_in"):
                         CONFIG[k] = v if isinstance(v, bool) else str(v).lower() in ("true", "1", "yes")
+                        if k == "enable_echo_cancel":
+                            state._has_echo_cancel = None  # force re-detection
                     elif k in ("silence_timeout", "talk_silence_timeout", "barge_in_silence"):
                         CONFIG[k] = max(0.1, min(float(v), 10.0))
                     elif k == "barge_in_frames":
@@ -618,8 +623,9 @@ def handle_request(req):
                     ("Audio", ["player", "recorder", "mic_source", "speaker_sink"]),
                     ("Voice", ["voice", "fast_voice"]),
                     ("Timing", ["silence_timeout", "talk_silence_timeout"]),
-                    ("Mode", ["half_duplex", "enable_pause", "enable_barge_in",
-                              "barge_in_frames", "barge_in_silence"]),
+                    ("Mode", ["half_duplex", "enable_pause"]),
+                    ("Experimental", ["enable_echo_cancel", "enable_barge_in",
+                                      "barge_in_frames", "barge_in_silence"]),
                     ("Chimes", ["chime_ready", "chime_processing", "chime_speak",
                                 "chime_done", "chime_hum", "chime_barge_in"]),
                     ("UI", ["visual_indicator", "live_subtitles", "subtitle_color_user",

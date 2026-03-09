@@ -51,6 +51,8 @@ Live scrolling subtitles with ANSI color support:
 - Cached ISO timestamps in STT hot loop (avoids 1000+ strftime calls)
 - Progress notification dedup to reduce MCP notification spam
 - Full-duplex plays a chime when TTS finishes to signal "your turn"
+- Silence countdown indicator (○→◔→◑→◕→●) shows how close to cutoff during listening
+- `talk_silence_timeout` default 3.0s (configurable) — time to think between phrases
 
 ## Pairing with azure-chat-assistant
 For voice conversations with multiple Azure AI models, use alongside the

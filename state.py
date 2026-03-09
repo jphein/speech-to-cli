@@ -165,7 +165,7 @@ def load_config():
         "mic_source": cfg.get("mic_source", None),
         "speaker_sink": cfg.get("speaker_sink", None),
         "silence_timeout": cfg.get("silence_timeout", SILENCE_TIMEOUT),
-        "talk_silence_timeout": cfg.get("talk_silence_timeout", 1.5),
+        "talk_silence_timeout": cfg.get("talk_silence_timeout", 4.0),
         # UI settings
         "chime_ready": cfg.get("chime_ready", True),
         "chime_processing": cfg.get("chime_processing", False),
@@ -181,6 +181,7 @@ def load_config():
         "barge_in_silence": cfg.get("barge_in_silence", 1.0),
         "chime_barge_in": cfg.get("chime_barge_in", True),
         "enable_pause": cfg.get("enable_pause", True),
+        "enable_echo_cancel": cfg.get("enable_echo_cancel", False),
         "enable_barge_in": cfg.get("enable_barge_in", False),
         "half_duplex": cfg.get("half_duplex", "auto"),
     }
