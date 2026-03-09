@@ -273,9 +273,9 @@ def send_progress(token, progress, total=None, description=None):
     if total is not None:
         msg["params"]["total"] = total
     if description:
-        # Claude Code uses 'description', Gemini CLI uses 'message'
-        msg["params"]["message"] = description
+        # Claude Code renders ANSI in 'description', Gemini CLI uses plain 'message'
         msg["params"]["description"] = description
+        msg["params"]["message"] = re.sub(r'\033\[[0-9;]*m', '', description)
     line = json.dumps(msg) + "\n"
     with _stdout_lock:
         sys.stdout.write(line)
