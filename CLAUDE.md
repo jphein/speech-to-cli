@@ -50,11 +50,26 @@ Live scrolling subtitles with ANSI color support:
 - Debounced connection pre-warming (`_schedule_warmup`)
 - Cached ISO timestamps in STT hot loop (avoids 1000+ strftime calls)
 - Progress notification dedup to reduce MCP notification spam
-- Full-duplex plays a chime when TTS finishes to signal "your turn"
+- Full-duplex chime when mic is ready (plays over TTS if needed)
 - Silence countdown indicator (○→◔→◑→◕→●) shows how close to cutoff during listening
-- `talk_silence_timeout` default 4.0s (configurable) — time to think between phrases
-- Dynamic agent hints: tool responses include `[AGENT HINTS]` suggesting config changes based on user behavior (repeated no-speech, short responses)
+- End word "over" immediately stops recording (configurable via `end_word` setting)
+- Post-TTS energy threshold reset to 300 (avoids inflated thresholds from TTS bleed)
+- STT phrase accumulation: all phrases kept across pauses, not just the last one
+- Dynamic agent hints: `[AGENT HINTS]` in responses suggest config changes based on user behavior
 - Agents guided to pass per-call `silence_timeout` (2s for yes/no, 6-8s for open-ended)
+- Debug logging: `configure(debug=true)` or `SPEECH_DEBUG=1` → `/tmp/speech-debug.log`
+
+### Dynamic Configurables (via `configure` tool)
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `talk_silence_timeout` | 4.0s | Silence before stopping in talk mode |
+| `silence_timeout` | 3.0s | Silence before stopping in listen mode |
+| `no_speech_timeout` | 7.0s | Wait for any speech before giving up |
+| `energy_multiplier` | 2.5 | Mic sensitivity (lower = more sensitive) |
+| `end_word` | "over" | Word to immediately stop recording |
+| `enable_echo_cancel` | false | [Experimental] PipeWire echo cancellation |
+| `enable_barge_in` | false | [Experimental] User speech pauses TTS |
+| `debug` | false | Write debug logs to /tmp/speech-debug.log |
 
 ## Pairing with azure-chat-assistant
 For voice conversations with multiple Azure AI models, use alongside the
