@@ -197,7 +197,14 @@ def multi_speak(segments, quality="fast", progress_token=None):
         pct = seg_target
         send_progress(progress_token, pct, 100, f"🔊 Played {i + 1}/{n_seg}")
 
-    send_progress(progress_token, 100, 100, f"🔊 Done — {spoken} segments")
+    # Show last segment text so subtitles persist
+    last_text = ""
+    for seg in reversed(segments):
+        if seg.get("text"):
+            last_color = seg.get("subtitle_color") or _ms_default_color
+            last_text = _colorize(seg["text"], last_color)
+            break
+    send_progress(progress_token, 100, 100, f"🔊 {last_text}" if last_text else f"🔊 Done — {spoken} segments")
     return {"spoken": spoken}
 
 
@@ -321,7 +328,9 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
         if is_cancelled():
             send_progress(progress_token, 100, 100, "⏹ Cancelled")
             return {"spoken": False, "cancelled": True}
-        send_progress(progress_token, 100, 100, "✅ Done")
+        # Show full text in final message so subtitles persist
+        tts_color = subtitle_color or CONFIG.get("subtitle_color_tts")
+        send_progress(progress_token, 100, 100, f"🔊 {_colorize(text, tts_color)}")
     play_done()
     _mark_tts_end()
     return {"spoken": True, "chars": len(text)}
@@ -876,7 +885,8 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
         stop_hum()
         play_done()
         _mark_tts_end()
-        send_progress(progress_token, 100, 100, "✅ Done")
+        tts_color = subtitle_color or CONFIG.get("subtitle_color_tts")
+        send_progress(progress_token, 100, 100, f"🔊 {_colorize(text, tts_color)}")
         return {"spoken": True, "text": ""}
 
     user_text = ""
@@ -968,12 +978,19 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
     stop_hum()
     play_done()
     _mark_tts_end()
-    send_progress(progress_token, 100, 100, "✅ Done")
 
     # Strip end word from result if it triggered the stop
     if _end_word and user_text:
         import re as _re
         user_text = _re.sub(r'\s*\b' + _re.escape(_end_word) + r'[.!?,]*\s*$', '', user_text, flags=_re.IGNORECASE).strip()
+
+    # Show final state: TTS text + user reply so subtitles persist
+    tts_color = subtitle_color or CONFIG.get("subtitle_color_tts")
+    user_color = CONFIG.get("subtitle_color_user")
+    if user_text:
+        send_progress(progress_token, 100, 100, f"🎤 {_colorize(user_text, user_color)}")
+    else:
+        send_progress(progress_token, 100, 100, f"🔊 {_colorize(text, tts_color)}")
 
     # Pre-warm for next call
     _schedule_warmup()
