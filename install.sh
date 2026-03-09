@@ -16,7 +16,8 @@ else
 fi
 
 # Python dependencies
-pip install -r "$(dirname "$0")/requirements.txt"
+pip install -r "$(dirname "$0")/requirements.txt" 2>/dev/null || \
+pip install --break-system-packages -r "$(dirname "$0")/requirements.txt"
 
 echo ""
 echo "✅ Installed! Next steps:"

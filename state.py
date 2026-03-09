@@ -180,8 +180,8 @@ def load_config():
         "chime_hum": cfg.get("chime_hum", False),
         "visual_indicator": cfg.get("visual_indicator", True),
         "live_subtitles": cfg.get("live_subtitles", True),
-        "subtitle_color_user": cfg.get("subtitle_color_user", "default"),
-        "subtitle_color_tts": cfg.get("subtitle_color_tts", "default"),
+        "subtitle_color_user": cfg.get("subtitle_color_user", "light_green"),
+        "subtitle_color_tts": cfg.get("subtitle_color_tts", "amber"),
         "vu_meter": cfg.get("vu_meter", True),
         "barge_in_frames": cfg.get("barge_in_frames", 3),
         "barge_in_silence": cfg.get("barge_in_silence", 1.0),
@@ -273,7 +273,13 @@ def send_progress(token, progress, total=None, description=None):
     if total is not None:
         msg["params"]["total"] = total
     if description:
-        # Gemini CLI uses the 'message' field to show status text
+        # Claude Code uses 'description', Gemini CLI uses 'message'
         msg["params"]["message"] = description
-    sys.stdout.write(json.dumps(msg) + "\n")
-    sys.stdout.flush()
+        msg["params"]["description"] = description
+    line = json.dumps(msg) + "\n"
+    with _stdout_lock:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+    if CONFIG.get("debug"):
+        with open("/tmp/speech-debug.log", "a") as _f:
+            _f.write(f"PROGRESS: {line}")
