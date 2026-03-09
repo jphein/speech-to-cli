@@ -150,21 +150,56 @@ def multi_speak(segments, quality="fast", progress_token=None):
     _ms_default_color = CONFIG.get("subtitle_color_tts")
     _ms_window = max(40, _get_tty_width() - 25)
 
+    # Pre-warm next player while current is playing to eliminate inter-segment gap
+    next_proc = [None]
+
+    def _prewarm_next():
+        """Pre-start player with silence so it's hot when audio arrives."""
+        p = _start_player(tts_rate)
+        if p is None:
+            return
+        try:
+            # Write ~100ms of silence to warm up the audio pipeline
+            p.stdin.write(b"\x00" * (tts_rate * 2 // 10))
+            p.stdin.flush()
+        except (BrokenPipeError, OSError):
+            return
+        next_proc[0] = p
+
     for i, audio in enumerate(audio_buffers):
         if is_cancelled():
             return {"cancelled": True}
         if audio is None:
             continue
 
-        proc = _start_player(tts_rate)
-        if proc is None:
-            return {"error": "No audio player found"}
+        # Use pre-warmed player if available, otherwise start fresh
+        if next_proc[0] is not None:
+            proc = next_proc[0]
+            next_proc[0] = None
+        else:
+            proc = _start_player(tts_rate)
+            if proc is None:
+                return {"error": "No audio player found"}
+            try:
+                proc.stdin.write(silence_bytes)
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                continue
 
         register_proc(proc)
+
         try:
-            proc.stdin.write(silence_bytes)
             proc.stdin.write(audio)
             proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            unregister_proc(proc)
+            continue
+
+        # Pre-warm next player in background while this one plays
+        if i + 1 < n_seg:
+            threading.Thread(target=_prewarm_next, daemon=True).start()
+
+        try:
             seg_text = segments[i].get("text", "")
             seg_color = segments[i].get("subtitle_color") or _ms_default_color
             seg_target = int(((i + 1) / n_seg) * 99)
@@ -850,14 +885,16 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
             timer_icon = " ◕"
         else:
             timer_icon = " ●"
+        # Keep TTS text visible + show user's speech below it
+        tts_line = f"🔊 {_colorize(text, tts_color)}" if show_subs else ""
         if rec_speech_detected.is_set():
             partial = stt_partial[0]
             if partial and show_subs:
-                send_progress(progress_token, pct, 100, f"🎤 {vu} {_colorize(partial, user_color)}{timer_icon}")
+                send_progress(progress_token, pct, 100, f"{tts_line}\n🎤 {vu} {_colorize(partial, user_color)}{timer_icon}")
             else:
-                send_progress(progress_token, pct, 100, f"🎤 {vu} Hearing you...{timer_icon}")
+                send_progress(progress_token, pct, 100, f"{tts_line}\n🎤 {vu} Hearing you...{timer_icon}")
         else:
-            send_progress(progress_token, pct, 100, f"🎤 {vu} Listening for your reply...")
+            send_progress(progress_token, pct, 100, f"{tts_line}\n🎤 {vu} Listening for your reply...")
         rec_thread.join(timeout=0.15)
 
     # Stop recording if still running
