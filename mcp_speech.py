@@ -25,7 +25,8 @@ from state import (CONFIG, HAS_WS, DEFAULTS_PATH, _SCRIPT_DIR,
                    send_progress, _stdout_lock, _request_queue, _request_cond)
 from audio import (_generate_chimes, _refresh_audio_detection, _prewarm_all,
                    _prewarm_recorder, _schedule_warmup,
-                   has_echo_cancel, _COLOR_MAP)
+                   has_echo_cancel, _COLOR_MAP,
+                   _build_player_cmd, _build_rec_cmd)
 from stt import stt, _get_stt_ws, _invalidate_stt_ws
 from speech_tts import tts, multi_speak, talk_fullduplex, get_voices
 
@@ -196,6 +197,8 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
+                "key": {"type": "string", "description": "Azure Speech Services API key. Overrides AZURE_SPEECH_KEY env var."},
+                "region": {"type": "string", "description": "Azure region (e.g. westus2, eastus). Overrides AZURE_SPEECH_REGION env var."},
                 "player": {"type": "string", "description": "Audio player: aplay, pw-play, pw-cat, ffplay, or auto."},
                 "recorder": {"type": "string", "description": "Audio recorder: pw-record, arecord, or auto."},
                 "mic_source": {"type": "string", "description": "PipeWire node name for mic input, or 'null' for default."},
@@ -698,7 +701,9 @@ def handle_request(req):
             if updated or bt_msg:
                 text = bt_msg + ("Updated: " + ", ".join(updated) if updated else "")
             else:
+                key_display = "***" + CONFIG.get("key", "")[-4:] if CONFIG.get("key") else "NOT SET"
                 sections = [
+                    ("Credentials", []),
                     ("Audio", ["player", "recorder", "mic_source", "speaker_sink"]),
                     ("Voice", ["voice", "fast_voice"]),
                     ("Timing", ["silence_timeout", "talk_silence_timeout", "no_speech_timeout",
@@ -714,12 +719,29 @@ def handle_request(req):
                 lines = []
                 for label, keys in sections:
                     lines.append(f"[{label}]")
+                    if label == "Credentials":
+                        lines.append(f"  key: {key_display}")
+                        lines.append(f"  region: {CONFIG.get('region')}")
+                        continue
                     for k in keys:
                         lines.append(f"  {k}: {CONFIG.get(k)}")
+                # Resolve effective player/recorder
+                _player = CONFIG.get("player", "auto")
+                _recorder = CONFIG.get("recorder", "auto")
+                if _player == "auto":
+                    _eff_player = _build_player_cmd(24000)[0][0] if _build_player_cmd(24000) else "unknown"
+                else:
+                    _eff_player = _player
+                if _recorder == "auto":
+                    _eff_recorder = _build_rec_cmd()[0] if _build_rec_cmd() else "unknown"
+                else:
+                    _eff_recorder = _recorder
                 det_type = CONFIG.get("_detected_output", "unknown")
                 det_info = CONFIG.get("_detected_output_info", {})
                 det_desc = det_info.get("description", "unknown")
                 lines.append(f"[Detected]")
+                lines.append(f"  player_binary: {_eff_player}")
+                lines.append(f"  recorder_binary: {_eff_recorder}")
                 lines.append(f"  output_device: {det_desc} ({det_type})")
                 lines.append(f"  echo_cancel: {has_echo_cancel()}")
                 text = "Current settings:\n" + "\n".join(lines)
