@@ -188,6 +188,7 @@ def load_config():
         "chime_barge_in": cfg.get("chime_barge_in", True),
         "enable_pause": cfg.get("enable_pause", True),
         "end_word": cfg.get("end_word", "over"),
+        "max_record_seconds": cfg.get("max_record_seconds", 120),
         "enable_echo_cancel": cfg.get("enable_echo_cancel", False),
         "enable_barge_in": cfg.get("enable_barge_in", False),
         "debug": cfg.get("debug", False),

@@ -348,7 +348,8 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
     ssml, tts_rate, headers, url = _prepare_tts(text, quality, speed, voice, pitch, volume)
 
     # --- Start STT recording ---
-    max_seconds = max(1, min(int(seconds or 30), 30))
+    cap = int(CONFIG.get("max_record_seconds", 120))
+    max_seconds = max(1, min(int(seconds or cap), cap))
     stt_silence = float(silence_timeout) if silence_timeout else CONFIG.get("talk_silence_timeout", 1.5)
 
     rec_cmd = _build_rec_cmd()
@@ -440,6 +441,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
     # --- Live subtitle state ---
     stt_partial = [""]
     stt_phrase_done = threading.Event()
+    stt_turn_ended = threading.Event()  # Azure closed STT session
     silence_ratio = [0.0]  # 0.0 → 1.0 as silence approaches cutoff
     end_word_detected = threading.Event()
     _end_word = CONFIG.get("end_word", "over")
@@ -482,21 +484,33 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
         elif "speech.phrase" in hdr_lower:
             try:
                 data = json.loads(body)
-                if data.get("RecognitionStatus") == "Success":
+                status = data.get("RecognitionStatus", "?")
+                if status == "Success":
                     nbest = data.get("NBest", [])
                     phrase = nbest[0]["Display"] if nbest else data.get("DisplayText", "")
                     if phrase:
                         stt_phrases.append(phrase)
+                        # Check end word on confirmed phrase only (not hypotheses)
+                        if _check_end_word(phrase):
+                            end_word_detected.set()
                         # Update partial to show all confirmed text
                         full = " ".join(stt_phrases)
                         term_width = _get_tty_width()
                         window = max(40, term_width - 25)
                         stt_partial[0] = full if len(full) < window else "..." + full[-(window-3):]
+                else:
+                    _log(f"phrase status={status}: {body[:150]}")
             except Exception:
                 pass
             stt_phrase_done.set()
         elif "turn.end" in hdr_lower:
+            _log(f"turn.end received during recording (phrases={len(stt_phrases)}) — Azure ended STT session")
+            stt_turn_ended.set()
             stt_phrase_done.set()
+            # Azure won't process any more audio on this request.
+            # Mark WS dead so recording loop stops sending and we fall back to REST.
+            stt_ws[0] = None
+            _invalidate_stt_ws()
 
     # --- Barge-in config (experimental, disabled by default) ---
     barge_trigger_frames = max(1, int(CONFIG.get("barge_in_frames", 3)))
@@ -531,9 +545,12 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
             barge_silence_frames = int(barge_silence_sec * 1000 / state.FRAME_MS)
 
             post_tts_frames = 0
+            ws_reconnected = False
+            tts_dead_frames = []  # frames buffered after WS died during TTS
             _log(f"limits: max_silence={max_silence} max_no_speech={max_no_speech} min_speech={min_speech} stt_silence={stt_silence}")
 
-            while total_frames < max_total:
+            hard_cap = max_total * 3  # safety cap: 3x max to allow TTS + full recording
+            while (post_tts_frames < max_total or not tts_done.is_set()) and total_frames < hard_cap:
                 if is_cancelled():
                     _log("cancelled")
                     break
@@ -553,8 +570,12 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                             ws.send(_make_ws_audio_msg(rid, chunk),
                                     opcode=websocket.ABNF.OPCODE_BINARY)
                             _try_recv_ws(ws)
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            _log(f"WS send error during TTS (frame {total_frames}): {_e}")
+                            stt_ws[0] = None  # mark dead so we don't keep trying
+                    elif stt_ws[0] is None:
+                        # WS is dead — buffer frames so we can replay on reconnect
+                        tts_dead_frames.append(chunk)
 
                     # Experimental barge-in (disabled by default)
                     if CONFIG.get("enable_barge_in", False) and is_speech:
@@ -584,6 +605,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                     # Let webrtcvad do the heavy lifting for speech detection.
                     energy_threshold = 300.0
                     _log(f"reset threshold to {energy_threshold:.0f}")
+
                 post_tts_frames += 1
                 rec_frames.append(chunk)
 
@@ -594,8 +616,52 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                         ws.send(_make_ws_audio_msg(rid, chunk),
                                 opcode=websocket.ABNF.OPCODE_BINARY)
                         _try_recv_ws(ws)
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        _log(f"WS send error post-TTS (frame {total_frames}): {_e}")
+                        stt_ws[0] = None  # mark dead
+                elif stt_ws[0] is None and use_streaming_stt and not ws_reconnected:
+                    # Azure killed WS during TTS — start fresh session
+                    ws_reconnected = True
+                    _log(f"WS dead at post-TTS frame {post_tts_frames}, starting fresh STT session")
+                    try:
+                        ws_new = _get_stt_ws()
+                        rid_new = uuid.uuid4().hex
+                        stt_request_id[0] = rid_new
+                        try:
+                            ws_new.settimeout(0.05)
+                            while True:
+                                ws_new.recv()
+                        except Exception:
+                            pass
+                        speech_cfg = {
+                            "context": {
+                                "system": {"version": "1.0.00000"},
+                                "os": {"platform": "Linux", "name": "speech-to-cli"},
+                                "audio": {"source": {"connectivity": "Unknown", "manufacturer": "Unknown",
+                                                     "model": "Unknown", "type": "Unknown"}},
+                            }
+                        }
+                        ws_new.send(
+                            f"Path: speech.config\r\nX-RequestId: {rid_new}\r\n"
+                            f"X-Timestamp: {time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())}\r\n"
+                            f"Content-Type: application/json\r\n\r\n" + json.dumps(speech_cfg)
+                        )
+                        wav_hdr = struct.pack('<4sI4s4sIHHIIHH4sI',
+                            b'RIFF', 0, b'WAVE', b'fmt ', 16, 1, 1, 16000, 32000, 2, 16, b'data', 0)
+                        ws_new.send(_make_ws_audio_msg(rid_new, wav_hdr),
+                                    opcode=websocket.ABNF.OPCODE_BINARY)
+                        # Replay buffered frames: TTS-phase dead frames + post-TTS frames
+                        replay = tts_dead_frames + rec_frames
+                        for prev_frame in replay:
+                            ws_new.send(_make_ws_audio_msg(rid_new, prev_frame),
+                                        opcode=websocket.ABNF.OPCODE_BINARY)
+                        stt_ws[0] = ws_new
+                        stt_turn_ended.clear()
+                        stt_phrase_done.clear()
+                        stt_phrases.clear()
+                        _log(f"fresh WS started: rid={rid_new[:8]}, replayed {len(tts_dead_frames)}+{len(rec_frames)} frames")
+                    except Exception as _e:
+                        _log(f"fresh WS FAILED: {_e}")
 
                 if is_speech:
                     speech_frames += 1
@@ -622,6 +688,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                 if speech_frames == 0 and post_tts_frames >= max_no_speech:
                     _log(f"STOP: no speech timeout. post_tts={post_tts_frames}/{max_no_speech}")
                     break
+            _log(f"REC END: speech={speech_frames} post_tts={post_tts_frames} total={total_frames} ws_alive={stt_ws[0] is not None} phrases={len(stt_phrases)} text={repr(' '.join(stt_phrases)[:100])}")
         except Exception as e:
             _log(f"exception: {e}")
         finally:
@@ -815,11 +882,13 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
     user_text = ""
     if use_streaming_stt and stt_ws[0]:
         send_progress(progress_token, 88, 100, "🧠 Finishing transcription...")
+        _log(f"DRAIN START: phrases_so_far={len(stt_phrases)} phrase_done={stt_phrase_done.is_set()}")
         try:
             stt_ws[0].send(_make_ws_audio_msg(stt_request_id[0], b""),
                            opcode=websocket.ABNF.OPCODE_BINARY)
-        except Exception:
-            pass
+            _log("sent end-of-stream marker")
+        except Exception as _e:
+            _log(f"end-of-stream send FAILED: {_e}")
         if not stt_phrase_done.is_set():
             deadline = time.time() + 5
             ws = stt_ws[0]
@@ -827,29 +896,41 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                 try:
                     ws.settimeout(1.0)
                     msg = ws.recv()
-                except Exception:
+                except Exception as _e:
+                    _log(f"drain recv error: {_e}")
                     break
                 if isinstance(msg, str):
                     parts = msg.split("\r\n\r\n", 1)
                     if len(parts) < 2:
                         continue
                     hdr, body = parts
+                    _log(f"drain msg: {hdr.split(chr(13))[0][:60]}")
                     if "speech.phrase" in hdr.lower():
                         try:
                             data = json.loads(body)
-                            if data.get("RecognitionStatus") == "Success":
+                            status = data.get("RecognitionStatus", "?")
+                            _log(f"drain phrase status={status}")
+                            if status == "Success":
                                 nbest = data.get("NBest", [])
                                 phrase = nbest[0]["Display"] if nbest else data.get("DisplayText", "")
                                 if phrase:
                                     stt_phrases.append(phrase)
-                        except Exception:
-                            pass
+                                    _log(f"drain phrase: {phrase[:80]}")
+                            else:
+                                _log(f"drain phrase NON-SUCCESS: {body[:200]}")
+                        except Exception as _e:
+                            _log(f"drain phrase parse error: {_e}")
                         break
                     elif "turn.end" in hdr.lower():
+                        _log("drain: turn.end received")
                         break
+        else:
+            _log("phrase_done already set, skipping drain")
         user_text = " ".join(stt_phrases)
-    else:
-        # Fallback: REST STT
+        _log(f"FINAL RESULT: phrases={len(stt_phrases)} text={repr(user_text[:150])}")
+    if not user_text:
+        # Fallback: REST STT (WS failed, died, or returned nothing)
+        _log(f"WS returned nothing (ws_alive={stt_ws[0] is not None} turn_ended={stt_turn_ended.is_set()} raw_bytes={len(raw_data)}), falling back to REST STT")
         send_progress(progress_token, 85, 100, "🧠 Transcribing...")
         wav_path = tempfile.mktemp(suffix=".wav")
         try:
@@ -866,11 +947,18 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                 )
             if stt_resp.status_code == 200:
                 result = stt_resp.json()
-                if result.get("RecognitionStatus") == "Success":
+                status = result.get("RecognitionStatus", "?")
+                _log(f"REST STT status={status}")
+                if status == "Success":
                     nbest = result.get("NBest", [])
                     user_text = nbest[0]["Display"] if nbest else result.get("DisplayText", "")
-        except Exception:
-            pass
+                    _log(f"REST STT recovered: {repr(user_text[:100])}")
+                else:
+                    _log(f"REST STT non-success: {status}")
+            else:
+                _log(f"REST STT HTTP error: {stt_resp.status_code}")
+        except Exception as _e:
+            _log(f"REST STT exception: {_e}")
         finally:
             try:
                 os.unlink(wav_path)

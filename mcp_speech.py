@@ -47,8 +47,8 @@ TOOLS = [
             "properties": {
                 "seconds": {
                     "type": "integer",
-                    "description": "Max recording duration (default 30).",
-                    "default": 30,
+                    "description": "Max recording duration in seconds (default 120).",
+                    "default": 120,
                     "minimum": 1,
                     "maximum": 30,
                 },
@@ -171,8 +171,8 @@ TOOLS = [
             "properties": {
                 "seconds": {
                     "type": "integer",
-                    "description": "Max recording duration (default 30).",
-                    "default": 30,
+                    "description": "Max recording duration in seconds (default 120).",
+                    "default": 120,
                 },
                 "mode": {
                     "type": "string",
@@ -202,6 +202,7 @@ TOOLS = [
                 "speaker_sink": {"type": "string", "description": "PipeWire node name for speaker output, or 'null' for default."},
                 "silence_timeout": {"type": "number", "description": "Silence timeout for listen tool (seconds)."},
                 "talk_silence_timeout": {"type": "number", "description": "Silence timeout for talk tool (seconds)."},
+                "max_record_seconds": {"type": "integer", "description": "Max recording duration after TTS finishes (default 120)."},
                 "end_word": {"type": "string", "description": "Word that immediately stops recording when said at end of sentence (default 'over'). Set to empty string to disable."},
                 "voice": {"type": "string", "description": "Azure TTS voice name."},
                 "fast_voice": {"type": "string", "description": "Azure TTS voice name for fast quality."},
@@ -288,8 +289,8 @@ TOOLS = [
                 },
                 "seconds": {
                     "type": "integer",
-                    "description": "Max recording duration (default 30).",
-                    "default": 30,
+                    "description": "Max recording duration in seconds (default 120).",
+                    "default": 120,
                 },
                 "mode": {
                     "type": "string",
@@ -620,7 +621,7 @@ def handle_request(req):
             settable = {"key", "region",
                         "player", "recorder", "mic_source", "speaker_sink",
                         "silence_timeout", "talk_silence_timeout", "no_speech_timeout",
-                        "energy_multiplier", "end_word", "voice", "fast_voice",
+                        "max_record_seconds", "energy_multiplier", "end_word", "voice", "fast_voice",
                         "half_duplex", "chime_ready", "chime_processing", "chime_speak",
                         "chime_done", "chime_hum", "chime_barge_in", "visual_indicator",
                         "live_subtitles", "subtitle_color_user", "subtitle_color_tts",
@@ -668,6 +669,8 @@ def handle_request(req):
                         val = max(0.5, min(float(v), 20.0))
                         state.ENERGY_THRESHOLD_MULTIPLIER = val
                         CONFIG[k] = val
+                    elif k == "max_record_seconds":
+                        CONFIG[k] = max(5, min(int(v), 300))
                     elif k == "barge_in_frames":
                         CONFIG[k] = max(1, min(int(v), 20))
                     else:
@@ -699,7 +702,7 @@ def handle_request(req):
                     ("Audio", ["player", "recorder", "mic_source", "speaker_sink"]),
                     ("Voice", ["voice", "fast_voice"]),
                     ("Timing", ["silence_timeout", "talk_silence_timeout", "no_speech_timeout",
-                               "energy_multiplier", "end_word"]),
+                               "max_record_seconds", "energy_multiplier", "end_word"]),
                     ("Mode", ["half_duplex", "enable_pause"]),
                     ("Experimental", ["enable_echo_cancel", "enable_barge_in",
                                       "barge_in_frames", "barge_in_silence", "debug"]),
