@@ -100,6 +100,7 @@ _pause_event = threading.Event()
 # Pre-warmed recorder
 _prewarmed_rec = None
 _prewarmed_rec_lock = threading.Lock()
+_rec_idle_timer = None  # threading.Timer that kills idle recorder
 _warmup_pending = False
 _warmup_lock = threading.Lock()
 

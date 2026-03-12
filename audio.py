@@ -573,8 +573,11 @@ def record_with_vad(proc, max_seconds):
 # Pre-warming
 # ---------------------------------------------------------------------------
 
+_REC_IDLE_SECONDS = 30  # kill prewarmed recorder after this many seconds idle
+
 def _prewarm_recorder():
-    """Start a recorder process in background so next listen/converse is instant."""
+    """Start a recorder process in background so next listen/converse is instant.
+    Auto-releases after _REC_IDLE_SECONDS to avoid holding the mic device open."""
     with state._prewarmed_rec_lock:
         if state._prewarmed_rec is not None:
             return  # already pre-warmed
@@ -584,6 +587,12 @@ def _prewarm_recorder():
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             )
             state._prewarmed_rec = proc
+            # Cancel any existing idle timer before starting a new one
+            if state._rec_idle_timer is not None:
+                state._rec_idle_timer.cancel()
+            state._rec_idle_timer = threading.Timer(_REC_IDLE_SECONDS, _discard_prewarmed_rec)
+            state._rec_idle_timer.daemon = True
+            state._rec_idle_timer.start()
         except Exception:
             pass
 
@@ -611,14 +620,21 @@ def _take_prewarmed_rec():
     with state._prewarmed_rec_lock:
         proc = state._prewarmed_rec
         state._prewarmed_rec = None
+        # Cancel idle timer — recorder is now in active use
+        if state._rec_idle_timer is not None:
+            state._rec_idle_timer.cancel()
+            state._rec_idle_timer = None
         return proc
 
 
 def _discard_prewarmed_rec():
-    """Kill and discard any pre-warmed recorder (e.g. on shutdown)."""
+    """Kill and discard any pre-warmed recorder (e.g. on shutdown or idle timeout)."""
     with state._prewarmed_rec_lock:
         proc = state._prewarmed_rec
         state._prewarmed_rec = None
+        if state._rec_idle_timer is not None:
+            state._rec_idle_timer.cancel()
+            state._rec_idle_timer = None
     if proc:
         try:
             proc.terminate()
