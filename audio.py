@@ -637,8 +637,8 @@ def _discard_prewarmed_rec():
             state._rec_idle_timer = None
     if proc:
         try:
-            proc.terminate()
-            proc.wait(timeout=1)
+            proc.kill()  # SIGKILL — pw-record ignores SIGTERM
+            proc.wait(timeout=2)
         except Exception:
             pass
 
