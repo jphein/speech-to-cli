@@ -101,6 +101,136 @@ def _prepare_tts(text, quality, speed, voice, pitch, volume):
     return ssml, tts_rate, headers, url
 
 
+def _build_multi_voice_ssml(segments, quality="fast"):
+    """Build SSML with multiple <voice> tags for single-request multi-voice TTS."""
+    voices_xml = []
+    for seg in segments:
+        text = seg.get("text", "")[:state._MAX_TTS_CHARS]
+        voice = seg.get("voice") or (CONFIG["fast_voice"] if quality == "fast" else CONFIG["voice"])
+        voice = _sanitize_ssml_attr(voice, CONFIG["fast_voice"])
+        if not text:
+            continue
+        # Escape XML special chars
+        safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+        # Add prosody for fast mode
+        if quality == "fast":
+            body = f'<prosody rate="+15%">{safe}</prosody>'
+        else:
+            body = safe
+        voices_xml.append(f'<voice name="{voice}">{body}</voice>')
+
+    return (
+        '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US">'
+        + "".join(voices_xml)
+        + '</speak>'
+    )
+
+
+def multi_speak_stream(segments, quality="fast", progress_token=None):
+    """Stream multi-voice TTS in a SINGLE request using Azure's multi-voice SSML.
+
+    Much faster than multi_speak - one API call instead of N calls.
+    Voices switch automatically within the audio stream.
+    """
+    stop_hum()
+    if not segments:
+        return {"error": "No segments"}
+
+    send_progress(progress_token, 1, 100, "🔊 Building multi-voice SSML...")
+
+    # Build single SSML with all voices
+    ssml = _build_multi_voice_ssml(segments, quality)
+    tts_rate = 48000 if quality == "hd" else 24000
+    url = f"https://{CONFIG['region']}.tts.speech.microsoft.com/cognitiveservices/v1"
+    headers = {
+        "Ocp-Apim-Subscription-Key": CONFIG["key"],
+        "Content-Type": "application/ssml+xml",
+        "X-Microsoft-OutputFormat": f"raw-{tts_rate // 1000}khz-16bit-mono-pcm",
+    }
+
+    send_progress(progress_token, 5, 100, f"🔊 Streaming {len(segments)} voices...")
+
+    # Stream the response
+    session = get_http_session()
+    try:
+        resp = session.post(url, headers=headers, data=ssml.encode("utf-8"), timeout=120, stream=True)
+        if resp.status_code != 200:
+            return {"error": f"TTS error {resp.status_code}: {resp.text[:200]}"}
+    except Exception as e:
+        return {"error": f"TTS request failed: {e}"}
+
+    # Start player
+    proc = _start_player(tts_rate)
+    if proc is None:
+        return {"error": "No audio player found"}
+    register_proc(proc)
+
+    # Calculate total expected duration for progress
+    total_chars = sum(len(seg.get("text", "")) for seg in segments)
+    estimated_duration = max(2.0, total_chars / 15.0)  # ~15 chars/sec speaking rate
+
+    # Stream audio chunks to player
+    lead_ms = _tts_lead_in_ms()
+    if lead_ms:
+        try:
+            silence = b"\x00" * (tts_rate * 2 * lead_ms // 1000)
+            proc.stdin.write(silence)
+        except Exception:
+            pass
+
+    bytes_written = 0
+    start_time = time.time()
+    _ms_show_subs = CONFIG.get("live_subtitles", True)
+    _ms_window = max(40, _get_tty_width() - 25)
+
+    # Combine all text for subtitle display
+    all_text = " | ".join(seg.get("text", "")[:100] for seg in segments if seg.get("text"))
+
+    try:
+        for chunk in resp.iter_content(chunk_size=4096):
+            if is_cancelled():
+                proc.kill()
+                return {"cancelled": True}
+            if chunk:
+                try:
+                    proc.stdin.write(chunk)
+                    bytes_written += len(chunk)
+                except (BrokenPipeError, OSError):
+                    break
+
+            # Update progress based on time elapsed
+            elapsed = time.time() - start_time
+            pct = min(95, 5 + int((elapsed / estimated_duration) * 90))
+
+            if _ms_show_subs and all_text:
+                char_idx = int(min(1.0, elapsed / estimated_duration) * len(all_text))
+                start_idx = max(0, char_idx - _ms_window)
+                snippet = all_text[start_idx:char_idx]
+                send_progress(progress_token, pct, 100, f"🔊 {snippet}")
+            else:
+                send_progress(progress_token, pct, 100, f"🔊 Streaming...")
+
+        proc.stdin.close()
+    except Exception as e:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return {"error": f"Streaming failed: {e}"}
+
+    # Wait for playback to finish
+    try:
+        proc.wait(timeout=estimated_duration + 30)
+    except Exception:
+        pass
+    finally:
+        unregister_proc(proc)
+
+    _mark_tts_end()
+    send_progress(progress_token, 100, 100, f"🔊 Done — {len(segments)} voices")
+    return {"spoken": len(segments), "bytes": bytes_written, "streamed": True}
+
+
 # ---------------------------------------------------------------------------
 # multi_speak
 # ---------------------------------------------------------------------------
@@ -221,6 +351,97 @@ def multi_speak(segments, quality="fast", progress_token=None):
             break
     send_progress(progress_token, 100, 100, f"🔊 {last_text}" if last_text else f"🔊 Done — {spoken} segments")
     return {"spoken": spoken}
+
+
+def multi_speak_parallel(segments, quality="fast", progress_token=None):
+    """Speak multiple text+voice segments SIMULTANEOUSLY. All voices play at once."""
+    stop_hum()
+    if not segments:
+        return {"error": "No segments"}
+
+    send_progress(progress_token, 1, 100, "🔊 Fetching all voices...")
+
+    tts_rate = 48000 if quality == "hd" else 24000
+    session = get_http_session()
+    n_seg = len(segments)
+    audio_buffers = [None] * n_seg
+    errors = [None] * n_seg
+
+    def fetch_one(idx, seg):
+        text = seg.get("text", "")[:state._MAX_TTS_CHARS]
+        voice = seg.get("voice")
+        if not text:
+            errors[idx] = "empty text"
+            return
+        ssml, _, headers, url = _prepare_tts(text, quality, 1.0, voice, "default", "default")
+        try:
+            resp = session.post(url, headers=headers, data=ssml.encode("utf-8"), timeout=30)
+            if resp.status_code != 200:
+                errors[idx] = f"TTS error {resp.status_code}"
+                return
+            audio_buffers[idx] = resp.content
+        except Exception as e:
+            errors[idx] = str(e)
+
+    # Fire all TTS requests in parallel
+    threads = []
+    for i, seg in enumerate(segments):
+        t = threading.Thread(target=fetch_one, args=(i, seg), daemon=True)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join(timeout=35)
+
+    send_progress(progress_token, 30, 100, f"🔊 Playing {n_seg} voices simultaneously...")
+
+    # Start ALL players at once
+    procs = []
+    for i, audio in enumerate(audio_buffers):
+        if audio is None:
+            continue
+        proc = _start_player(tts_rate)
+        if proc is None:
+            continue
+        register_proc(proc)
+        procs.append((i, proc))
+
+        # Write audio in background thread
+        def _write_audio(p, data):
+            try:
+                p.stdin.write(data)
+                p.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+        threading.Thread(target=_write_audio, args=(proc, audio), daemon=True).start()
+
+    # Wait for all players to finish
+    start_time = time.time()
+    while procs:
+        if is_cancelled():
+            for _, p in procs:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+            return {"cancelled": True}
+
+        # Check which processes are done
+        still_running = []
+        for i, p in procs:
+            if p.poll() is None:
+                still_running.append((i, p))
+            else:
+                unregister_proc(p)
+        procs = still_running
+
+        # Update progress
+        elapsed = time.time() - start_time
+        pct = min(95, 30 + int(elapsed * 10))  # Rough progress
+        send_progress(progress_token, pct, 100, f"🔊 {n_seg - len(procs)}/{n_seg} voices done")
+        time.sleep(0.2)
+
+    send_progress(progress_token, 100, 100, f"🔊 All {n_seg} voices finished")
+    return {"spoken": n_seg, "parallel": True}
 
 
 # ---------------------------------------------------------------------------

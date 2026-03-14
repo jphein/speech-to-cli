@@ -28,7 +28,7 @@ from audio import (_generate_chimes, _refresh_audio_detection, _prewarm_all,
                    has_echo_cancel, _COLOR_MAP,
                    _build_player_cmd, _build_rec_cmd)
 from stt import stt, _get_stt_ws, _invalidate_stt_ws
-from speech_tts import tts, multi_speak, talk_fullduplex, get_voices
+from speech_tts import tts, multi_speak, multi_speak_stream, talk_fullduplex, get_voices
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +142,40 @@ TOOLS = [
                         "required": ["text"],
                     },
                     "description": "List of {text, voice, subtitle_color} segments to speak back-to-back.",
+                },
+                "quality": {
+                    "type": "string",
+                    "enum": ["fast", "hd"],
+                    "default": "fast",
+                },
+            },
+            "required": ["segments"],
+        },
+    },
+    {
+        "name": "multi_speak_stream",
+        "description": (
+            "Stream multi-voice TTS in a SINGLE Azure request using SSML multi-voice tags. "
+            "MUCH FASTER than multi_speak — one API call instead of N calls. "
+            "Ideal for multi_chat responses: each model's response plays with its own voice, "
+            "switching seamlessly within a single audio stream. "
+            "Voice assignments: gpt-5.3-chat→DavisNeural, Claude→AvaNeural, "
+            "Llama→AndrewNeural, DeepSeek→BrianNeural, Phi→JennyNeural, Gemini→AriaNeural."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "segments": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string", "description": "Text to speak."},
+                            "voice": {"type": "string", "description": "Azure voice name (e.g., en-US-DavisNeural)."},
+                        },
+                        "required": ["text"],
+                    },
+                    "description": "List of {text, voice} segments. All synthesized in ONE request.",
                 },
                 "quality": {
                     "type": "string",
@@ -413,6 +447,29 @@ def handle_request(req):
             else:
                 count = result.get("spoken", 0)
                 msg = f"Spoke {count} segment{'s' if count != 1 else ''} aloud." if count else result.get("error", "Failed")
+            _schedule_warmup()
+            return {
+                "jsonrpc": "2.0", "id": req_id,
+                "result": {"content": [{"type": "text", "text": msg}]},
+            }
+        elif tool_name == "multi_speak_stream":
+            segments = args.get("segments", [])
+            if not segments:
+                return {
+                    "jsonrpc": "2.0", "id": req_id,
+                    "result": {"content": [{"type": "text", "text": "Error: 'segments' is required."}]},
+                }
+            quality = args.get("quality", "fast")
+            if quality not in ("fast", "hd"):
+                quality = "fast"
+            result = multi_speak_stream(segments, quality=quality, progress_token=progress_token)
+            if result.get("cancelled"):
+                msg = "(cancelled)"
+            elif result.get("error"):
+                msg = result["error"]
+            else:
+                count = result.get("spoken", 0)
+                msg = f"Streamed {count} voice{'s' if count != 1 else ''} in single request."
             _schedule_warmup()
             return {
                 "jsonrpc": "2.0", "id": req_id,
