@@ -330,12 +330,12 @@ def stt_streaming(max_seconds=30, progress_token=None):
 
                         if total_frames % 3 == 0 or current_pct > last_progress_pct:
                             parts = ["🎤"]
-                            if _show_vu:
-                                parts.append(vu)
                             if _show_subs:
                                 parts.append(_colorize(partial_text[0], _user_color) + timer_icon)
                             else:
                                 parts.append("Listening..." + timer_icon)
+                            if _show_vu:
+                                parts.append(vu)
                             send_progress(progress_token, current_pct, 100, " ".join(parts))
                             last_progress_pct = current_pct
 

@@ -164,6 +164,9 @@ def load_config():
         "region": os.environ.get("AZURE_SPEECH_REGION") or cfg.get("region", "westus2"),
         "voice": os.environ.get("AZURE_SPEECH_VOICE") or cfg.get("voice", "en-US-Ava:DragonHDLatestNeural"),
         "fast_voice": cfg.get("fast_voice", "en-US-AvaNeural"),
+        # Separate TTS region/key for DragonHD voices (only available in select regions)
+        "tts_region": cfg.get("tts_region", None),  # None = use main region
+        "tts_key": cfg.get("tts_key", None),          # None = use main key
         # Audio device settings
         "player": cfg.get("player", "auto"),
         "recorder": cfg.get("recorder", "auto"),

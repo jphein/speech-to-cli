@@ -232,7 +232,9 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "key": {"type": "string", "description": "Azure Speech Services API key. Overrides AZURE_SPEECH_KEY env var."},
-                "region": {"type": "string", "description": "Azure region (e.g. westus2, eastus). Overrides AZURE_SPEECH_REGION env var."},
+                "region": {"type": "string", "description": "Azure region for STT (e.g. westus2, eastus). Overrides AZURE_SPEECH_REGION env var."},
+                "tts_region": {"type": "string", "description": "Azure region for TTS only (e.g. eastus for DragonHD voices). Falls back to main region if not set."},
+                "tts_key": {"type": "string", "description": "Azure Speech API key for TTS region. Falls back to main key if not set."},
                 "player": {"type": "string", "description": "Audio player: aplay, pw-play, pw-cat, ffplay, or auto."},
                 "recorder": {"type": "string", "description": "Audio recorder: pw-record, arecord, or auto."},
                 "mic_source": {"type": "string", "description": "PipeWire node name for mic input, or 'null' for default."},
@@ -678,7 +680,7 @@ def handle_request(req):
                     bt_msg = f"Bluetooth profile switch failed: {e}. "
 
             # Update config settings
-            settable = {"key", "region",
+            settable = {"key", "region", "tts_region", "tts_key",
                         "player", "recorder", "mic_source", "speaker_sink",
                         "silence_timeout", "talk_silence_timeout", "no_speech_timeout",
                         "max_record_seconds", "energy_multiplier", "end_word", "voice", "fast_voice",
@@ -693,10 +695,11 @@ def handle_request(req):
                 if k in settable:
                     if v == "null" or v is None:
                         CONFIG[k] = None
-                    elif k in ("key", "region"):
-                        CONFIG[k] = str(v)
+                    elif k in ("key", "region", "tts_region", "tts_key"):
+                        CONFIG[k] = str(v) if v else None
                         state._http_session = None
-                        _invalidate_stt_ws()
+                        if k in ("key", "region"):
+                            _invalidate_stt_ws()
                     elif k == "end_word":
                         CONFIG[k] = str(v).strip().lower() if v else ""
                     elif k == "half_duplex":

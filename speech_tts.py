@@ -92,9 +92,11 @@ def _prepare_tts(text, quality, speed, voice, pitch, volume):
     volume = _sanitize_ssml_attr(volume, "default")
     ssml = _build_ssml(text, voice, quality, speed, pitch, volume)
     tts_rate = 48000 if quality == "hd" else 24000
-    url = f"https://{CONFIG['region']}.tts.speech.microsoft.com/cognitiveservices/v1"
+    tts_region = CONFIG.get("tts_region") or CONFIG["region"]
+    tts_key = CONFIG.get("tts_key") or CONFIG["key"]
+    url = f"https://{tts_region}.tts.speech.microsoft.com/cognitiveservices/v1"
     headers = {
-        "Ocp-Apim-Subscription-Key": CONFIG["key"],
+        "Ocp-Apim-Subscription-Key": tts_key,
         "Content-Type": "application/ssml+xml",
         "X-Microsoft-OutputFormat": f"raw-{tts_rate // 1000}khz-16bit-mono-pcm",
     }
@@ -141,9 +143,11 @@ def multi_speak_stream(segments, quality="fast", progress_token=None):
     # Build single SSML with all voices
     ssml = _build_multi_voice_ssml(segments, quality)
     tts_rate = 48000 if quality == "hd" else 24000
-    url = f"https://{CONFIG['region']}.tts.speech.microsoft.com/cognitiveservices/v1"
+    tts_region = CONFIG.get("tts_region") or CONFIG["region"]
+    tts_key = CONFIG.get("tts_key") or CONFIG["key"]
+    url = f"https://{tts_region}.tts.speech.microsoft.com/cognitiveservices/v1"
     headers = {
-        "Ocp-Apim-Subscription-Key": CONFIG["key"],
+        "Ocp-Apim-Subscription-Key": tts_key,
         "Content-Type": "application/ssml+xml",
         "X-Microsoft-OutputFormat": f"raw-{tts_rate // 1000}khz-16bit-mono-pcm",
     }
@@ -446,7 +450,7 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
             elapsed = time.time() - start_time
             current_pct = int(min(1.0, elapsed / estimated_duration) * 100)
 
-            vu_prefix = f"{random.choice(bars)} " if show_vu else ""
+            vu_suffix = f" {random.choice(bars)}" if show_vu else ""
 
             if show_subs and total_len > 0:
                 char_idx = int((current_pct / 100.0) * total_len)
@@ -456,7 +460,7 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
             else:
                 base_msg = "Speaking..."
 
-            msg = f"🔊 {vu_prefix}{base_msg}"
+            msg = f"🔊 {base_msg}{vu_suffix}"
             if msg != last_msg or show_vu:
                 send_progress(progress_token, current_pct, 100, msg)
                 last_msg = msg
@@ -1011,9 +1015,11 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
 # ---------------------------------------------------------------------------
 
 def get_voices():
-    """Fetch available voices from Azure."""
-    url = f"https://{CONFIG['region']}.tts.speech.microsoft.com/cognitiveservices/voices/list"
-    headers = {"Ocp-Apim-Subscription-Key": CONFIG["key"]}
+    """Fetch available voices from Azure (uses TTS region/key if set)."""
+    tts_region = CONFIG.get("tts_region") or CONFIG["region"]
+    tts_key = CONFIG.get("tts_key") or CONFIG["key"]
+    url = f"https://{tts_region}.tts.speech.microsoft.com/cognitiveservices/voices/list"
+    headers = {"Ocp-Apim-Subscription-Key": tts_key}
     try:
         resp = get_http_session().get(url, headers=headers, timeout=10)
         if resp.status_code == 200:
