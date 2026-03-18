@@ -16,6 +16,15 @@ import state
 from state import (CONFIG, _cancel_event, _pause_event,
                    is_cancelled, register_proc, unregister_proc, get_http_session)
 
+try:
+    import numpy as np
+    _HAS_NUMPY = True
+except ImportError:
+    _HAS_NUMPY = False
+
+# Pre-computed struct format for standard frame size (480 samples = 960 bytes)
+_RMS_FMT = f'<{state.FRAME_BYTES // 2}h'
+
 
 # ---------------------------------------------------------------------------
 # Echo cancellation detection
@@ -366,6 +375,7 @@ def play_processing():
         _play_sound(state.CHIME_PROCESSING)
 
     if CONFIG.get("chime_hum", False):
+        stop_hum()  # Kill any existing hum before starting a new one
         _print_status("🧠 Thinking...", "94")
         try:
             state._hum_proc = subprocess.Popen(
@@ -380,14 +390,21 @@ def play_processing():
 def stop_hum():
     """Stop the looping hum if active."""
     _print_status("")  # Clear indicator
-    if state._hum_proc:
+    proc = state._hum_proc
+    state._hum_proc = None
+    if proc:
         try:
-            import signal
-            os.killpg(os.getpgid(state._hum_proc.pid), signal.SIGTERM)
-            state._hum_proc.wait(timeout=0.1)
+            import signal as _sig
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, _sig.SIGTERM)
+            proc.wait(timeout=0.3)
         except Exception:
-            pass
-        state._hum_proc = None
+            # SIGTERM failed or timed out — force kill the process group
+            try:
+                os.killpg(pgid, _sig.SIGKILL)
+                proc.wait(timeout=0.3)
+            except Exception:
+                pass
 
 
 def play_speak():
@@ -411,8 +428,16 @@ def rms_energy(frame_bytes):
     n = len(frame_bytes) // 2
     if n == 0:
         return 0.0
-    samples = memoryview(frame_bytes[:n * 2]).cast('h')
-    return math.sqrt(sum(s * s for s in samples) / n)
+    # Fast path: numpy vectorized RMS (~5-10x faster, SIMD-optimized)
+    if _HAS_NUMPY and len(frame_bytes) == state.FRAME_BYTES:
+        samples = np.frombuffer(frame_bytes, dtype=np.int16)
+        return float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
+    # Fallback: struct.unpack + Python generator
+    if len(frame_bytes) == state.FRAME_BYTES:
+        samples = struct.unpack(_RMS_FMT, frame_bytes)
+    else:
+        samples = struct.unpack(f'<{n}h', frame_bytes[:n * 2])
+    return (sum(s * s for s in samples) / n) ** 0.5
 
 
 def calibrate_noise(proc, n_frames=state.ENERGY_CALIBRATION_FRAMES):
@@ -686,10 +711,10 @@ def _prewarm_all():
             _get_stt_ws()
     except Exception:
         pass
-    # Keep TTS HTTP connection alive
+    # Keep TTS HTTP connection alive (use tts_region, not STT region)
     try:
         session = get_http_session()
-        region = CONFIG.get("region")
+        region = CONFIG.get("tts_region") or CONFIG.get("region")
         if region:
             session.head(f"https://{region}.tts.speech.microsoft.com", timeout=3)
     except Exception:

@@ -720,6 +720,9 @@ def handle_request(req):
                               "live_subtitles", "vu_meter", "enable_pause",
                               "enable_echo_cancel", "enable_barge_in", "debug"):
                         CONFIG[k] = v if isinstance(v, bool) else str(v).lower() in ("true", "1", "yes")
+                        if k == "chime_hum" and not CONFIG[k]:
+                            from audio import stop_hum
+                            stop_hum()  # Kill running hum immediately
                         if k == "enable_echo_cancel":
                             state._has_echo_cancel = None  # force re-detection
                     elif k in ("silence_timeout", "talk_silence_timeout", "barge_in_silence"):
@@ -958,6 +961,11 @@ def _stdin_reader():
 
 
 def main():
+    # Validate Azure credentials at startup (warn but don't exit — some tools work without Azure)
+    if not CONFIG.get("key") or not CONFIG.get("region"):
+        print("ERROR: AZURE_SPEECH_KEY and AZURE_SPEECH_REGION must be set. "
+              "See README.md for setup.", file=sys.stderr)
+
     # Startup side effects (run once, not on import)
     _generate_chimes()
     _refresh_audio_detection()
