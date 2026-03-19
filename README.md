@@ -129,6 +129,18 @@ Example `config.json`:
 | `visual_indicator`| `true` | Show status icons (🎤/🧠) in the terminal. |
 | `live_subtitles` | `true` | Show real-time partial transcription in progress bar. |
 | `vu_meter` | `true` | Show live volume meter in progress bar. |
+| `silence_timeout` | `3.0` | Seconds of silence after speech before auto-stop. |
+| `loop_silence_timeout` | `1.2` | Silence timeout in continuous loop mode (shorter = faster turnaround). |
+| `no_speech_timeout` | `7.0` | Max seconds to wait for any speech before giving up. |
+| `talk_silence_timeout` | `4.0` | Silence timeout for talk/converse mode. |
+| `energy_multiplier` | `2.5` | Noise gate threshold multiplier. Lower = more sensitive. |
+| `half_duplex` | `"auto"` | `"auto"` (detect speakers/headphones), `"true"`, or `"false"`. |
+| `continuous_dictation` | `false` | Auto-restart listening after each utterance (used by gnome-speaks). |
+| `dictation_mode` | `true` | Type transcribed text at cursor (vs clipboard only). |
+| `terminal_mode` | `false` | All lowercase, no auto-capitalization. |
+| `end_word` | `"over"` | Say this word to immediately stop recording. |
+| `max_record_seconds` | `120` | Absolute maximum recording duration. |
+| `debug` | `false` | Write detailed logs to `/tmp/speech-debug.log`. |
 
 > ⚠️ **Never commit your API key.** Use environment variables or the config file (which is in your home directory, outside the repo). See [Security](#security) below.
 
@@ -194,8 +206,14 @@ Restart your CLI — it will now have `listen`, `speak`, `multi_speak`, and `con
 |------|-----------|-------------|
 | `listen` | `seconds` (1-30), `mode` (streaming/vad/whisper/fixed) | Records from mic, returns transcribed text |
 | `speak` | `text` (required), `quality` (fast/hd) | Speaks text aloud via Azure TTS |
+| `talk` | `text` (required), `quality` (fast/hd) | Speaks text then listens for a reply — full-duplex TTS+STT in one call |
 | `converse` | `seconds`, `mode` | Like `listen`, but signals conversational intent — Copilot will speak its reply then listen again |
 | `multi_speak` | `segments` (array of {text, voice}), `quality` (fast/hd) | Speak multiple text+voice segments in one call — TTS requests fire in parallel, audio plays back-to-back |
+| `multi_speak_stream` | `segments`, `quality` | Like `multi_speak` with streaming progress events |
+| `configure` | `key`, `value` | View or change runtime settings |
+| `get_voices` | (none) | List available Azure TTS voices |
+| `pause` | (none) | Pause current TTS playback |
+| `resume` | (none) | Resume paused TTS playback |
 
 **STT Modes** (auto-selected by default):
 
@@ -212,6 +230,25 @@ Restart your CLI — it will now have `listen`, `speak`, `multi_speak`, and `con
 |---------|-------|--------------|----------|
 | `fast` (default) | AvaNeural | ~120ms | Conversation, quick responses |
 | `hd` | DragonHD | ~1200ms | High-quality narration |
+
+### Half-Duplex vs Full-Duplex
+
+The `half_duplex` setting controls whether TTS and STT can overlap:
+
+- **`"auto"`** (default): Auto-detects speakers vs headphones. Headphones get full duplex; speakers get half duplex.
+- **`"true"`** (half duplex): TTS must finish before the mic opens. Prevents the mic from hearing speaker output. A 0.5s drain buffer is added after TTS ends.
+- **`"false"`** (full duplex): TTS and STT can run simultaneously. The recorder is prewarmed during TTS so listening starts immediately. Only works well with headphones.
+
+### Talk Tool
+
+The `talk` MCP tool combines TTS and STT in a single call — it speaks the provided text, then immediately listens for the user's reply:
+
+```
+talk(text="What would you like me to do?")
+→ speaks the text, records user's reply, returns transcribed text
+```
+
+This is the same mechanism that gnome-speaks exposes over D-Bus as `org.gnome.Speaks.Talk(text)`. When called via the MCP server, it uses `speech_tts.talk_fullduplex()` which handles the TTS→STT handoff, respecting the duplex setting. The `talk_silence_timeout` (default 4.0s) controls how long it waits for a reply.
 
 ### Voice Chat (standalone companion)
 
