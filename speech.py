@@ -7,7 +7,6 @@ Press Enter to start recording, Enter again to stop and transcribe.
 Press Ctrl+C to quit.
 """
 
-import json
 import os
 import signal
 import subprocess
@@ -15,21 +14,7 @@ import sys
 import tempfile
 import requests
 
-DEFAULTS_PATH = os.path.expanduser("~/.config/speech-to-cli/config.json")
-
-
-def load_config():
-    cfg = {}
-    if os.path.exists(DEFAULTS_PATH):
-        with open(DEFAULTS_PATH) as f:
-            cfg = json.load(f)
-    key = os.environ.get("AZURE_SPEECH_KEY") or cfg.get("key")
-    region = os.environ.get("AZURE_SPEECH_REGION") or cfg.get("region", "westus2")
-    if not key:
-        print("Error: No Azure Speech API key found.", file=sys.stderr)
-        print("Set AZURE_SPEECH_KEY or create ~/.config/speech-to-cli/config.json", file=sys.stderr)
-        sys.exit(1)
-    return key, region
+from state import load_config_standalone
 
 
 def record_audio(path):
@@ -79,7 +64,7 @@ def copy_to_clipboard(text):
 
 
 def main():
-    key, region = load_config()
+    key, region = load_config_standalone()
     print(f"🎤 Speech-to-CLI (Azure {region})")
     print(f"   Enter = start recording, Enter = stop & transcribe, Ctrl+C = quit\n")
 

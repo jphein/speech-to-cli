@@ -42,11 +42,15 @@ def _make_ws_audio_msg(request_id, audio_data):
 
 
 def _get_stt_ws():
-    """Get or create persistent WebSocket to Azure STT (saves ~230ms on reuse)."""
+    """Get or create persistent WebSocket to Azure STT (saves ~230ms on reuse).
+
+    Returns (ws, is_fresh) where is_fresh=True if a new connection was just created.
+    Callers should pass drain=not is_fresh to _init_stt_ws_session().
+    """
     now = time.time()
     if state._persistent_ws is not None and (now - state._persistent_ws_time) < state.WS_IDLE_TIMEOUT:
         state._persistent_ws_time = now
-        return state._persistent_ws
+        return state._persistent_ws, False
     if state._persistent_ws is not None:
         try:
             state._persistent_ws.close()
@@ -55,9 +59,10 @@ def _get_stt_ws():
         state._persistent_ws = None
     region = CONFIG["region"]
     key = CONFIG["key"]
+    lang = CONFIG.get("language", "en-US")
     state._persistent_ws = websocket.create_connection(
         f"wss://{region}.stt.speech.microsoft.com/speech/recognition"
-        f"/conversation/cognitiveservices/v1?language=en-US&format=detailed",
+        f"/conversation/cognitiveservices/v1?language={lang}&format=detailed",
         header=[
             f"Ocp-Apim-Subscription-Key: {key}",
             f"X-ConnectionId: {uuid.uuid4().hex}",
@@ -65,7 +70,7 @@ def _get_stt_ws():
         timeout=10,
     )
     state._persistent_ws_time = time.time()
-    return state._persistent_ws
+    return state._persistent_ws, True
 
 
 def _invalidate_stt_ws():
@@ -133,34 +138,47 @@ def _window_partial(text, term_width=None):
     return text if len(text) < window else "..." + text[-(window - 3):]
 
 
-def _init_stt_ws_session(ws, request_id):
-    """Initialize an STT WebSocket session: drain stale msgs, send config + WAV header."""
-    try:
-        ws.settimeout(0.05)
-        while True:
-            ws.recv()
-    except Exception:
-        pass
-    speech_config = {
-        "context": {
-            "system": {"version": "1.0.00000"},
-            "os": {"platform": "Linux", "name": "speech-to-cli"},
-            "audio": {"source": {"connectivity": "Unknown", "manufacturer": "Unknown",
-                                 "model": "Unknown", "type": "Unknown"}},
-        }
+# Pre-computed WAV header for STT init (never changes)
+_STT_WAV_HEADER = struct.pack('<4sI4s4sIHHIIHH4sI',
+    b'RIFF', 0, b'WAVE', b'fmt ', 16, 1, 1, 16000, 32000, 2, 16, b'data', 0)
+
+# Pre-serialized speech config JSON (never changes)
+_STT_SPEECH_CONFIG = json.dumps({
+    "context": {
+        "system": {"version": "1.0.00000"},
+        "os": {"platform": "Linux", "name": "speech-to-cli"},
+        "audio": {"source": {"connectivity": "Unknown", "manufacturer": "Unknown",
+                             "model": "Unknown", "type": "Unknown"}},
     }
+})
+
+
+def _init_stt_ws_session(ws, request_id, drain=True):
+    """Initialize an STT WebSocket session: drain stale msgs, send config + WAV header.
+
+    Set drain=False on freshly created connections (no stale messages to clear).
+    """
+    if drain:
+        try:
+            ws.settimeout(0.05)
+            while True:
+                ws.recv()
+        except Exception:
+            pass
     ws.send(
         f"Path: speech.config\r\nX-RequestId: {request_id}\r\n"
         f"X-Timestamp: {_get_iso_timestamp()}\r\n"
-        f"Content-Type: application/json\r\n\r\n" + json.dumps(speech_config)
+        f"Content-Type: application/json\r\n\r\n" + _STT_SPEECH_CONFIG
     )
-    wav_header = struct.pack('<4sI4s4sIHHIIHH4sI',
-        b'RIFF', 0, b'WAVE', b'fmt ', 16, 1, 1, 16000, 32000, 2, 16, b'data', 0)
-    ws.send(_make_ws_audio_msg(request_id, wav_header), opcode=websocket.ABNF.OPCODE_BINARY)
+    ws.send(_make_ws_audio_msg(request_id, _STT_WAV_HEADER), opcode=websocket.ABNF.OPCODE_BINARY)
 
 
-def _parse_ws_msg(msg, phrases, partial_holder, end_word_event, end_word, _log):
+def _parse_ws_msg(msg, phrases, partial_holder, end_word_event, end_word, _log,
+                   raw_partial_holder=None):
     """Parse a WS STT message. Updates phrases/partial_holder in place.
+
+    If raw_partial_holder is provided, also stores the unwindowed full text there
+    (useful for live typing where terminal-width truncation would corrupt diffs).
 
     Returns: 'hypothesis', 'phrase', 'turn_end', or None.
     """
@@ -180,6 +198,8 @@ def _parse_ws_msg(msg, phrases, partial_holder, end_word_event, end_word, _log):
                     end_word_event.set()
                 full = (" ".join(phrases) + " " + partial).strip() if phrases else partial
                 partial_holder[0] = _window_partial(full)
+                if raw_partial_holder is not None:
+                    raw_partial_holder[0] = full
         except Exception:
             pass
         return "hypothesis"
@@ -197,6 +217,8 @@ def _parse_ws_msg(msg, phrases, partial_holder, end_word_event, end_word, _log):
                         end_word_event.set()
                     full = " ".join(phrases)
                     partial_holder[0] = _window_partial(full)
+                    if raw_partial_holder is not None:
+                        raw_partial_holder[0] = full
             else:
                 _log(f"phrase status={status}: {body[:150]}")
         except Exception:
@@ -217,20 +239,23 @@ def _rest_stt_fallback(raw_frames, _log=None):
     if not raw_data:
         return ""
     _log(f"REST STT fallback: {len(raw_data)} bytes")
-    wav_path = tempfile.mktemp(suffix=".wav")
+    # Build WAV in memory — no disk I/O
+    wav_header = struct.pack('<4sI4s4sIHHIIHH4sI',
+        b'RIFF', 36 + len(raw_data), b'WAVE', b'fmt ', 16, 1, 1,
+        16000, 32000, 2, 16, b'data', len(raw_data))
+    wav_data = wav_header + raw_data
+    lang = CONFIG.get("language", "en-US")
     try:
-        write_wav(wav_path, raw_data)
         stt_url = (f"https://{CONFIG['region']}.stt.speech.microsoft.com"
                    f"/speech/recognition/conversation/cognitiveservices/v1")
         stt_headers = {
             "Ocp-Apim-Subscription-Key": CONFIG["key"],
             "Content-Type": "audio/wav; codecs=audio/pcm; samplerate=16000",
         }
-        with open(wav_path, "rb") as f:
-            resp = get_http_session().post(
-                stt_url, params={"language": "en-US", "format": "detailed"},
-                headers=stt_headers, data=f, timeout=30,
-            )
+        resp = get_http_session().post(
+            stt_url, params={"language": lang, "format": "detailed"},
+            headers=stt_headers, data=wav_data, timeout=30,
+        )
         if resp.status_code == 200:
             result = resp.json()
             status = result.get("RecognitionStatus", "?")
@@ -245,11 +270,6 @@ def _rest_stt_fallback(raw_frames, _log=None):
             _log(f"REST STT HTTP error: {resp.status_code}")
     except Exception as e:
         _log(f"REST STT exception: {e}")
-    finally:
-        try:
-            os.unlink(wav_path)
-        except OSError:
-            pass
     return ""
 
 
@@ -262,7 +282,7 @@ def stt_streaming(max_seconds=30, progress_token=None):
     _log = _make_logger("stt-stream")
     _end_word = CONFIG.get("end_word", "over")
 
-    def _do_streaming(ws, max_seconds):
+    def _do_streaming(ws, max_seconds, is_fresh=False):
         request_id = uuid.uuid4().hex
 
         proc = _take_prewarmed_rec()
@@ -272,7 +292,7 @@ def stt_streaming(max_seconds=30, progress_token=None):
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             )
 
-        _init_stt_ws_session(ws, request_id)
+        _init_stt_ws_session(ws, request_id, drain=not is_fresh)
         play_chime()
         send_progress(progress_token, 0, 100, "🎤 Listening...")
         register_proc(proc)
@@ -412,14 +432,20 @@ def stt_streaming(max_seconds=30, progress_token=None):
                     break
             elif mtype == "turn_end":
                 _log(f"turn.end received (phrases={len(phrases)})")
+                got_phrase = True  # WS analyzed audio, even if no speech found
                 break
 
         sender.join(timeout=2)
         user_text = " ".join(phrases).strip()
 
-        if not user_text and rec_frames:
+        # Only fall back to REST if the WS never responded (connection failure).
+        # If WS returned a phrase status (even InitialSilenceTimeout) or turn.end,
+        # it already analyzed the audio — REST would just repeat the same result.
+        if not user_text and rec_frames and not got_phrase:
             _log(f"WS returned nothing, falling back to REST STT (frames={len(rec_frames)})")
             user_text = _rest_stt_fallback(rec_frames, _log)
+        elif not user_text and got_phrase:
+            _log(f"WS analyzed audio but found no speech (skipping REST fallback)")
 
         user_text = _strip_end_word(user_text, _end_word)
         _log(f"FINAL: {repr(user_text[:100])}")
@@ -434,8 +460,8 @@ def stt_streaming(max_seconds=30, progress_token=None):
     # Try persistent connection, retry once on failure
     for attempt in range(2):
         try:
-            ws = _get_stt_ws()
-            text = _do_streaming(ws, max_seconds)
+            ws, is_fresh = _get_stt_ws()
+            text = _do_streaming(ws, max_seconds, is_fresh)
             if is_cancelled():
                 return {"text": "", "cancelled": True}
             return {"text": text}
@@ -482,7 +508,7 @@ def stt_vad(max_seconds=30, progress_token=None):
             "Content-Type": "audio/wav; codecs=audio/pcm; samplerate=16000",
         }
         with open(tmp_path, "rb") as f:
-            resp = get_http_session().post(url, params={"language": "en-US", "format": "detailed"},
+            resp = get_http_session().post(url, params={"language": CONFIG.get("language", "en-US"), "format": "detailed"},
                                  headers=headers, data=f, timeout=30)
         if resp.status_code != 200:
             return {"error": f"Azure STT error {resp.status_code}"}
@@ -587,7 +613,7 @@ def stt_fixed(seconds=5, progress_token=None):
             "Content-Type": "audio/wav; codecs=audio/pcm; samplerate=16000",
         }
         with open(tmp_path, "rb") as f:
-            resp = get_http_session().post(url, params={"language": "en-US", "format": "detailed"},
+            resp = get_http_session().post(url, params={"language": CONFIG.get("language", "en-US"), "format": "detailed"},
                                  headers=headers, data=f, timeout=30)
         if resp.status_code != 200:
             return {"error": f"Azure STT error {resp.status_code}"}

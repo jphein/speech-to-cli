@@ -251,6 +251,30 @@ python3 tts.py  # speaks clipboard contents
 
 No Azure SDK required — just plain REST/WebSocket API calls.
 
+## Used as a library
+
+Other projects import the core modules from this repository directly rather than going through the MCP server:
+
+- **[gnome-speaks](https://github.com/jphein/gnome-speaks)** — a GNOME Shell extension that adds voice control to the desktop. It imports `state.py`, `audio.py`, `stt.py`, and `speech_tts.py` via `sys.path`.
+- **[the-oracle](https://github.com/jphein/the-oracle)** — proxies this MCP server through a FastMCP gateway so multiple clients can share a single speech backend.
+
+The env var `SPEECH_ENGINE_PATH` can be set to the path of this directory so that downstream projects can locate and import the modules at runtime.
+
+**File roles:**
+
+| File | Role |
+|------|------|
+| `state.py` | Shared state, constants, config, helpers |
+| `audio.py` | Audio I/O, device detection, chimes, UI, VAD |
+| `stt.py` | Speech-to-text backends |
+| `speech_tts.py` | Text-to-speech (Azure TTS, multi_speak) |
+| `mcp_speech.py` | MCP protocol adapter (tool schemas, request routing, stdio) |
+| `speech.py` | Standalone CLI — mic to clipboard |
+| `tts.py` | Standalone CLI — text to speech |
+| `voice_chat.py` | Standalone CLI — interactive voice chat loop |
+
+If you are building on top of these modules, import the four core library files (`state`, `audio`, `stt`, `speech_tts`) and leave `mcp_speech.py` and the standalone CLIs out of your import graph.
+
 ## Security
 
 This project handles audio data and API credentials. Please review:

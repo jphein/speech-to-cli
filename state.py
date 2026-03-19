@@ -70,7 +70,7 @@ MIN_SPEECH_DURATION = 0.15
 VAD_AGGRESSIVENESS = 3
 ENERGY_CALIBRATION_FRAMES = 5
 ENERGY_THRESHOLD_MULTIPLIER = 2.5
-NOISE_CACHE_TTL = 30.0
+NOISE_CACHE_TTL = 120.0  # reuse ambient threshold for 2min (re-calibrates on fresh listen)
 
 WS_IDLE_TIMEOUT = 540  # Azure closes at ~600s
 
@@ -197,7 +197,33 @@ def load_config():
         "enable_barge_in": cfg.get("enable_barge_in", False),
         "debug": cfg.get("debug", False),
         "half_duplex": cfg.get("half_duplex", "auto"),
+        # LLM / conversation mode settings (used by gnome-speaks)
+        "llm_provider": cfg.get("llm_provider", "anthropic"),
+        "llm_model": cfg.get("llm_model", "claude-opus-4-6"),
+        "llm_api_key": cfg.get("llm_api_key", ""),
+        "llm_system_prompt": cfg.get("llm_system_prompt", ""),
+        "conversation_mode": cfg.get("conversation_mode", False),
+        "dictation_mode": cfg.get("dictation_mode", True),
+        "continuous_dictation": cfg.get("continuous_dictation", False),
+        "read_notifications": cfg.get("read_notifications", False),
     }
+
+
+def load_config_standalone(need_voice=False):
+    """Load config for standalone scripts (speech.py, tts.py, voice_chat.py).
+
+    Returns (key, region) or (key, region, voice) if need_voice=True.
+    Exits with an error message if AZURE_SPEECH_KEY is not set.
+    """
+    cfg = load_config()
+    if not cfg.get("key"):
+        print("Error: No Azure Speech API key found.", file=sys.stderr)
+        print("Set AZURE_SPEECH_KEY or create ~/.config/speech-to-cli/config.json",
+              file=sys.stderr)
+        sys.exit(1)
+    if need_voice:
+        return cfg["key"], cfg["region"], cfg["voice"]
+    return cfg["key"], cfg["region"]
 
 
 CONFIG = load_config()

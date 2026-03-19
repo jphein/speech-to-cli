@@ -361,7 +361,7 @@ def multi_speak(segments, quality="fast", progress_token=None):
 # tts (single segment, streaming playback)
 # ---------------------------------------------------------------------------
 
-def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="default", progress_token=None, subtitle_color=None):
+def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="default", progress_token=None, subtitle_color=None, audio_level_cb=None):
     """Speak text aloud via Azure TTS with streaming playback."""
     stop_hum()
     send_progress(progress_token, 0, 100, "🔊 Synthesizing...")
@@ -399,6 +399,7 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
                 silence_bytes = b"\x00" * (tts_rate * 2 * lead_ms // 1000)
                 proc.stdin.write(silence_bytes)
                 proc.stdin.flush()
+                _chunk_count = 0
                 for chunk in resp.iter_content(chunk_size=16384):
                     if is_cancelled():
                         break
@@ -408,6 +409,14 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
                         proc.stdin.write(chunk)
                         proc.stdin.flush()
                         last_write_time[0] = time.time()
+                        # Emit audio level from TTS audio (every 3rd chunk)
+                        _chunk_count += 1
+                        if audio_level_cb and _chunk_count % 3 == 0:
+                            try:
+                                rms = rms_energy(chunk[:3200])  # first ~100ms of 16-bit mono
+                                audio_level_cb(min(rms / 8000.0, 1.0))
+                            except Exception:
+                                pass
                 proc.stdin.close()
             except Exception:
                 pass
@@ -491,7 +500,7 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
 
 def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default",
                     volume="default", seconds=30, mode=None, silence_timeout=None,
-                    progress_token=None, subtitle_color=None):
+                    progress_token=None, subtitle_color=None, audio_level_cb=None):
     """Speak and listen simultaneously.
 
     TTS plays to the default output while STT records from the default mic.
@@ -565,10 +574,10 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
     use_streaming_stt = HAS_WS
     if use_streaming_stt:
         try:
-            ws = _get_stt_ws()
+            ws, ws_fresh = _get_stt_ws()
             rid = uuid.uuid4().hex
             stt_request_id[0] = rid
-            _init_stt_ws_session(ws, rid)
+            _init_stt_ws_session(ws, rid, drain=not ws_fresh)
             stt_ws[0] = ws
         except Exception:
             use_streaming_stt = False
@@ -710,10 +719,10 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                     ws_reconnected = True
                     _log(f"WS dead at post-TTS frame {post_tts_frames}, starting fresh STT session")
                     try:
-                        ws_new = _get_stt_ws()
+                        ws_new, ws_new_fresh = _get_stt_ws()
                         rid_new = uuid.uuid4().hex
                         stt_request_id[0] = rid_new
-                        _init_stt_ws_session(ws_new, rid_new)
+                        _init_stt_ws_session(ws_new, rid_new, drain=not ws_new_fresh)
                         # Replay buffered frames: TTS-phase dead frames + post-TTS frames
                         replay = tts_dead_frames + rec_frames
                         for prev_frame in replay:
@@ -773,6 +782,7 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                 player_proc.stdin.flush()
             except (BrokenPipeError, OSError):
                 pass
+            _td_chunk_count = 0
             for chunk in resp.iter_content(chunk_size=16384):
                 if is_cancelled():
                     break
@@ -791,6 +801,14 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                         last_write_time[0] = time.time()
                     except (BrokenPipeError, OSError):
                         break
+                    # Emit audio level from TTS stream
+                    _td_chunk_count += 1
+                    if audio_level_cb and _td_chunk_count % 3 == 0:
+                        try:
+                            rms = rms_energy(chunk[:3200])
+                            audio_level_cb(min(rms / 8000.0, 1.0))
+                        except Exception:
+                            pass
             try:
                 player_proc.stdin.close()
             except (BrokenPipeError, OSError):

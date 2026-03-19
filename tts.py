@@ -8,28 +8,12 @@ Usage:
   echo "hello" | python3 tts.py   # speak stdin
 """
 
-import json
 import os
 import subprocess
 import sys
 import requests
 
-DEFAULTS_PATH = os.path.expanduser("~/.config/speech-to-cli/config.json")
-
-
-def load_config():
-    cfg = {}
-    if os.path.exists(DEFAULTS_PATH):
-        with open(DEFAULTS_PATH) as f:
-            cfg = json.load(f)
-    key = os.environ.get("AZURE_SPEECH_KEY") or cfg.get("key")
-    region = os.environ.get("AZURE_SPEECH_REGION") or cfg.get("region", "westus2")
-    voice = os.environ.get("AZURE_SPEECH_VOICE") or cfg.get("voice", "en-US-Ava:DragonHDLatestNeural")
-    if not key:
-        print("Error: No Azure Speech API key found.", file=sys.stderr)
-        print("Set AZURE_SPEECH_KEY or create ~/.config/speech-to-cli/config.json", file=sys.stderr)
-        sys.exit(1)
-    return key, region, voice
+from state import load_config_standalone
 
 
 def get_text():
@@ -78,7 +62,7 @@ def play_audio(audio_data):
 
 
 def main():
-    key, region, voice = load_config()
+    key, region, voice = load_config_standalone(need_voice=True)
     text = get_text()
     if not text:
         print("No text to speak. Usage: tts.py \"text\" or copy text to clipboard first.", file=sys.stderr)
