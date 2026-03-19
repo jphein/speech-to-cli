@@ -207,6 +207,7 @@ def load_config():
         "skip_final_paste": cfg.get("skip_final_paste", True),
         "terminal_mode": cfg.get("terminal_mode", False),
         "continuous_dictation": cfg.get("continuous_dictation", False),
+        "loop_silence_timeout": cfg.get("loop_silence_timeout", 1.2),
         "read_notifications": cfg.get("read_notifications", False),
     }
 
