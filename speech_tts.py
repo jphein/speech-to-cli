@@ -500,7 +500,8 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
 
 def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default",
                     volume="default", seconds=30, mode=None, silence_timeout=None,
-                    progress_token=None, subtitle_color=None, audio_level_cb=None):
+                    progress_token=None, subtitle_color=None, audio_level_cb=None,
+                    partial_cb=None):
     """Speak and listen simultaneously.
 
     TTS plays to the default output while STT records from the default mic.
@@ -602,6 +603,11 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
         except Exception:
             return
         mtype = _parse_ws_msg(msg, stt_phrases, stt_partial, end_word_detected, _end_word, _log)
+        if mtype in ("hypothesis", "phrase") and partial_cb and stt_partial[0]:
+            try:
+                partial_cb(stt_partial[0])
+            except Exception:
+                pass
         if mtype == "phrase":
             stt_phrase_done.set()
         elif mtype == "turn_end":
@@ -990,6 +996,11 @@ def talk_fullduplex(text, quality="fast", speed=1.0, voice=None, pitch="default"
                                 if phrase:
                                     stt_phrases.append(phrase)
                                     _log(f"drain phrase: {phrase[:80]}")
+                                    if partial_cb:
+                                        try:
+                                            partial_cb(" ".join(stt_phrases))
+                                        except Exception:
+                                            pass
                             else:
                                 _log(f"drain phrase NON-SUCCESS: {body[:200]}")
                         except Exception as _e:
