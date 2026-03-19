@@ -174,11 +174,15 @@ def _init_stt_ws_session(ws, request_id, drain=True):
 
 
 def _parse_ws_msg(msg, phrases, partial_holder, end_word_event, end_word, _log,
-                   raw_partial_holder=None):
+                   raw_partial_holder=None, use_lexical=False):
     """Parse a WS STT message. Updates phrases/partial_holder in place.
 
     If raw_partial_holder is provided, also stores the unwindowed full text there
     (useful for live typing where terminal-width truncation would corrupt diffs).
+
+    If use_lexical is True, uses the ITN field (lowercase, no punctuation,
+    but with number/symbol normalization) instead of Display for phrase
+    results. Useful for terminal/code input.
 
     Returns: 'hypothesis', 'phrase', 'turn_end', or None.
     """
@@ -210,7 +214,10 @@ def _parse_ws_msg(msg, phrases, partial_holder, end_word_event, end_word, _log,
             status = data.get("RecognitionStatus", "?")
             if status == "Success":
                 nbest = data.get("NBest", [])
-                phrase = nbest[0]["Display"] if nbest else data.get("DisplayText", "")
+                if use_lexical and nbest:
+                    phrase = nbest[0].get("ITN", nbest[0].get("Display", ""))
+                else:
+                    phrase = nbest[0]["Display"] if nbest else data.get("DisplayText", "")
                 if phrase:
                     phrases.append(phrase)
                     if _check_end_word(phrase, end_word):

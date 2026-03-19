@@ -204,6 +204,8 @@ def load_config():
         "llm_system_prompt": cfg.get("llm_system_prompt", ""),
         "conversation_mode": cfg.get("conversation_mode", False),
         "dictation_mode": cfg.get("dictation_mode", True),
+        "skip_final_paste": cfg.get("skip_final_paste", True),
+        "terminal_mode": cfg.get("terminal_mode", False),
         "continuous_dictation": cfg.get("continuous_dictation", False),
         "read_notifications": cfg.get("read_notifications", False),
     }
