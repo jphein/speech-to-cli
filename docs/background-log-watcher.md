@@ -142,17 +142,46 @@ It then continued polling for recovery events every 30 seconds.
 
 ## Reading Watcher Output
 
-The main agent can check what the watcher reported:
+Three ways to check what the watcher detected, from easiest to most manual:
+
+### 1. SendMessage — talk to the running agent
+
+If you gave the agent a `name` when spawning it (e.g. `name: "usb-watcher"`), the main conversation can send it a message and get a response:
+
+```
+SendMessage:
+  to: "usb-watcher"
+  message: "what have you seen so far?"
+```
+
+The watcher receives the message, processes it with full context of everything it's observed, and responds. This is the most powerful method — you're having a conversation *with* the watcher while it continues monitoring.
+
+**Requirement**: The agent must have been spawned with the `name` parameter.
+
+### 2. TaskOutput — read the transcript passively
+
+The main agent can call the `TaskOutput` tool with the background task's ID to read its full transcript. Just ask Claude:
+
+- **"check the watcher"** — Claude calls `TaskOutput` internally and summarizes
+- **"what did the USB watcher find?"** — same thing
+
+You don't need to know the task ID or file paths — Claude tracks these internally.
+
+### 3. Terminal — manual JSONL inspection
+
+The watcher's transcript is a JSONL file (one JSON object per line):
 
 ```bash
-# Read the agent's full transcript (JSONL)
-cat /tmp/claude-*/tasks/<agent-id>.output
+# Find the output file (path includes your UID and session ID)
+ls /tmp/claude-$(id -u)/*/tasks/*.output
 
-# Extract just the speak messages
-grep -o '"text":"[^"]*"' /tmp/claude-*/tasks/<agent-id>.output | tail -10
+# Extract just the text the agent spoke aloud
+grep -o '"name":"mcp__speech-to-cli__speak"[^}]*"text":"[^"]*"' \
+  /tmp/claude-$(id -u)/*/tasks/<agent-id>.output
 
-# Or use the TaskOutput tool from within Claude Code
-TaskOutput: agent-id
+# Or get a quick summary: the agent's own commentary (not tool calls)
+grep '"role":"assistant"' /tmp/claude-$(id -u)/*/tasks/<agent-id>.output \
+  | grep -o '"text":"[^"]*"' | tail -20
 ```
 
 ## Autonomous Response Loop
@@ -184,7 +213,7 @@ The powerful pattern: the main agent reads the watcher output and acts on it wit
 
 The user hears the TTS alert and knows work is happening. No manual intervention needed.
 
-**Caveat**: Background agents don't push notifications to the main agent — they only report back when they complete or are killed. The main agent must proactively read the output file (or the user can tell it to check).
+**Caveat**: Background agents don't *push* notifications to the main conversation — the main agent must pull via `TaskOutput` or `SendMessage`. The user hearing the TTS alert is often what triggers them to say "check the watcher."
 
 ## Adapting to Other Log Sources
 
@@ -204,7 +233,8 @@ The user hears the TTS alert and knows work is happening. No manual intervention
 - **Stay quiet on normal** — constant "all clear" announcements are annoying
 - **Short announcements** — "USB controller reset on bus 2" not a full paragraph (though the agent will sometimes give detailed context on critical events, which is useful)
 - **The agent needs ToolSearch first** — MCP tools are deferred, so the prompt should reference the tool name (`mcp__speech-to-cli__speak`) but the agent will fetch the schema itself
-- **Background agents don't notify the main agent** until they complete — since watchers run indefinitely, the main agent must proactively read the output file
-- **The user is the bridge** — they hear the TTS and can tell the main agent "check the watcher" until the main agent learns to check periodically
+- **Name your agents** — always set `name: "my-watcher"` so you can use `SendMessage` to talk to it while it runs
+- **The main agent must pull** — background agents don't push notifications; use `SendMessage` or `TaskOutput` to check in
+- **The user is the bridge** — they hear the TTS and can tell the main agent "check the watcher" to trigger a pull
 - **Poll interval tradeoff** — 30 seconds is a good default; shorter catches events faster but burns more LLM tokens on empty polls
 - **Voice choice** — `en-US-DavisNeural` works well for alerts (clear, authoritative); consider `en-US-AvaNeural` for softer notifications

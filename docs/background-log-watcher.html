@@ -1101,15 +1101,50 @@ blockquote p {
   <section class="reveal">
     <div class="section-label">Observability</div>
     <h2>Reading Watcher Output</h2>
-    <p>The main agent can check what the watcher reported:</p>
-    <pre><code><span class="syn-cmt"># Read the agent's full transcript (JSONL)</span>
-cat /tmp/claude-*/tasks/<span class="syn-var">&lt;agent-id&gt;</span>.output
+    <p>Three ways to check what the watcher detected, from most to least powerful:</p>
 
-<span class="syn-cmt"># Extract just the speak messages</span>
-grep -o <span class="syn-str">'"text":"[^"]*"'</span> /tmp/claude-*/tasks/<span class="syn-var">&lt;agent-id&gt;</span>.output | tail -<span class="syn-num">10</span>
+    <h3>1. SendMessage &mdash; talk to the running agent</h3>
+    <p>
+      If you gave the agent a <code>name</code> when spawning it (e.g. <code>name: "usb-watcher"</code>),
+      the main conversation can send it a message and get a live response:
+    </p>
+    <pre><code><span class="syn-key">SendMessage</span><span class="syn-op">:</span>
+  <span class="syn-var">to</span><span class="syn-op">:</span> <span class="syn-str">"usb-watcher"</span>
+  <span class="syn-var">message</span><span class="syn-op">:</span> <span class="syn-str">"what have you seen so far?"</span><span class="code-label">tool call</span></code></pre>
+    <p>
+      The watcher receives the message, processes it with full context of everything it&rsquo;s observed,
+      and responds. You&rsquo;re having a conversation <em>with</em> the watcher while it continues monitoring.
+    </p>
+    <div class="insight">
+      <p>
+        <strong>Requirement:</strong> The agent must have been spawned with the <code>name</code> parameter.
+        This is why the launch template includes <code>name: "my-watcher"</code>.
+      </p>
+    </div>
 
-<span class="syn-cmt"># Or use the TaskOutput tool from within Claude Code</span>
-<span class="syn-fn">TaskOutput</span>: <span class="syn-var">agent-id</span><span class="code-label">bash</span></code></pre>
+    <h3>2. TaskOutput &mdash; read the transcript passively</h3>
+    <p>
+      The main agent can call <code>TaskOutput</code> with the background task&rsquo;s ID
+      to read its full transcript. Just ask Claude naturally:
+    </p>
+    <ul class="tips" style="margin-top: 0.75rem;">
+      <li data-icon="&gt;" style="padding-left: 2.5rem;"><strong>&ldquo;check the watcher&rdquo;</strong> &mdash; Claude calls TaskOutput internally and summarizes</li>
+      <li data-icon="&gt;" style="padding-left: 2.5rem;"><strong>&ldquo;what did the USB watcher find?&rdquo;</strong> &mdash; same thing, different phrasing</li>
+    </ul>
+    <p>You don&rsquo;t need to know the task ID or file paths &mdash; Claude tracks these internally.</p>
+
+    <h3>3. Terminal &mdash; manual JSONL inspection</h3>
+    <p>The watcher&rsquo;s transcript is a JSONL file (one JSON object per line):</p>
+    <pre><code><span class="syn-cmt"># Find the output file (path includes your UID and session ID)</span>
+ls /tmp/claude-$(<span class="syn-fn">id</span> -u)/*/tasks/*.output
+
+<span class="syn-cmt"># Extract just the text the agent spoke aloud</span>
+grep -o <span class="syn-str">'"name":"mcp__speech-to-cli__speak"[^}]*"text":"[^"]*"'</span> \
+  /tmp/claude-$(<span class="syn-fn">id</span> -u)/*/tasks/<span class="syn-var">&lt;agent-id&gt;</span>.output
+
+<span class="syn-cmt"># Or get the agent's own commentary (not tool calls)</span>
+grep <span class="syn-str">'"role":"assistant"'</span> /tmp/claude-$(<span class="syn-fn">id</span> -u)/*/tasks/<span class="syn-var">&lt;agent-id&gt;</span>.output \
+  | grep -o <span class="syn-str">'"text":"[^"]*"'</span> | tail -<span class="syn-num">20</span><span class="code-label">bash</span></code></pre>
   </section>
 
   <!-- AUTONOMOUS LOOP -->
@@ -1146,9 +1181,9 @@ grep -o <span class="syn-str">'"text":"[^"]*"'</span> /tmp/claude-*/tasks/<span 
     </div>
 
     <p>
-      <strong>Caveat:</strong> Background agents don't push notifications to the main agent &mdash;
-      they only report back when they complete or are killed. The main agent must proactively read
-      the output file (or the user can tell it to check).
+      <strong>Caveat:</strong> Background agents don&rsquo;t <em>push</em> notifications to the main conversation &mdash;
+      the main agent must pull via <code>SendMessage</code> or <code>TaskOutput</code>.
+      The user hearing the TTS alert is often what triggers them to say &ldquo;check the watcher.&rdquo;
     </p>
   </section>
 
@@ -1217,9 +1252,13 @@ grep -o <span class="syn-str">'"text":"[^"]*"'</span> /tmp/claude-*/tasks/<span 
         <strong>The agent needs ToolSearch first</strong> &mdash; MCP tools are deferred, so the prompt should reference
         the tool name (<code>mcp__speech-to-cli__speak</code>) but the agent will fetch the schema itself.
       </li>
+      <li data-icon="&#x1F3F7;">
+        <strong>Name your agents</strong> &mdash; always set <code>name: "my-watcher"</code> so you can use
+        <code>SendMessage</code> to talk to it while it runs.
+      </li>
       <li data-icon="&#x1F517;">
-        <strong>Background agents don't push notifications</strong> &mdash; since watchers run indefinitely,
-        the main agent must proactively read the output file.
+        <strong>The main agent must pull</strong> &mdash; background agents don&rsquo;t push notifications;
+        use <code>SendMessage</code> or <code>TaskOutput</code> to check in.
       </li>
       <li data-icon="&#x1F3A4;">
         <strong>Voice choice matters</strong> &mdash; <code>en-US-DavisNeural</code> works well for alerts (clear, authoritative);
@@ -1231,7 +1270,7 @@ grep -o <span class="syn-str">'"text":"[^"]*"'</span> /tmp/claude-*/tasks/<span 
       </li>
       <li data-icon="&#x1F9D1;">
         <strong>The user is the bridge</strong> &mdash; they hear the TTS and can tell the main agent
-        &ldquo;check the watcher&rdquo; until the main agent learns to check periodically.
+        &ldquo;check the watcher&rdquo; to trigger a pull.
       </li>
     </ul>
   </section>
