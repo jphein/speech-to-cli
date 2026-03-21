@@ -105,7 +105,7 @@ The background agent is a separate Claude Code subprocess with its own context w
 6. **speak()** on anomaly — announces what it found, with context
 7. **Goto 4** — loops indefinitely until killed
 
-The polling pattern (`sleep 30 && tail`) is crude but effective. The agent doesn't have access to inotify or event-driven log watching, so it simulates it with periodic checks.
+The polling pattern (`sleep 30 && tail`) is crude but effective. The Claude Code Bash tool has no streaming mode — foreground commands block until exit, background commands write to a file with no callback. So the agent must poll the output file periodically, even though the underlying `journalctl -f` is event-driven.
 
 ## Example: USB/xHCI Monitor
 

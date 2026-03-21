@@ -999,8 +999,9 @@ blockquote p {
 
     <p>
       The polling pattern (<code>sleep 30 && tail</code>) is crude but effective.
-      The agent doesn't have access to inotify or event-driven log watching,
-      so it simulates it with periodic checks.
+      The Claude Code Bash tool has no streaming mode &mdash; foreground commands block until exit,
+      background commands write to a file with no callback. So the agent must poll the output file
+      periodically, even though the underlying <code>journalctl -f</code> is event-driven.
     </p>
   </section>
 
