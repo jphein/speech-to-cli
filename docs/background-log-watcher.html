@@ -1,0 +1,1278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Background Log Watcher Pattern — speech-to-cli</title>
+<meta name="description" content="Use a Claude Code background agent to monitor system logs and announce anomalies aloud via TTS through the MCP protocol.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&family=Instrument+Serif:ital@0;1&family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,400&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg-deep: #0a0c10;
+  --bg-surface: #11141a;
+  --bg-elevated: #181c25;
+  --bg-code: #0d1017;
+  --border: #1e2330;
+  --border-glow: #2a3a5c;
+  --text-primary: #c8cdd8;
+  --text-secondary: #7a8194;
+  --text-dim: #4a5068;
+  --accent-blue: #5b9ef5;
+  --accent-cyan: #4ecdc4;
+  --accent-amber: #f0a848;
+  --accent-red: #e85d5d;
+  --accent-green: #5ce0a0;
+  --accent-purple: #a78bfa;
+  --glow-blue: rgba(91, 158, 245, 0.12);
+  --glow-cyan: rgba(78, 205, 196, 0.10);
+  --glow-amber: rgba(240, 168, 72, 0.10);
+  --glow-red: rgba(232, 93, 93, 0.15);
+  --font-display: 'Instrument Serif', Georgia, serif;
+  --font-body: 'DM Sans', system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', 'Fira Code', monospace;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html {
+  scroll-behavior: smooth;
+  scrollbar-color: var(--border-glow) transparent;
+}
+
+body {
+  font-family: var(--font-body);
+  background: var(--bg-deep);
+  color: var(--text-primary);
+  line-height: 1.7;
+  font-size: 16px;
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+}
+
+/* --- Noise texture overlay --- */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  opacity: 0.025;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='1'/%3E%3C/svg%3E");
+  background-size: 256px;
+  pointer-events: none;
+  z-index: 9999;
+}
+
+/* --- Ambient glow blobs --- */
+.ambient {
+  position: fixed;
+  border-radius: 50%;
+  filter: blur(120px);
+  pointer-events: none;
+  z-index: -1;
+}
+.ambient--blue { width: 600px; height: 600px; background: var(--glow-blue); top: -100px; right: -200px; }
+.ambient--cyan { width: 500px; height: 500px; background: var(--glow-cyan); bottom: 30%; left: -150px; }
+.ambient--amber { width: 400px; height: 400px; background: var(--glow-amber); bottom: -100px; right: 10%; }
+
+/* --- Layout --- */
+.page { max-width: 860px; margin: 0 auto; padding: 0 2rem; }
+
+/* --- Header --- */
+.header {
+  padding: 5rem 0 3rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 4rem;
+  position: relative;
+}
+.header__eyebrow {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-weight: 500;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--accent-cyan);
+  margin-bottom: 1.25rem;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+.header__eyebrow::before {
+  content: '';
+  width: 24px;
+  height: 1px;
+  background: var(--accent-cyan);
+}
+.header__title {
+  font-family: var(--font-display);
+  font-size: clamp(2.5rem, 6vw, 3.8rem);
+  font-weight: 400;
+  line-height: 1.15;
+  color: #e8ecf4;
+  letter-spacing: -0.01em;
+  margin-bottom: 1.5rem;
+}
+.header__title em {
+  font-style: italic;
+  color: var(--accent-blue);
+}
+.header__subtitle {
+  font-size: 1.15rem;
+  color: var(--text-secondary);
+  max-width: 600px;
+  line-height: 1.65;
+}
+.header__meta {
+  margin-top: 2rem;
+  display: flex;
+  gap: 2rem;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+.header__meta a {
+  color: var(--text-dim);
+  text-decoration: none;
+  transition: color 0.2s;
+}
+.header__meta a:hover { color: var(--accent-blue); }
+
+/* --- Sections --- */
+section { margin-bottom: 4rem; }
+.section-label {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 0.75rem;
+}
+h2 {
+  font-family: var(--font-display);
+  font-size: 2rem;
+  font-weight: 400;
+  color: #dde1ec;
+  margin-bottom: 1.25rem;
+  letter-spacing: -0.01em;
+}
+h3 {
+  font-family: var(--font-body);
+  font-size: 1.15rem;
+  font-weight: 600;
+  color: #c0c6d4;
+  margin-bottom: 0.75rem;
+  margin-top: 2rem;
+}
+p { margin-bottom: 1rem; color: var(--text-secondary); }
+p + p { margin-top: 0; }
+a { color: var(--accent-blue); text-decoration: none; }
+a:hover { text-decoration: underline; }
+strong { color: var(--text-primary); font-weight: 500; }
+em { color: var(--accent-amber); font-style: normal; }
+
+/* --- Key insight callout --- */
+.insight {
+  background: linear-gradient(135deg, var(--bg-elevated), var(--bg-surface));
+  border: 1px solid var(--border-glow);
+  border-left: 3px solid var(--accent-cyan);
+  border-radius: 8px;
+  padding: 1.5rem 1.75rem;
+  margin: 1.5rem 0;
+  position: relative;
+}
+.insight::before {
+  content: 'KEY';
+  position: absolute;
+  top: -0.55rem;
+  left: 1.25rem;
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  font-weight: 600;
+  letter-spacing: 0.2em;
+  color: var(--accent-cyan);
+  background: var(--bg-elevated);
+  padding: 0 0.5rem;
+}
+.insight p { color: var(--text-primary); margin-bottom: 0; }
+
+/* --- Architecture diagrams --- */
+.diagram {
+  margin: 2.5rem 0;
+  padding: 2.5rem;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow-x: auto;
+}
+.diagram__title {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 2rem;
+  text-align: center;
+}
+
+.arch-flow {
+  display: flex;
+  align-items: flex-start;
+  gap: 0;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+.arch-node {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-glow);
+  border-radius: 10px;
+  padding: 1.25rem 1.5rem;
+  min-width: 180px;
+  position: relative;
+  transition: border-color 0.3s, box-shadow 0.3s;
+}
+.arch-node:hover {
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 20px var(--glow-blue);
+}
+.arch-node--main { border-color: var(--accent-blue); }
+.arch-node--agent { border-color: var(--accent-cyan); }
+.arch-node--mcp { border-color: var(--accent-purple); }
+.arch-node--azure { border-color: var(--accent-amber); }
+.arch-node--output { border-color: var(--accent-green); }
+
+.arch-node__label {
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  margin-bottom: 0.5rem;
+}
+.arch-node--main .arch-node__label { color: var(--accent-blue); }
+.arch-node--agent .arch-node__label { color: var(--accent-cyan); }
+.arch-node--mcp .arch-node__label { color: var(--accent-purple); }
+.arch-node--azure .arch-node__label { color: var(--accent-amber); }
+.arch-node--output .arch-node__label { color: var(--accent-green); }
+
+.arch-node__title {
+  font-weight: 500;
+  font-size: 0.95rem;
+  color: #dde1ec;
+  margin-bottom: 0.4rem;
+}
+.arch-node__desc {
+  font-size: 0.8rem;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+.arch-node__list {
+  list-style: none;
+  margin-top: 0.6rem;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+.arch-node__list li {
+  padding: 0.15rem 0;
+}
+.arch-node__list li::before {
+  content: '>';
+  color: var(--text-dim);
+  margin-right: 0.4rem;
+}
+
+.arch-arrow {
+  display: flex;
+  align-items: center;
+  padding: 0 0.5rem;
+  min-width: 60px;
+  justify-content: center;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+.arch-arrow__line {
+  width: 40px;
+  height: 2px;
+  background: linear-gradient(90deg, var(--border-glow), var(--text-dim));
+  position: relative;
+}
+.arch-arrow__line::after {
+  content: '';
+  position: absolute;
+  right: -1px;
+  top: -4px;
+  border: 5px solid transparent;
+  border-left: 6px solid var(--text-dim);
+}
+.arch-arrow__label {
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.arch-arrow--down {
+  flex-direction: column;
+  padding: 0.5rem 0;
+  min-width: auto;
+}
+.arch-arrow--down .arch-arrow__line {
+  width: 2px;
+  height: 30px;
+  background: linear-gradient(180deg, var(--border-glow), var(--text-dim));
+}
+.arch-arrow--down .arch-arrow__line::after {
+  right: auto;
+  top: auto;
+  bottom: -1px;
+  left: -4px;
+  border: 5px solid transparent;
+  border-top: 6px solid var(--text-dim);
+  border-left: 5px solid transparent;
+}
+
+/* --- Data flow pipeline --- */
+.pipeline {
+  margin: 2rem 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+.pipeline__step {
+  display: flex;
+  gap: 1.25rem;
+  align-items: flex-start;
+  position: relative;
+}
+.pipeline__step + .pipeline__step { margin-top: 0; }
+.pipeline__gutter {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 36px;
+  flex-shrink: 0;
+}
+.pipeline__number {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-weight: 600;
+  flex-shrink: 0;
+  position: relative;
+  z-index: 1;
+}
+.pipeline__number--blue { background: rgba(91,158,245,0.15); color: var(--accent-blue); border: 1px solid rgba(91,158,245,0.3); }
+.pipeline__number--cyan { background: rgba(78,205,196,0.15); color: var(--accent-cyan); border: 1px solid rgba(78,205,196,0.3); }
+.pipeline__number--purple { background: rgba(167,139,250,0.15); color: var(--accent-purple); border: 1px solid rgba(167,139,250,0.3); }
+.pipeline__number--amber { background: rgba(240,168,72,0.15); color: var(--accent-amber); border: 1px solid rgba(240,168,72,0.3); }
+.pipeline__number--green { background: rgba(92,224,160,0.15); color: var(--accent-green); border: 1px solid rgba(92,224,160,0.3); }
+.pipeline__number--red { background: rgba(232,93,93,0.15); color: var(--accent-red); border: 1px solid rgba(232,93,93,0.3); }
+
+.pipeline__wire {
+  width: 2px;
+  flex-grow: 1;
+  min-height: 20px;
+  background: var(--border);
+}
+.pipeline__content {
+  padding-bottom: 1.75rem;
+  flex: 1;
+}
+.pipeline__content h4 {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--text-primary);
+  margin-bottom: 0.3rem;
+}
+.pipeline__content p {
+  font-size: 0.9rem;
+  color: var(--text-secondary);
+  margin-bottom: 0.3rem;
+}
+.pipeline__content code {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  background: var(--bg-code);
+  color: var(--accent-amber);
+  padding: 0.15rem 0.4rem;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+}
+
+/* --- Code blocks --- */
+pre {
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.25rem 1.5rem;
+  overflow-x: auto;
+  margin: 1.25rem 0;
+  position: relative;
+}
+pre code {
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  line-height: 1.65;
+  color: var(--text-secondary);
+  background: none;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+}
+pre .code-label {
+  position: absolute;
+  top: 0.5rem;
+  right: 0.75rem;
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+code {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  background: var(--bg-code);
+  color: var(--accent-amber);
+  padding: 0.15rem 0.45rem;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+}
+
+/* Syntax colors inside pre */
+.syn-key { color: var(--accent-blue); }
+.syn-str { color: var(--accent-green); }
+.syn-fn { color: var(--accent-amber); }
+.syn-cmt { color: var(--text-dim); font-style: italic; }
+.syn-num { color: var(--accent-purple); }
+.syn-op { color: var(--text-dim); }
+.syn-var { color: var(--accent-cyan); }
+
+/* --- Blockquote (TTS transcript) --- */
+blockquote {
+  background: linear-gradient(135deg, rgba(232,93,93,0.06), rgba(240,168,72,0.04));
+  border: 1px solid rgba(232,93,93,0.2);
+  border-left: 3px solid var(--accent-red);
+  border-radius: 8px;
+  padding: 1.25rem 1.5rem;
+  margin: 1.5rem 0;
+  position: relative;
+}
+blockquote::before {
+  content: 'TTS OUTPUT';
+  position: absolute;
+  top: -0.55rem;
+  left: 1.25rem;
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  font-weight: 600;
+  letter-spacing: 0.2em;
+  color: var(--accent-red);
+  background: var(--bg-deep);
+  padding: 0 0.5rem;
+}
+blockquote p {
+  color: var(--text-primary);
+  font-style: italic;
+  font-size: 0.95rem;
+  margin-bottom: 0;
+}
+
+/* --- Agent loop steps --- */
+.loop-steps {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.5rem;
+  margin: 1.5rem 0;
+}
+.loop-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
+  padding: 0.85rem 1.1rem;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  transition: border-color 0.2s, background 0.2s;
+}
+.loop-step:hover {
+  border-color: var(--border-glow);
+  background: var(--bg-elevated);
+}
+.loop-step__num {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: var(--accent-cyan);
+  background: rgba(78,205,196,0.1);
+  border: 1px solid rgba(78,205,196,0.2);
+  border-radius: 50%;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  margin-top: 0.1rem;
+}
+.loop-step__text {
+  font-size: 0.9rem;
+  color: var(--text-secondary);
+}
+.loop-step__text strong { color: var(--text-primary); }
+.loop-step__text code {
+  font-size: 0.78rem;
+}
+.loop-step--repeat {
+  border-style: dashed;
+  border-color: var(--text-dim);
+}
+.loop-step--repeat .loop-step__num {
+  color: var(--text-dim);
+  background: rgba(74,80,104,0.15);
+  border-color: rgba(74,80,104,0.3);
+}
+
+/* --- Incident timeline --- */
+.timeline {
+  margin: 1.5rem 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+.timeline__event {
+  display: flex;
+  gap: 1.25rem;
+  align-items: flex-start;
+}
+.timeline__gutter {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 16px;
+}
+.timeline__dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  position: relative;
+  z-index: 1;
+}
+.timeline__dot--warn { background: var(--accent-amber); box-shadow: 0 0 10px var(--glow-amber); }
+.timeline__dot--crit { background: var(--accent-red); box-shadow: 0 0 12px var(--glow-red); }
+.timeline__dot--cascade { background: var(--accent-red); box-shadow: 0 0 16px var(--glow-red); animation: pulse-red 2s infinite; }
+.timeline__line {
+  width: 2px;
+  flex-grow: 1;
+  min-height: 20px;
+  background: var(--border);
+}
+.timeline__body {
+  padding-bottom: 1.5rem;
+  flex: 1;
+}
+.timeline__time {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  margin-bottom: 0.2rem;
+}
+.timeline__title {
+  font-weight: 500;
+  font-size: 0.95rem;
+  color: var(--text-primary);
+  margin-bottom: 0.25rem;
+}
+.timeline__desc {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  line-height: 1.55;
+}
+
+@keyframes pulse-red {
+  0%, 100% { box-shadow: 0 0 8px var(--glow-red); }
+  50% { box-shadow: 0 0 20px rgba(232,93,93,0.4); }
+}
+
+/* --- Adapting table --- */
+.adapt-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1.5rem 0;
+  font-size: 0.88rem;
+}
+.adapt-table th {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  text-align: left;
+  padding: 0.75rem 1rem;
+  border-bottom: 2px solid var(--border);
+}
+.adapt-table td {
+  padding: 0.7rem 1rem;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-secondary);
+  vertical-align: top;
+}
+.adapt-table tr:last-child td { border-bottom: none; }
+.adapt-table tr:hover td { background: var(--bg-surface); }
+.adapt-table td:first-child { color: var(--text-primary); font-weight: 500; white-space: nowrap; }
+.adapt-table td code {
+  font-size: 0.78rem;
+}
+
+/* --- Tips list --- */
+.tips {
+  list-style: none;
+  margin: 1.5rem 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+.tips li {
+  padding: 1rem 1.25rem;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 0.9rem;
+  color: var(--text-secondary);
+  position: relative;
+  padding-left: 3rem;
+}
+.tips li::before {
+  content: attr(data-icon);
+  position: absolute;
+  left: 1rem;
+  top: 1rem;
+  font-size: 1rem;
+}
+.tips li strong { color: var(--text-primary); }
+
+/* --- Autonomous loop diagram --- */
+.auto-loop {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  grid-template-rows: auto auto auto;
+  gap: 1rem;
+  align-items: center;
+  justify-items: center;
+  margin: 2rem 0;
+}
+.auto-loop__box {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-glow);
+  border-radius: 10px;
+  padding: 1rem 1.5rem;
+  text-align: center;
+  width: 100%;
+}
+.auto-loop__box-label {
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  margin-bottom: 0.3rem;
+}
+.auto-loop__box-text {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+.auto-loop__arrow-text {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  text-align: center;
+}
+
+/* --- Footer --- */
+.footer {
+  margin-top: 4rem;
+  padding: 2.5rem 0;
+  border-top: 1px solid var(--border);
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 0.85rem;
+}
+.footer a { color: var(--text-secondary); }
+.footer a:hover { color: var(--accent-blue); }
+
+/* --- Responsive --- */
+@media (max-width: 700px) {
+  .page { padding: 0 1.25rem; }
+  .header { padding-top: 3rem; }
+  .header__title { font-size: 2rem; }
+  h2 { font-size: 1.6rem; }
+  .arch-flow { flex-direction: column; align-items: center; }
+  .arch-arrow { transform: rotate(90deg); padding: 0.25rem 0; min-width: auto; }
+  .diagram { padding: 1.5rem 1rem; }
+  .auto-loop { grid-template-columns: 1fr; }
+}
+
+/* --- Scroll animations --- */
+.reveal {
+  opacity: 0;
+  transform: translateY(20px);
+  transition: opacity 0.6s ease, transform 0.6s ease;
+}
+.reveal.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+</style>
+</head>
+<body>
+
+<div class="ambient ambient--blue"></div>
+<div class="ambient ambient--cyan"></div>
+<div class="ambient ambient--amber"></div>
+
+<div class="page">
+
+  <!-- HEADER -->
+  <header class="header">
+    <div class="header__eyebrow">speech-to-cli</div>
+    <h1 class="header__title">Background Log <em>Watcher</em> Pattern</h1>
+    <p class="header__subtitle">
+      Use a Claude Code background agent to monitor system logs in real-time
+      and announce anomalies aloud via TTS through the MCP protocol.
+    </p>
+    <div class="header__meta">
+      <span>March 2026</span>
+      <a href="https://github.com/jphein/speech-to-cli">GitHub</a>
+      <a href="https://github.com/jphein/kiyo-xhci-fix">Origin: kiyo-xhci-fix</a>
+    </div>
+  </header>
+
+  <!-- OVERVIEW -->
+  <section class="reveal">
+    <div class="section-label">Overview</div>
+    <h2>What This Is</h2>
+    <p>
+      A background Claude Code agent tails a log source (e.g. <code>journalctl -k -f</code>),
+      pattern-matches for concerning events, and calls the <code>speak</code> MCP tool to deliver
+      audio alerts &mdash; all while the main conversation continues working normally.
+    </p>
+    <div class="insight">
+      <p>
+        <strong>No HTTP API is involved.</strong> The agent calls <code>speak</code> as an MCP tool &mdash;
+        the same mechanism Claude Code uses for all its tools. The speech-to-cli MCP server runs as a
+        subprocess of Claude Code, communicating over <strong>stdio JSON-RPC</strong>.
+      </p>
+    </div>
+    <p>
+      The main agent can read the watcher's output file at any time to see what was detected
+      and act on it autonomously.
+    </p>
+  </section>
+
+  <!-- ARCHITECTURE -->
+  <section class="reveal">
+    <div class="section-label">Architecture</div>
+    <h2>How the Pieces Fit Together</h2>
+
+    <div class="diagram">
+      <div class="diagram__title">System Architecture</div>
+      <div class="arch-flow">
+        <div class="arch-node arch-node--main">
+          <div class="arch-node__label">Foreground</div>
+          <div class="arch-node__title">Main Claude Code</div>
+          <div class="arch-node__desc">Your conversation. Spawns the watcher, continues working independently.</div>
+        </div>
+
+        <div class="arch-arrow">
+          <div class="arch-arrow__label">Agent tool</div>
+          <div class="arch-arrow__line"></div>
+          <div class="arch-arrow__label">background: true</div>
+        </div>
+
+        <div class="arch-node arch-node--agent">
+          <div class="arch-node__label">Background</div>
+          <div class="arch-node__title">Watcher Agent</div>
+          <div class="arch-node__desc">Separate subprocess with own context window.</div>
+          <ul class="arch-node__list">
+            <li>tails log source</li>
+            <li>polls every ~30s</li>
+            <li>speaks on anomaly</li>
+          </ul>
+        </div>
+
+        <div class="arch-arrow">
+          <div class="arch-arrow__label">MCP tool call</div>
+          <div class="arch-arrow__line"></div>
+          <div class="arch-arrow__label">stdio JSON-RPC</div>
+        </div>
+
+        <div class="arch-node arch-node--mcp">
+          <div class="arch-node__label">MCP Server</div>
+          <div class="arch-node__title">speech-to-cli</div>
+          <div class="arch-node__desc">Routes speak() calls through Azure TTS to PipeWire.</div>
+          <ul class="arch-node__list">
+            <li>mcp_speech.py</li>
+            <li>handle_request()</li>
+            <li>speech_tts.tts()</li>
+          </ul>
+        </div>
+
+        <div class="arch-arrow">
+          <div class="arch-arrow__label">HTTP POST</div>
+          <div class="arch-arrow__line"></div>
+          <div class="arch-arrow__label">48kHz audio</div>
+        </div>
+
+        <div class="arch-node arch-node--azure">
+          <div class="arch-node__label">Cloud</div>
+          <div class="arch-node__title">Azure TTS</div>
+          <div class="arch-node__desc">Cognitive Services endpoint returns PCM audio stream.</div>
+        </div>
+      </div>
+    </div>
+
+    <p style="text-align: center; margin-top: -0.5rem;">
+      <span style="font-family: var(--font-mono); font-size: 0.75rem; color: var(--text-dim);">
+        Audio plays through PipeWire (pw-cat) &rarr; your speakers
+      </span>
+    </p>
+  </section>
+
+  <!-- DATA FLOW -->
+  <section class="reveal">
+    <div class="section-label">Internals</div>
+    <h2>Data Flow for a speak() Call</h2>
+    <p>When the background agent decides to announce something, here's the exact chain:</p>
+
+    <div class="pipeline">
+      <div class="pipeline__step">
+        <div class="pipeline__gutter">
+          <div class="pipeline__number pipeline__number--blue">1</div>
+          <div class="pipeline__wire"></div>
+        </div>
+        <div class="pipeline__content">
+          <h4>Agent LLM generates tool_use</h4>
+          <p>The model outputs a structured tool call in its response.</p>
+          <pre><code><span class="syn-op">{</span><span class="syn-key">"name"</span><span class="syn-op">:</span> <span class="syn-str">"mcp__speech-to-cli__speak"</span><span class="syn-op">,</span>
+ <span class="syn-key">"input"</span><span class="syn-op">:</span> <span class="syn-op">{</span><span class="syn-key">"text"</span><span class="syn-op">:</span> <span class="syn-str">"Critical: xHCI controller died"</span><span class="syn-op">,</span>
+           <span class="syn-key">"voice"</span><span class="syn-op">:</span> <span class="syn-str">"en-US-DavisNeural"</span><span class="syn-op">}}</span></code></pre>
+        </div>
+      </div>
+
+      <div class="pipeline__step">
+        <div class="pipeline__gutter">
+          <div class="pipeline__number pipeline__number--cyan">2</div>
+          <div class="pipeline__wire"></div>
+        </div>
+        <div class="pipeline__content">
+          <h4>Claude Code harness serializes to JSON-RPC</h4>
+          <p>The harness translates the tool call to MCP protocol over <strong>stdio</strong>.</p>
+          <pre><code><span class="syn-op">{</span><span class="syn-key">"method"</span><span class="syn-op">:</span> <span class="syn-str">"tools/call"</span><span class="syn-op">,</span>
+ <span class="syn-key">"params"</span><span class="syn-op">:</span> <span class="syn-op">{</span><span class="syn-key">"name"</span><span class="syn-op">:</span> <span class="syn-str">"speak"</span><span class="syn-op">,</span> <span class="syn-key">"arguments"</span><span class="syn-op">:</span> <span class="syn-op">{...}}}</span></code></pre>
+        </div>
+      </div>
+
+      <div class="pipeline__step">
+        <div class="pipeline__gutter">
+          <div class="pipeline__number pipeline__number--purple">3</div>
+          <div class="pipeline__wire"></div>
+        </div>
+        <div class="pipeline__content">
+          <h4>mcp_speech.py routes to tts()</h4>
+          <p><code>handle_request()</code> receives on stdin, dispatches to <code>speech_tts.tts()</code>.</p>
+        </div>
+      </div>
+
+      <div class="pipeline__step">
+        <div class="pipeline__gutter">
+          <div class="pipeline__number pipeline__number--purple">4</div>
+          <div class="pipeline__wire"></div>
+        </div>
+        <div class="pipeline__content">
+          <h4>_prepare_tts() builds SSML</h4>
+          <p>Constructs the XML payload with voice, rate, and pitch parameters.</p>
+        </div>
+      </div>
+
+      <div class="pipeline__step">
+        <div class="pipeline__gutter">
+          <div class="pipeline__number pipeline__number--amber">5</div>
+          <div class="pipeline__wire"></div>
+        </div>
+        <div class="pipeline__content">
+          <h4>HTTP POST to Azure TTS</h4>
+          <p>Cognitive Services endpoint returns a <strong>48kHz PCM audio stream</strong>.</p>
+        </div>
+      </div>
+
+      <div class="pipeline__step">
+        <div class="pipeline__gutter">
+          <div class="pipeline__number pipeline__number--green">6</div>
+        </div>
+        <div class="pipeline__content">
+          <h4>Audio piped to pw-cat</h4>
+          <p>PipeWire player streams directly to your speakers. You hear it.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="insight">
+      <p>
+        The agent never touches HTTP directly. The MCP protocol abstracts the entire
+        Azure TTS pipeline &mdash; the agent just calls <code>speak</code> like any other tool.
+      </p>
+    </div>
+  </section>
+
+  <!-- HOW TO LAUNCH -->
+  <section class="reveal">
+    <div class="section-label">Usage</div>
+    <h2>How to Launch</h2>
+    <p>From the main Claude Code conversation, use the Agent tool:</p>
+    <pre><code><span class="syn-key">Agent tool call:</span>
+  <span class="syn-var">description</span><span class="syn-op">:</span> <span class="syn-str">"Watch [system] logs and speak alerts"</span>
+  <span class="syn-var">name</span><span class="syn-op">:</span> <span class="syn-str">"my-watcher"</span>
+  <span class="syn-var">run_in_background</span><span class="syn-op">:</span> <span class="syn-num">true</span>
+  <span class="syn-var">prompt</span><span class="syn-op">: |</span>
+    You are a [SYSTEM] log monitor. Your job is to tail [LOG_SOURCE]
+    for [SPECIFIC EVENTS] and use the speech MCP tool to announce
+    anything concerning.
+
+    Steps:
+    <span class="syn-num">1.</span> Use the speak tool to announce: "[System] log watcher online."
+    <span class="syn-num">2.</span> Run [LOG_COMMAND] in the background via Bash
+    <span class="syn-num">3.</span> Every ~30 seconds, check the output for anomalies
+    <span class="syn-num">4.</span> On anomaly: announce via speak tool with a brief summary
+    <span class="syn-num">5.</span> On normal: stay quiet &mdash; only speak when something is wrong
+    <span class="syn-num">6.</span> Keep monitoring indefinitely
+
+    Use the <span class="syn-fn">mcp__speech-to-cli__speak</span> tool for announcements.
+    Keep them short and clear.<span class="code-label">YAML-ish</span></code></pre>
+
+    <h3>What the Agent Actually Does</h3>
+    <p>
+      The background agent is a separate Claude Code subprocess with its own context window.
+      It has access to the same tools as the main conversation (Bash, MCP tools, etc.) but runs independently.
+    </p>
+
+    <div class="loop-steps">
+      <div class="loop-step">
+        <div class="loop-step__num">1</div>
+        <div class="loop-step__text"><strong>ToolSearch</strong> for <code>"speak speech"</code> &mdash; MCP tools are deferred, so the agent fetches the schema first</div>
+      </div>
+      <div class="loop-step">
+        <div class="loop-step__num">2</div>
+        <div class="loop-step__text"><strong>speak()</strong> &mdash; announces itself: &ldquo;USB log watcher online.&rdquo;</div>
+      </div>
+      <div class="loop-step">
+        <div class="loop-step__num">3</div>
+        <div class="loop-step__text"><strong>Bash</strong> with <code>run_in_background: true</code> &mdash; starts <code>journalctl -k -f</code> writing to a temp file</div>
+      </div>
+      <div class="loop-step">
+        <div class="loop-step__num">4</div>
+        <div class="loop-step__text"><strong>Bash</strong> with <code>sleep 30 && tail -10 &lt;output&gt;</code> &mdash; polls the journalctl output</div>
+      </div>
+      <div class="loop-step">
+        <div class="loop-step__num">5</div>
+        <div class="loop-step__text"><strong>LLM reasoning</strong> &mdash; reads the tail output, decides if anything is anomalous</div>
+      </div>
+      <div class="loop-step">
+        <div class="loop-step__num">6</div>
+        <div class="loop-step__text"><strong>speak()</strong> on anomaly &mdash; announces what it found, with context</div>
+      </div>
+      <div class="loop-step loop-step--repeat">
+        <div class="loop-step__num">&hookleftarrow;</div>
+        <div class="loop-step__text">Loop back to step 4 &mdash; runs indefinitely until killed</div>
+      </div>
+    </div>
+
+    <p>
+      The polling pattern (<code>sleep 30 && tail</code>) is crude but effective.
+      The agent doesn't have access to inotify or event-driven log watching,
+      so it simulates it with periodic checks.
+    </p>
+  </section>
+
+  <!-- REAL WORLD EXAMPLE -->
+  <section class="reveal">
+    <div class="section-label">Case Study</div>
+    <h2>USB/xHCI Monitor &mdash; Real Crash Detection</h2>
+    <p>
+      Used during the <a href="https://github.com/jphein/kiyo-xhci-fix">kiyo-xhci-fix</a> project
+      to monitor for USB controller crashes caused by a Razer Kiyo Pro firmware bug.
+    </p>
+
+    <pre><code><span class="syn-var">prompt</span><span class="syn-op">: |</span>
+  You are a USB log monitor. Tail the kernel logs for USB-related
+  events and use the speech MCP tool to announce any concerning
+  USB events (errors, resets, disconnects, watchdog triggers,
+  xhci failures).
+
+  <span class="syn-num">1.</span> Announce: <span class="syn-str">"USB log watcher online. Monitoring for anomalies."</span>
+  <span class="syn-num">2.</span> Run: <span class="syn-fn">journalctl -k -f --grep='usb|xhci|USB' --no-pager</span>
+  <span class="syn-num">3.</span> Check output every ~30 seconds
+  <span class="syn-num">4.</span> Announce anomalies: <span class="syn-str">"Warning: USB controller reset detected"</span>
+  <span class="syn-num">5.</span> Stay quiet on normal traffic
+  <span class="syn-num">6.</span> Monitor indefinitely<span class="code-label">Prompt</span></code></pre>
+
+    <h3>Incident Timeline &mdash; March 21, 2026</h3>
+    <p>
+      The agent ran for ~30 minutes during USB stress testing and caught a full
+      xHCI controller death in real time:
+    </p>
+
+    <div class="timeline">
+      <div class="timeline__event">
+        <div class="timeline__gutter">
+          <div class="timeline__dot timeline__dot--warn"></div>
+          <div class="timeline__line"></div>
+        </div>
+        <div class="timeline__body">
+          <div class="timeline__time">13:17</div>
+          <div class="timeline__title">TRB Warnings (Precursor)</div>
+          <div class="timeline__desc">
+            <code>WARN Event TRB for slot 16 ep 2 with no TDs queued?</code><br>
+            Repeated 7 times over 5 seconds. The xHCI controller is struggling with
+            stalled endpoints on the Razer Kiyo Pro.
+          </div>
+        </div>
+      </div>
+
+      <div class="timeline__event">
+        <div class="timeline__gutter">
+          <div class="timeline__dot timeline__dot--crit"></div>
+          <div class="timeline__line"></div>
+        </div>
+        <div class="timeline__body">
+          <div class="timeline__time">13:30:57</div>
+          <div class="timeline__title">Controller Death</div>
+          <div class="timeline__desc">
+            <code>xHCI host not responding to stop endpoint command</code><br>
+            <code>xHCI host controller not responding, assume dead</code><br>
+            <code>HC died; cleaning up</code><br>
+            13 minutes after the TRB warnings, the controller gives up entirely.
+          </div>
+        </div>
+      </div>
+
+      <div class="timeline__event">
+        <div class="timeline__gutter">
+          <div class="timeline__dot timeline__dot--cascade"></div>
+        </div>
+        <div class="timeline__body">
+          <div class="timeline__time">13:30:57 (same second)</div>
+          <div class="timeline__title">Cascade Disconnect &mdash; 15 Devices</div>
+          <div class="timeline__desc">
+            Every USB device on both bus 1 and bus 2 disconnected simultaneously:
+            keyboard, mouse, Logitech receiver, Razer webcam, Bluetooth adapter,
+            audio interface, USB storage. Total loss of USB input.
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <h3>The Agent's Actual TTS Announcement</h3>
+    <blockquote>
+      <p>
+        &ldquo;Critical alert! The xHCI USB host controller has died. The kernel reports:
+        host controller not responding, assume dead, cleaning up. All USB devices on both
+        bus 1 and bus 2 have disconnected simultaneously. This includes keyboard, mouse,
+        Logitech receiver, Razer webcam, USB storage, Bluetooth, and audio devices. Total
+        of 15 device disconnects. You have lost all USB input. The earlier TRB warnings
+        at 13:17 were a precursor to this failure.&rdquo;
+      </p>
+    </blockquote>
+    <p>It then continued polling for recovery events every 30 seconds.</p>
+  </section>
+
+  <!-- READING OUTPUT -->
+  <section class="reveal">
+    <div class="section-label">Observability</div>
+    <h2>Reading Watcher Output</h2>
+    <p>The main agent can check what the watcher reported:</p>
+    <pre><code><span class="syn-cmt"># Read the agent's full transcript (JSONL)</span>
+cat /tmp/claude-*/tasks/<span class="syn-var">&lt;agent-id&gt;</span>.output
+
+<span class="syn-cmt"># Extract just the speak messages</span>
+grep -o <span class="syn-str">'"text":"[^"]*"'</span> /tmp/claude-*/tasks/<span class="syn-var">&lt;agent-id&gt;</span>.output | tail -<span class="syn-num">10</span>
+
+<span class="syn-cmt"># Or use the TaskOutput tool from within Claude Code</span>
+<span class="syn-fn">TaskOutput</span>: <span class="syn-var">agent-id</span><span class="code-label">bash</span></code></pre>
+  </section>
+
+  <!-- AUTONOMOUS LOOP -->
+  <section class="reveal">
+    <div class="section-label">Pattern</div>
+    <h2>Autonomous Response Loop</h2>
+    <p>
+      The powerful pattern: the main agent reads the watcher output and acts on it
+      without human intervention.
+    </p>
+
+    <div class="diagram">
+      <div class="diagram__title">Detect &rarr; Alert &rarr; Investigate &rarr; Fix</div>
+      <div class="auto-loop">
+        <div class="auto-loop__box" style="border-color: var(--accent-cyan);">
+          <div class="auto-loop__box-label" style="color: var(--accent-cyan);">Background</div>
+          <div class="auto-loop__box-text">Watcher Agent detects anomaly in kernel logs</div>
+        </div>
+        <div class="auto-loop__arrow-text">&xrarr; TTS alert<br>&xrarr; output file</div>
+        <div class="auto-loop__box" style="border-color: var(--accent-amber);">
+          <div class="auto-loop__box-label" style="color: var(--accent-amber);">Human</div>
+          <div class="auto-loop__box-text">Hears the spoken alert through speakers</div>
+        </div>
+
+        <div></div>
+        <div class="auto-loop__arrow-text">&darr; &ldquo;check the watcher&rdquo;</div>
+        <div></div>
+
+        <div class="auto-loop__box" style="border-color: var(--accent-blue); grid-column: 1 / -1;">
+          <div class="auto-loop__box-label" style="color: var(--accent-blue);">Foreground</div>
+          <div class="auto-loop__box-text">Main Agent reads output &rarr; investigates &rarr; fixes issue &rarr; deploys</div>
+        </div>
+      </div>
+    </div>
+
+    <p>
+      <strong>Caveat:</strong> Background agents don't push notifications to the main agent &mdash;
+      they only report back when they complete or are killed. The main agent must proactively read
+      the output file (or the user can tell it to check).
+    </p>
+  </section>
+
+  <!-- ADAPTING -->
+  <section class="reveal">
+    <div class="section-label">Adapt</div>
+    <h2>Other Log Sources</h2>
+
+    <table class="adapt-table">
+      <thead>
+        <tr><th>Use Case</th><th>Log Command</th><th>Watch For</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>USB / xHCI</td>
+          <td><code>journalctl -k -f</code></td>
+          <td><code>HC died</code>, <code>not responding</code>, <code>disconnect</code></td>
+        </tr>
+        <tr>
+          <td>systemd service</td>
+          <td><code>journalctl -u myservice -f</code></td>
+          <td><code>error</code>, <code>failed</code>, <code>timeout</code></td>
+        </tr>
+        <tr>
+          <td>Nginx</td>
+          <td><code>tail -f /var/log/nginx/error.log</code></td>
+          <td><code>502</code>, <code>upstream timed out</code></td>
+        </tr>
+        <tr>
+          <td>Kubernetes</td>
+          <td><code>kubectl logs -f deploy/myapp</code></td>
+          <td><code>OOMKilled</code>, <code>CrashLoopBackOff</code></td>
+        </tr>
+        <tr>
+          <td>Docker</td>
+          <td><code>docker logs -f container</code></td>
+          <td><code>ERROR</code>, <code>FATAL</code>, stack traces</td>
+        </tr>
+        <tr>
+          <td>Build system</td>
+          <td><code>tail -f build.log</code></td>
+          <td><code>FAILED</code>, <code>error:</code>, non-zero exit</td>
+        </tr>
+        <tr>
+          <td>Network / firewall</td>
+          <td><code>logread -f</code> (OpenWrt)</td>
+          <td><code>DROP</code>, <code>REJECT</code>, zone violations</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- TIPS -->
+  <section class="reveal">
+    <div class="section-label">Guidance</div>
+    <h2>Tips</h2>
+    <ul class="tips">
+      <li data-icon="&#x1F3AF;">
+        <strong>Be specific in the prompt</strong> about what's anomalous vs. normal &mdash; reduces false positive announcements.
+      </li>
+      <li data-icon="&#x1F507;">
+        <strong>Stay quiet on normal</strong> &mdash; constant &ldquo;all clear&rdquo; announcements are annoying.
+        Only speak when something is wrong.
+      </li>
+      <li data-icon="&#x1F50D;">
+        <strong>The agent needs ToolSearch first</strong> &mdash; MCP tools are deferred, so the prompt should reference
+        the tool name (<code>mcp__speech-to-cli__speak</code>) but the agent will fetch the schema itself.
+      </li>
+      <li data-icon="&#x1F517;">
+        <strong>Background agents don't push notifications</strong> &mdash; since watchers run indefinitely,
+        the main agent must proactively read the output file.
+      </li>
+      <li data-icon="&#x1F3A4;">
+        <strong>Voice choice matters</strong> &mdash; <code>en-US-DavisNeural</code> works well for alerts (clear, authoritative);
+        consider <code>en-US-AvaNeural</code> for softer notifications.
+      </li>
+      <li data-icon="&#x23F1;">
+        <strong>Poll interval tradeoff</strong> &mdash; 30 seconds is a good default; shorter catches events faster
+        but burns more LLM tokens on empty polls.
+      </li>
+      <li data-icon="&#x1F9D1;">
+        <strong>The user is the bridge</strong> &mdash; they hear the TTS and can tell the main agent
+        &ldquo;check the watcher&rdquo; until the main agent learns to check periodically.
+      </li>
+    </ul>
+  </section>
+
+  <footer class="footer">
+    <p>
+      Part of <a href="https://github.com/jphein/speech-to-cli">speech-to-cli</a> &mdash;
+      MCP server for voice I/O via Azure Speech Services.
+    </p>
+    <p style="margin-top: 0.5rem; font-size: 0.78rem;">
+      Pattern discovered during <a href="https://github.com/jphein/kiyo-xhci-fix">kiyo-xhci-fix</a>
+      USB crash debugging, March 2026.
+    </p>
+  </footer>
+
+</div>
+
+<script>
+// Scroll-triggered reveal animations with staggered delay
+const reveals = document.querySelectorAll('.reveal');
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach(entry => {
+    if (entry.isIntersecting) {
+      entry.target.classList.add('visible');
+    }
+  });
+}, { threshold: 0.08, rootMargin: '0px 0px -20px 0px' });
+
+reveals.forEach((el, i) => {
+  el.style.transitionDelay = `${i * 0.05}s`;
+  observer.observe(el);
+});
+
+// Ensure above-fold content is visible immediately
+requestAnimationFrame(() => {
+  reveals.forEach(el => {
+    const rect = el.getBoundingClientRect();
+    if (rect.top < window.innerHeight) {
+      el.classList.add('visible');
+    }
+  });
+});
+</script>
+</body>
+</html>
