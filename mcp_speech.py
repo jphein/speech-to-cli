@@ -18,6 +18,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 
 import state
 from state import (CONFIG, HAS_WS, DEFAULTS_PATH, _SCRIPT_DIR,
@@ -29,6 +30,11 @@ from audio import (_generate_chimes, _refresh_audio_detection, _prewarm_all,
                    _build_player_cmd, _build_rec_cmd)
 from stt import stt, _get_stt_ws, _invalidate_stt_ws
 from speech_tts import tts, multi_speak, multi_speak_stream, talk_fullduplex, get_voices
+
+# Voice list cache (fetched once per session, voices don't change)
+_voices_cache = None
+_voices_cache_time = 0.0
+_VOICES_CACHE_TTL = 3600  # 1 hour
 
 
 # ---------------------------------------------------------------------------
@@ -395,7 +401,10 @@ def handle_request(req):
             "jsonrpc": "2.0", "id": req_id,
             "result": {
                 "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {"listChanged": True}},
+                "capabilities": {
+                    "tools": {"listChanged": True},
+                    "resources": {"listChanged": True},
+                },
                 "serverInfo": {"name": "azure-speech", "version": "4.3.0"},
             },
         }
@@ -850,24 +859,37 @@ def handle_request(req):
                 "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"},
             }
     elif method == "resources/list":
+        resources = [
+            {
+                "uri": "speech://readme",
+                "name": "Speech-to-CLI Documentation",
+                "description": "Complete README with features, usage, and configuration.",
+                "mimeType": "text/markdown"
+            },
+            {
+                "uri": "speech://config",
+                "name": "Current Configuration",
+                "description": "Live configuration settings (API key masked). Read-only snapshot — use the configure tool to change settings.",
+                "mimeType": "application/json"
+            },
+            {
+                "uri": "speech://voices",
+                "name": "Available Voices",
+                "description": "Azure Speech voices for the current region. Cached for 1 hour.",
+                "mimeType": "application/json"
+            },
+        ]
+        save_dir = CONFIG.get("save_audio_dir")
+        if save_dir and os.path.isdir(os.path.expanduser(save_dir)):
+            resources.append({
+                "uri": "speech://recordings",
+                "name": "Saved Recordings",
+                "description": f"Audio files saved in {save_dir}.",
+                "mimeType": "application/json"
+            })
         return {
             "jsonrpc": "2.0", "id": req_id,
-            "result": {
-                "resources": [
-                    {
-                        "uri": "speech://readme",
-                        "name": "Speech-to-CLI Documentation",
-                        "description": "The complete README and documentation for the speech-to-cli MCP server, including features, usage, and configuration.",
-                        "mimeType": "text/markdown"
-                    },
-                    {
-                        "uri": "speech://config-schema",
-                        "name": "Configuration Schema",
-                        "description": "The current configuration settings loaded by the MCP server.",
-                        "mimeType": "application/json"
-                    }
-                ]
-            }
+            "result": {"resources": resources}
         }
     elif method == "resources/read":
         uri = params.get("uri")
@@ -881,27 +903,104 @@ def handle_request(req):
             return {
                 "jsonrpc": "2.0", "id": req_id,
                 "result": {
-                    "contents": [
-                        {
-                            "uri": uri,
-                            "mimeType": "text/markdown",
-                            "text": content
-                        }
-                    ]
+                    "contents": [{
+                        "uri": uri,
+                        "mimeType": "text/markdown",
+                        "text": content
+                    }]
                 }
             }
-        elif uri == "speech://config-schema":
-            safe_config = {k: ("***" if k == "key" else v) for k, v in CONFIG.items()}
+        elif uri == "speech://config":
+            safe_config = {k: ("***" if k in ("key", "tts_key") else v)
+                          for k, v in CONFIG.items()
+                          if not k.startswith("_")}
             return {
                 "jsonrpc": "2.0", "id": req_id,
                 "result": {
-                    "contents": [
-                        {
+                    "contents": [{
+                        "uri": uri,
+                        "mimeType": "application/json",
+                        "text": json.dumps(safe_config, indent=2, default=str)
+                    }]
+                }
+            }
+        elif uri == "speech://voices":
+            global _voices_cache, _voices_cache_time
+            now = time.time()
+            if _voices_cache is None or (now - _voices_cache_time) > _VOICES_CACHE_TTL:
+                raw = get_voices()
+                if isinstance(raw, list):
+                    _voices_cache = raw
+                    _voices_cache_time = now
+                else:
+                    return {
+                        "jsonrpc": "2.0", "id": req_id,
+                        "result": {
+                            "contents": [{
+                                "uri": uri,
+                                "mimeType": "application/json",
+                                "text": json.dumps({"error": raw.get("error", "Unknown error")})
+                            }]
+                        }
+                    }
+            compact = [
+                {
+                    "name": v["ShortName"],
+                    "gender": v.get("Gender", ""),
+                    "locale": v.get("LocaleName", ""),
+                    "type": v.get("VoiceType", ""),
+                }
+                for v in _voices_cache
+            ]
+            return {
+                "jsonrpc": "2.0", "id": req_id,
+                "result": {
+                    "contents": [{
+                        "uri": uri,
+                        "mimeType": "application/json",
+                        "text": json.dumps(compact, indent=2)
+                    }]
+                }
+            }
+        elif uri == "speech://recordings":
+            save_dir = CONFIG.get("save_audio_dir")
+            if not save_dir:
+                return {
+                    "jsonrpc": "2.0", "id": req_id,
+                    "result": {
+                        "contents": [{
                             "uri": uri,
                             "mimeType": "application/json",
-                            "text": json.dumps(safe_config, indent=2)
-                        }
-                    ]
+                            "text": json.dumps({"error": "save_audio_dir not configured"})
+                        }]
+                    }
+                }
+            save_dir = os.path.expanduser(save_dir)
+            files = []
+            if os.path.isdir(save_dir):
+                for fname in sorted(os.listdir(save_dir), reverse=True):
+                    if fname.endswith((".mp3", ".wav")):
+                        fpath = os.path.join(save_dir, fname)
+                        stat = os.stat(fpath)
+                        files.append({
+                            "name": fname,
+                            "path": fpath,
+                            "size_bytes": stat.st_size,
+                            "modified": time.strftime('%Y-%m-%dT%H:%M:%SZ',
+                                                      time.gmtime(stat.st_mtime)),
+                        })
+            return {
+                "jsonrpc": "2.0", "id": req_id,
+                "result": {
+                    "contents": [{
+                        "uri": uri,
+                        "mimeType": "application/json",
+                        "text": json.dumps({
+                            "directory": save_dir,
+                            "count": len(files),
+                            "files": files[:100],
+                        }, indent=2)
+                    }]
                 }
             }
         else:
