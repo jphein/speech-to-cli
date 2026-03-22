@@ -36,9 +36,10 @@ def get_text():
 def synthesize(text, key, region, voice):
     """Send text to Azure TTS, return audio bytes."""
     url = f"https://{region}.tts.speech.microsoft.com/cognitiveservices/v1"
+    safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
     ssml = (
         f'<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US">'
-        f'<voice name="{voice}">{text}</voice></speak>'
+        f'<voice name="{voice}">{safe}</voice></speak>'
     )
     headers = {
         "Ocp-Apim-Subscription-Key": key,

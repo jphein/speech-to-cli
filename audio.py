@@ -508,7 +508,9 @@ def _quick_stt(raw_frames):
     raw_data = b"".join(raw_frames)
     if not raw_data or len(raw_data) < state.FRAME_BYTES * 3:
         return ""
-    wav_path = _tempfile.mktemp(suffix=".wav")
+    _tmp = _tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    wav_path = _tmp.name
+    _tmp.close()
     try:
         write_wav(wav_path, raw_data)
         url = (f"https://{CONFIG['region']}.stt.speech.microsoft.com"
