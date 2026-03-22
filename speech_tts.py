@@ -35,6 +35,66 @@ if HAS_VAD:
 
 
 # ---------------------------------------------------------------------------
+# Audio file saving
+# ---------------------------------------------------------------------------
+
+def _auto_output_file():
+    """Generate an auto-save file path from save_audio_dir config, or None."""
+    save_dir = CONFIG.get("save_audio_dir")
+    if not save_dir:
+        return None
+    save_dir = os.path.expanduser(save_dir)
+    os.makedirs(save_dir, exist_ok=True)
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    return os.path.join(save_dir, f"tts_{ts}.mp3")
+
+
+def _save_audio_file(pcm_data, sample_rate, output_file):
+    """Save raw PCM audio data to a file. Supports .mp3 (via ffmpeg) and .wav.
+
+    Returns dict with file path, duration, and size on success, or None on failure.
+    """
+    if not pcm_data or not output_file:
+        return None
+
+    output_file = os.path.expanduser(output_file)
+    parent = os.path.dirname(output_file)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    ext = os.path.splitext(output_file)[1].lower()
+
+    if ext == ".wav":
+        import wave
+        with wave.open(output_file, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(pcm_data)
+    else:
+        if not ext:
+            output_file += ".mp3"
+        try:
+            proc = subprocess.Popen(
+                ["ffmpeg", "-y", "-f", "s16le", "-ar", str(sample_rate), "-ac", "1",
+                 "-i", "pipe:0", "-codec:a", "libmp3lame", "-q:a", "2", output_file],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            proc.communicate(pcm_data, timeout=60)
+            if proc.returncode != 0:
+                return None
+        except Exception:
+            return None
+
+    duration = len(pcm_data) / (sample_rate * 2)
+    try:
+        size = os.path.getsize(output_file)
+    except OSError:
+        size = 0
+    return {"file": output_file, "duration_seconds": round(duration, 1), "size_bytes": size}
+
+
+# ---------------------------------------------------------------------------
 # TTS helpers
 # ---------------------------------------------------------------------------
 
@@ -128,15 +188,18 @@ def _build_multi_voice_ssml(segments, quality="fast"):
     )
 
 
-def multi_speak_stream(segments, quality="fast", progress_token=None):
+def multi_speak_stream(segments, quality="fast", progress_token=None, output_file=None):
     """Stream multi-voice TTS in a SINGLE request using Azure's multi-voice SSML.
 
     Much faster than multi_speak - one API call instead of N calls.
     Voices switch automatically within the audio stream.
+    If output_file is set, saves audio to that path (MP3 or WAV) alongside playback.
     """
     stop_hum()
     if not segments:
         return {"error": "No segments"}
+    if not output_file:
+        output_file = _auto_output_file()
 
     send_progress(progress_token, 1, 100, "🔊 Building multi-voice SSML...")
 
@@ -186,6 +249,7 @@ def multi_speak_stream(segments, quality="fast", progress_token=None):
     start_time = time.time()
     _ms_show_subs = CONFIG.get("live_subtitles", True)
     _ms_window = max(40, _get_tty_width() - 25)
+    save_buf = bytearray() if output_file else None
 
     # Combine all text for subtitle display
     all_text = " | ".join(seg.get("text", "")[:100] for seg in segments if seg.get("text"))
@@ -201,6 +265,8 @@ def multi_speak_stream(segments, quality="fast", progress_token=None):
                     bytes_written += len(chunk)
                 except (BrokenPipeError, OSError):
                     break
+                if save_buf is not None:
+                    save_buf.extend(chunk)
 
             # Update progress based on time elapsed
             elapsed = time.time() - start_time
@@ -231,19 +297,33 @@ def multi_speak_stream(segments, quality="fast", progress_token=None):
         unregister_proc(proc)
 
     _mark_tts_end()
+
+    # Save to file if requested
+    saved = None
+    if save_buf is not None and len(save_buf) > 0:
+        saved = _save_audio_file(bytes(save_buf), tts_rate, output_file)
+
     send_progress(progress_token, 100, 100, f"🔊 Done — {len(segments)} voices")
-    return {"spoken": len(segments), "bytes": bytes_written, "streamed": True}
+    result = {"spoken": len(segments), "bytes": bytes_written, "streamed": True}
+    if saved:
+        result["output_file"] = saved["file"]
+        result["duration_seconds"] = saved["duration_seconds"]
+        result["size_bytes"] = saved["size_bytes"]
+    return result
 
 
 # ---------------------------------------------------------------------------
 # multi_speak
 # ---------------------------------------------------------------------------
 
-def multi_speak(segments, quality="fast", progress_token=None):
-    """Speak multiple text+voice segments. TTS requests fire in parallel, playback is sequential."""
+def multi_speak(segments, quality="fast", progress_token=None, output_file=None):
+    """Speak multiple text+voice segments. TTS requests fire in parallel, playback is sequential.
+    If output_file is set, saves concatenated audio to that path (MP3 or WAV) alongside playback."""
     stop_hum()
     if not segments:
         return {"error": "No segments"}
+    if not output_file:
+        output_file = _auto_output_file()
 
     send_progress(progress_token, 1, 100, "🔊 Starting...")
 
@@ -346,6 +426,16 @@ def multi_speak(segments, quality="fast", progress_token=None):
         pct = seg_target
         send_progress(progress_token, pct, 100, f"🔊 Played {i + 1}/{n_seg}")
 
+    # Save to file if requested
+    saved = None
+    if output_file:
+        combined = bytearray()
+        for audio in audio_buffers:
+            if audio:
+                combined.extend(audio)
+        if combined:
+            saved = _save_audio_file(bytes(combined), tts_rate, output_file)
+
     # Show last segment text so subtitles persist
     last_text = ""
     for seg in reversed(segments):
@@ -354,21 +444,29 @@ def multi_speak(segments, quality="fast", progress_token=None):
             last_text = _colorize(seg["text"], last_color)
             break
     send_progress(progress_token, 100, 100, f"🔊 {last_text}" if last_text else f"🔊 Done — {spoken} segments")
-    return {"spoken": spoken}
+    result = {"spoken": spoken}
+    if saved:
+        result["output_file"] = saved["file"]
+        result["duration_seconds"] = saved["duration_seconds"]
+        result["size_bytes"] = saved["size_bytes"]
+    return result
 
 
 # ---------------------------------------------------------------------------
 # tts (single segment, streaming playback)
 # ---------------------------------------------------------------------------
 
-def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="default", progress_token=None, subtitle_color=None, audio_level_cb=None):
-    """Speak text aloud via Azure TTS with streaming playback."""
+def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="default", progress_token=None, subtitle_color=None, audio_level_cb=None, output_file=None):
+    """Speak text aloud via Azure TTS with streaming playback.
+    If output_file is set, saves audio to that path (MP3 or WAV) alongside playback."""
     stop_hum()
     send_progress(progress_token, 0, 100, "🔊 Synthesizing...")
 
     if not text or not isinstance(text, str):
         return {"error": "No text provided"}
     text = text[:state._MAX_TTS_CHARS]
+    if not output_file:
+        output_file = _auto_output_file()
 
     ssml, tts_rate, headers, url = _prepare_tts(text, quality, speed, voice, pitch, volume)
 
@@ -393,6 +491,8 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
         estimated_duration = max(1.0, len(text) / speed_factor)
         start_time = time.time()
 
+        save_buf = bytearray() if output_file else None
+
         def download_audio():
             try:
                 lead_ms = _tts_lead_in_ms()
@@ -409,6 +509,8 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
                         proc.stdin.write(chunk)
                         proc.stdin.flush()
                         last_write_time[0] = time.time()
+                        if save_buf is not None:
+                            save_buf.extend(chunk)
                         # Emit audio level from TTS audio (every 3rd chunk)
                         _chunk_count += 1
                         if audio_level_cb and _chunk_count % 3 == 0:
@@ -491,7 +593,18 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
         send_progress(progress_token, 100, 100, f"🔊 {_colorize(text, tts_color)}")
     play_done()
     _mark_tts_end()
-    return {"spoken": True, "chars": len(text)}
+
+    # Save to file if requested
+    saved = None
+    if save_buf is not None and len(save_buf) > 0:
+        saved = _save_audio_file(bytes(save_buf), tts_rate, output_file)
+
+    result = {"spoken": True, "chars": len(text)}
+    if saved:
+        result["output_file"] = saved["file"]
+        result["duration_seconds"] = saved["duration_seconds"]
+        result["size_bytes"] = saved["size_bytes"]
+    return result
 
 
 # ---------------------------------------------------------------------------

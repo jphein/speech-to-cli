@@ -209,6 +209,8 @@ def load_config():
         "continuous_dictation": cfg.get("continuous_dictation", False),
         "loop_silence_timeout": cfg.get("loop_silence_timeout", 1.2),
         "read_notifications": cfg.get("read_notifications", False),
+        # Audio file saving
+        "save_audio_dir": cfg.get("save_audio_dir", None),  # auto-save all TTS to this dir
     }
 
 

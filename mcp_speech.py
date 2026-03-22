@@ -116,6 +116,10 @@ TOOLS = [
                     "type": "string",
                     "description": "Override subtitle color for this speak call. Useful for giving each voice its own color in multi-agent conversations.",
                 },
+                "output_file": {
+                    "type": "string",
+                    "description": "Save audio to this file path (MP3 or WAV). Audio still plays aloud AND saves to disk. Example: '~/podcast.mp3'",
+                },
             },
             "required": ["text"],
         },
@@ -147,6 +151,10 @@ TOOLS = [
                     "type": "string",
                     "enum": ["fast", "hd"],
                     "default": "fast",
+                },
+                "output_file": {
+                    "type": "string",
+                    "description": "Save concatenated audio to this file path (MP3 or WAV). Audio still plays aloud AND saves to disk.",
                 },
             },
             "required": ["segments"],
@@ -181,6 +189,10 @@ TOOLS = [
                     "type": "string",
                     "enum": ["fast", "hd"],
                     "default": "fast",
+                },
+                "output_file": {
+                    "type": "string",
+                    "description": "Save streamed audio to this file path (MP3 or WAV). Audio still plays aloud AND saves to disk.",
                 },
             },
             "required": ["segments"],
@@ -266,6 +278,7 @@ TOOLS = [
                 "barge_in_frames": {"type": "integer", "description": "[Experimental] Speech frames needed to trigger barge-in (default 3)."},
                 "barge_in_silence": {"type": "number", "description": "[Experimental] Silence seconds to resume TTS after barge-in (default 1.0)."},
                 "debug": {"type": "boolean", "description": "Write debug logs to /tmp/speech-debug.log."},
+                "save_audio_dir": {"type": "string", "description": "Auto-save ALL TTS audio to this directory as MP3 files. Set to a path like '~/tts-recordings' to enable, or empty string to disable."},
             },
         },
     },
@@ -383,7 +396,7 @@ def handle_request(req):
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {"listChanged": True}},
-                "serverInfo": {"name": "azure-speech", "version": "4.2.0"},
+                "serverInfo": {"name": "azure-speech", "version": "4.3.0"},
             },
         }
     elif method == "notifications/initialized":
@@ -443,12 +456,14 @@ def handle_request(req):
             quality = args.get("quality", "fast")
             if quality not in ("fast", "hd"):
                 quality = "fast"
-            result = multi_speak(segments, quality=quality, progress_token=progress_token)
+            result = multi_speak(segments, quality=quality, progress_token=progress_token, output_file=args.get("output_file"))
             if result.get("cancelled"):
                 msg = "(cancelled)"
             else:
                 count = result.get("spoken", 0)
                 msg = f"Spoke {count} segment{'s' if count != 1 else ''} aloud." if count else result.get("error", "Failed")
+                if result.get("output_file"):
+                    msg += f" Saved to {result['output_file']} ({result.get('duration_seconds', 0)}s, {result.get('size_bytes', 0)} bytes)"
             _schedule_warmup()
             return {
                 "jsonrpc": "2.0", "id": req_id,
@@ -464,7 +479,7 @@ def handle_request(req):
             quality = args.get("quality", "fast")
             if quality not in ("fast", "hd"):
                 quality = "fast"
-            result = multi_speak_stream(segments, quality=quality, progress_token=progress_token)
+            result = multi_speak_stream(segments, quality=quality, progress_token=progress_token, output_file=args.get("output_file"))
             if result.get("cancelled"):
                 msg = "(cancelled)"
             elif result.get("error"):
@@ -472,6 +487,8 @@ def handle_request(req):
             else:
                 count = result.get("spoken", 0)
                 msg = f"Streamed {count} voice{'s' if count != 1 else ''} in single request."
+                if result.get("output_file"):
+                    msg += f" Saved to {result['output_file']} ({result.get('duration_seconds', 0)}s, {result.get('size_bytes', 0)} bytes)"
             _schedule_warmup()
             return {
                 "jsonrpc": "2.0", "id": req_id,
@@ -500,11 +517,14 @@ def handle_request(req):
                 volume=args.get("volume", "default"),
                 progress_token=progress_token,
                 subtitle_color=args.get("subtitle_color"),
+                output_file=args.get("output_file"),
             )
             if result.get("cancelled"):
                 msg = "(cancelled)"
             else:
                 msg = "Spoke the text aloud." if result.get("spoken") else result.get("error", "Failed")
+                if result.get("output_file"):
+                    msg += f" Saved to {result['output_file']} ({result.get('duration_seconds', 0)}s, {result.get('size_bytes', 0)} bytes)"
                 _schedule_warmup()
             return {
                 "jsonrpc": "2.0", "id": req_id,

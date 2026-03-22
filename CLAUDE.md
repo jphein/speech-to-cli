@@ -1,7 +1,8 @@
+<!-- claude-md-version: a4f6ebd | updated: 2026-03-22 -->
 # Azure Speech MCP Server (speech-to-cli)
 
 MCP server providing voice I/O (STT + TTS) for AI CLI agents via Azure Speech Services.
-Version 4.2.0. Python 3, threading-based, no Azure SDK — plain REST/WebSocket.
+Version 4.3.0. Python 3, threading-based, no Azure SDK — plain REST/WebSocket.
 License: GPL-3.0.
 
 ## Tech Stack
@@ -99,7 +100,7 @@ Overlaps TTS playback and STT recording. Resets energy threshold to 300 post-TTS
 `seconds`, `mode`, `silence_timeout`, `vad_aggressiveness`, `energy_multiplier`
 
 ### `speak` — One-way TTS
-`text` (required), `quality`, `voice`, `speed`, `pitch`, `volume`, `subtitle_color`
+`text` (required), `quality`, `voice`, `speed`, `pitch`, `volume`, `subtitle_color`, `output_file`
 
 ### `talk` — Speak then listen (primary conversation tool)
 `text` (required), `quality`, `voice`, `speed`, `pitch`, `volume`, `seconds`, `mode`, `silence_timeout`, `subtitle_color`
@@ -108,10 +109,13 @@ Overlaps TTS playback and STT recording. Resets energy threshold to 300 post-TTS
 `seconds`, `mode`, `silence_timeout`
 
 ### `multi_speak` — Multi-voice TTS (parallel requests, sequential playback)
-`segments` (required: `[{text, voice, subtitle_color}]`), `quality`
+`segments` (required: `[{text, voice, subtitle_color}]`), `quality`, `output_file`
 
 ### `multi_speak_stream` — Multi-voice in single SSML request
-`segments` (required: `[{text, voice}]`), `quality`
+`segments` (required: `[{text, voice}]`), `quality`, `output_file`
+
+### Audio File Saving
+All TTS tools (`speak`, `multi_speak`, `multi_speak_stream`) accept an `output_file` parameter. When set, audio plays AND saves to disk. Supports `.mp3` (via ffmpeg) and `.wav`. The standalone `tts.py` also supports `-o file.mp3` and `-s` (silent/save-only).
 
 ### `configure` — View/change settings at runtime
 ### `get_voices` — List Azure voices

@@ -1,6 +1,6 @@
 {
   "name": "speech-to-cli",
-  "version": "4.2.0",
+  "version": "4.3.0",
   "description": "Voice interface for AI CLI assistants — listen, speak, and converse using Azure Speech Services.",
   "mcpServers": {
     "azure-speech": {
