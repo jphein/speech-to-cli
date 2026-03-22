@@ -76,7 +76,9 @@ Standalone utilities (`speech.py` 119L, `tts.py` 97L, `voice_chat.py` 170L) are 
 |-----:|----------|---------|
 | 66 | `_build_ssml(text, voice, quality, ...)` | Build SSML payload for Azure TTS |
 | 86 | `_prepare_tts(text, quality, speed, ...)` | Sanitize inputs, build SSML, return (ssml, rate, headers, url) |
+| 106 | `_build_multi_voice_ssml(segments, quality)` | Build SSML with multiple `<voice>` tags for single-request multi-voice TTS |
 | 108 | `multi_speak(segments, quality, progress_token)` | Parallel TTS fetch, sequential playback |
+| 131 | `multi_speak_stream(segments, quality, progress_token)` | Single-request multi-voice TTS via SSML (faster than multi_speak) |
 | 230 | `tts(text, quality, speed, voice, ...)` | Single-segment TTS with streaming playback |
 | 358 | `talk_fullduplex(text, quality, ...)` | Speak + listen simultaneously (full-duplex) |
 | 883 | `get_voices()` | Fetch available Azure voices list |
@@ -95,6 +97,7 @@ Standalone utilities (`speech.py` 119L, `tts.py` 97L, `voice_chat.py` 170L) are 
 | `listen` | Record → transcribe (STT only) |
 | `speak` | TTS one-way (no mic) |
 | `multi_speak` | Parallel TTS fetch, sequential playback (multi-voice) |
+| `multi_speak_stream` | Single-request multi-voice TTS via SSML multi-voice tags (faster than multi_speak) |
 | `talk` | Full-duplex speak+listen — PRIMARY voice conversation tool |
 | `converse` | Listen-only with conversational context (for speak→converse loops) |
 | `configure` | View/change settings at runtime (saved to disk) |
@@ -145,8 +148,8 @@ tail -f /tmp/speech-debug.log          # watch STT/TTS debug output
 Multi-voice SSML in one TTS request (keeps talk_fullduplex architecture intact).
 Alternative: multi_speak → converse (works today but mic not recording during TTS).
 
-## Pairing with azure-chat-assistant
-Use alongside [azure-chat-assistant](../azure-chat-assistant/) MCP server for multi-model voice:
+## Pairing with cloud-chat-assistant
+Use alongside [cloud-chat-assistant](../cloud-chat-assistant/) MCP server for multi-model voice:
 1. `multi_chat` → parallel LLM queries  2. `multi_speak` → parallel TTS + sequential playback
 
 ### Voice Assignments (multi-agent)
