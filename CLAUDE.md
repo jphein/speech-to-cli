@@ -2,161 +2,147 @@
 
 MCP server providing voice I/O (STT + TTS) for AI CLI agents via Azure Speech Services.
 Version 4.2.0. Python 3, threading-based, no Azure SDK — plain REST/WebSocket.
+License: GPL-3.0.
 
-## Running
+## Tech Stack
+
+- **Python 3** (no venv required — uses system python3)
+- **Azure Speech Services** — REST API for TTS and STT, WebSocket for streaming STT
+- **PipeWire / ALSA** — audio recording and playback
+- **webrtcvad** — voice activity detection
+- **websocket-client** — persistent WebSocket for streaming STT
+- **faster-whisper** — optional local STT (offline fallback)
+- **requests** — HTTP client with connection pooling
+- **numpy** — optional, accelerates RMS energy calculation (~5-10x via SIMD)
+
+## Quick Start
+
 ```bash
-python3 mcp_speech.py          # MCP server over stdio (used by Claude Code, Copilot CLI, Gemini CLI)
-python3 speech.py              # Standalone mic→text→clipboard
-python3 tts.py "hello"         # Standalone text→speech
-python3 voice_chat.py          # Standalone voice chat companion
-SPEECH_DEBUG=1 python3 mcp_speech.py  # Debug mode → /tmp/speech-debug.log
+./install.sh                    # or: sudo apt install alsa-utils xclip python3 python3-pip
+pip install -r requirements.txt # requests, webrtcvad, websocket-client, faster-whisper
+export AZURE_SPEECH_KEY="your-key"
+export AZURE_SPEECH_REGION="westus2"
+python3 mcp_speech.py           # MCP server
+python3 speech.py               # Standalone: mic → clipboard
+python3 tts.py "hello"          # Standalone: text → speech
+python3 voice_chat.py           # Standalone: voice chat
+SPEECH_DEBUG=1 python3 mcp_speech.py && tail -f /tmp/speech-debug.log
 ```
 
-## Module Structure & Import Graph
+### MCP Integration
+
+**Claude Code** (`.mcp.json`):
+```json
+{"mcpServers": {"azure-speech": {"command": "python3", "args": ["/home/jp/Projects/speech-to-cli/mcp_speech.py"]}}}
 ```
-state.py (285L) — constants, CONFIG dict, mutable globals, small helpers
+
+**Gemini CLI**: Uses `gemini-extension.json`.
+
+## Architecture
+
+### Module Structure
+
+```
+state.py (318L) — constants, CONFIG dict, mutable globals, small helpers
   ↑ imported by all modules
-audio.py (691L) — audio I/O, device detection, chimes, colors, VAD, pre-warming
+audio.py (734L) — audio I/O, device detection, chimes, VAD, pre-warming
   ↑ imports state
-stt.py (650L) — STT backends (streaming WS, VAD+REST, Whisper, fixed) + shared helpers
+stt.py (683L) — STT backends (streaming WS, VAD+REST, Whisper, fixed)
   ↑ imports state, audio
-speech_tts.py (893L) — TTS, multi_speak, talk_fullduplex, get_voices
+speech_tts.py (1058L) — TTS, multi_speak, talk_fullduplex, get_voices
   ↑ imports state, audio, stt
-mcp_speech.py (929L) — MCP tool schemas, request routing, stdio transport
+mcp_speech.py (997L) — MCP tool schemas, request routing, stdio transport
   ↑ imports state, audio, stt, speech_tts
 ```
-Standalone utilities (`speech.py` 119L, `tts.py` 97L, `voice_chat.py` 170L) are independent — they don't import the core modules.
 
-**Import pattern**: `import state` at top. Reassignable globals via `state.X = val`. `CONFIG` dict imported by name (mutated in-place, never reassigned).
+Standalone utilities (`speech.py`, `tts.py`, `voice_chat.py`) import `load_config_standalone` from `state.py`.
 
-## Key Function Index
-### state.py — Shared state & helpers
-| Line | Function | Purpose |
-|-----:|----------|---------|
-| 121 | `_get_iso_timestamp()` | Cached ISO timestamp (refreshed every 500ms) |
-| 156 | `load_config()` | Load config from `~/.config/speech-to-cli/config.json` + env vars |
-| 207 | `is_cancelled()` | Check `_cancel_event` |
-| 227 | `cancel_active()` | Kill tracked subprocesses, signal cancellation |
-| 253 | `get_http_session()` | Reusable `requests.Session` for connection pooling |
-| 261 | `send_progress(token, progress, total, description)` | MCP progress notification (ANSI in `description`, plain in `message`) |
+**Import pattern**: `import state` then `state.X = val`. `CONFIG` dict imported by name (mutated in-place).
 
-### audio.py — Audio I/O, VAD, pre-warming
-| Line | Function | Purpose |
-|-----:|----------|---------|
-| 70 | `detect_audio_output(sink_id)` | PipeWire: headphones vs speakers → half/full-duplex |
-| 134 | `_refresh_audio_detection()` | Re-detect on sink change (~12ms, ~35ms on change) |
-| 172 | `_build_player_cmd(tts_rate, target)` | Build aplay/pw-cat/ffplay command list |
-| 200 | `_build_rec_cmd(max_seconds, raw)` | Build pw-record/arecord command |
-| 335 | `_colorize(text, color_name)` | ANSI color wrapper (uses `_COLOR_MAP` dict at line 323) |
-| 409 | `rms_energy(frame_bytes)` | RMS energy of 16-bit PCM frame |
-| 418 | `calibrate_noise(proc, n_frames)` | Ambient noise estimation (cached 30s) |
-| 441 | `is_speech_energy(chunk, vad, threshold)` | Combined VAD + energy gate |
-| 538 | `record_with_vad(proc, max_seconds)` | Record with energy-gated VAD |
-| 662 | `_prewarm_all()` | Pre-warm recorder + player + WS + TTS connection |
-| 685 | `_schedule_warmup()` | Debounced warmup (collapses rapid calls) |
+### STT Pipeline
 
-### stt.py — STT backends & shared helpers
-| Line | Function | Purpose |
-|-----:|----------|---------|
-| 44 | `_get_stt_ws()` | Get/create persistent Azure STT WebSocket (cached 540s) |
-| 85 | `_make_logger(tag)` | Debug logger factory → `/tmp/speech-debug.log` |
-| 95 | `_check_end_word(text, end_word)` | Check if text ends with stop word |
-| 105 | `_strip_end_word(text, end_word)` | Remove trailing end word |
-| 136 | `_init_stt_ws_session(ws, request_id)` | Drain stale msgs, send config + WAV header |
-| 162 | `_parse_ws_msg(msg, phrases, ...)` | Parse hypothesis/phrase/turn.end WS messages |
-| 212 | `_rest_stt_fallback(raw_frames, _log)` | REST API fallback when WS fails |
-| 260 | `stt_streaming(max_seconds, progress_token)` | Real-time STT via persistent Azure WS + VAD |
-| 449 | `stt_vad(max_seconds, progress_token)` | Record with VAD, upload on silence |
-| 504 | `stt_whisper(max_seconds, progress_token)` | Local faster-whisper (offline) |
-| 552 | `stt_fixed(seconds, progress_token)` | Fixed-duration recording fallback |
-| 609 | `stt(seconds, mode, silence_timeout, ...)` | Main STT dispatcher (auto-selects mode) |
+1. **Streaming** (default): Persistent WebSocket, real-time VAD + energy gating. Falls back to REST.
+2. **VAD+REST**: Record locally, upload WAV to Azure REST API.
+3. **Whisper**: Local faster-whisper model (offline, ~150MB download).
+4. **Fixed**: Fixed duration recording (last-resort).
 
-### speech_tts.py — TTS & full-duplex talk
-| Line | Function | Purpose |
-|-----:|----------|---------|
-| 66 | `_build_ssml(text, voice, quality, ...)` | Build SSML payload for Azure TTS |
-| 86 | `_prepare_tts(text, quality, speed, ...)` | Sanitize inputs, build SSML, return (ssml, rate, headers, url) |
-| 106 | `_build_multi_voice_ssml(segments, quality)` | Build SSML with multiple `<voice>` tags for single-request multi-voice TTS |
-| 108 | `multi_speak(segments, quality, progress_token)` | Parallel TTS fetch, sequential playback |
-| 131 | `multi_speak_stream(segments, quality, progress_token)` | Single-request multi-voice TTS via SSML (faster than multi_speak) |
-| 230 | `tts(text, quality, speed, voice, ...)` | Single-segment TTS with streaming playback |
-| 358 | `talk_fullduplex(text, quality, ...)` | Speak + listen simultaneously (full-duplex) |
-| 883 | `get_voices()` | Fetch available Azure voices list |
+### TTS Pipeline
 
-### mcp_speech.py — MCP protocol layer
-| Line | Function | Purpose |
-|-----:|----------|---------|
-| 38 | `TOOLS` | Tool schema definitions (list of dicts) |
-| 338 | `handle_request(req)` | Main JSON-RPC request router |
-| 856 | `_stdin_reader()` | Background stdin reader (routes pause/resume/cancel urgently) |
-| 900 | `main()` | Entry point: generate chimes, detect audio, start warmup, event loop |
+Text → SSML with prosody → Azure REST (streaming) → player process (aplay/pw-cat/ffplay) → live subtitles + VU meter. Pre-warmed player eliminates startup latency.
+
+### Full-Duplex Talk
+
+Overlaps TTS playback and STT recording. Resets energy threshold to 300 post-TTS. Falls back to half-duplex for speakers.
+
+### Audio Routing
+
+- **Full-duplex** (headphones): Simultaneous record + play, auto-detected via PipeWire.
+- **Half-duplex** (speakers): Sequential TTS then STT.
+- **Echo cancellation** (experimental): PipeWire AEC nodes.
+
+## Source Files
+
+| File | Lines | Purpose |
+|------|------:|---------|
+| `state.py` | 318 | Constants, CONFIG dict, mutable globals |
+| `audio.py` | 734 | Audio I/O, PipeWire, chimes, VAD, pre-warming |
+| `stt.py` | 683 | STT backends (streaming WS, VAD+REST, Whisper, fixed) |
+| `speech_tts.py` | 1058 | TTS, multi_speak, talk_fullduplex, get_voices |
+| `mcp_speech.py` | 997 | MCP tool schemas, JSON-RPC, stdio transport |
+| `speech.py` | 104 | Standalone: mic → transcribe → clipboard |
+| `tts.py` | 82 | Standalone: text → Azure TTS → speaker |
+| `voice_chat.py` | 155 | Standalone: voice chat companion |
 
 ## MCP Tools
-| Tool | Purpose |
-|------|---------|
-| `listen` | Record → transcribe (STT only) |
-| `speak` | TTS one-way (no mic) |
-| `multi_speak` | Parallel TTS fetch, sequential playback (multi-voice) |
-| `multi_speak_stream` | Single-request multi-voice TTS via SSML multi-voice tags (faster than multi_speak) |
-| `talk` | Full-duplex speak+listen — PRIMARY voice conversation tool |
-| `converse` | Listen-only with conversational context (for speak→converse loops) |
-| `configure` | View/change settings at runtime (saved to disk) |
-| `get_voices` | List Azure voices for current region |
-| `pause` / `resume` | Pause/resume audio |
+
+### `listen` — Record + transcribe (STT only)
+`seconds`, `mode`, `silence_timeout`, `vad_aggressiveness`, `energy_multiplier`
+
+### `speak` — One-way TTS
+`text` (required), `quality`, `voice`, `speed`, `pitch`, `volume`, `subtitle_color`
+
+### `talk` — Speak then listen (primary conversation tool)
+`text` (required), `quality`, `voice`, `speed`, `pitch`, `volume`, `seconds`, `mode`, `silence_timeout`, `subtitle_color`
+
+### `converse` — Listen-only with context
+`seconds`, `mode`, `silence_timeout`
+
+### `multi_speak` — Multi-voice TTS (parallel requests, sequential playback)
+`segments` (required: `[{text, voice, subtitle_color}]`), `quality`
+
+### `multi_speak_stream` — Multi-voice in single SSML request
+`segments` (required: `[{text, voice}]`), `quality`
+
+### `configure` — View/change settings at runtime
+### `get_voices` — List Azure voices
+### `pause` / `resume` — Pause/resume audio
+
+## Configuration
+
+Config loaded from env vars → `~/.config/speech-to-cli/config.json`. All changeable at runtime via `configure`.
+
+**Credentials**: `key`/`AZURE_SPEECH_KEY`, `region`/`AZURE_SPEECH_REGION`, `tts_region`, `tts_key`
+**Voice**: `voice` (HD default: `en-US-Ava:DragonHDLatestNeural`), `fast_voice` (`en-US-AvaNeural`)
+**Audio**: `player`, `recorder`, `mic_source`, `speaker_sink`
+**Timing**: `silence_timeout` (3.0s), `talk_silence_timeout` (4.0s), `no_speech_timeout` (7.0s), `max_record_seconds` (120), `energy_multiplier` (2.5), `end_word` ("over")
+**Mode**: `half_duplex` (auto), `enable_pause` (true)
+**Chimes**: `chime_ready` (true), `chime_processing`, `chime_speak`, `chime_done`, `chime_hum`, `chime_barge_in` (true)
+**UI**: `visual_indicator`, `live_subtitles`, `subtitle_color_user`, `subtitle_color_tts`, `vu_meter`
+**Experimental**: `enable_echo_cancel`, `enable_barge_in`, `barge_in_frames` (3), `barge_in_silence` (1.0), `debug`
+**Standalone/LLM**: `llm_provider`, `llm_model`, `llm_api_key`, `conversation_mode`, `dictation_mode`, `continuous_dictation`, `read_notifications`
 
 ## Key Implementation Details
-- TTS max: 5000 chars/segment. HD=48kHz, fast=24kHz
-- WS cached 540s (`WS_IDLE_TIMEOUT`), reconnects on Azure InitialSilenceTimeout
-- REST STT fallback when WS returns empty
-- Noise floor cached 30s. Post-TTS threshold reset to 300 (avoids TTS bleed)
-- Recording timer counts post-TTS frames only (TTS time excluded from max)
-- Debounced `_schedule_warmup()` pre-warms recorder + player + WS + HTTP
-- Cached ISO timestamps in hot loop (avoids 1000+ strftime/s)
-- End word "over" stops recording immediately (configurable)
-- `[AGENT HINTS]` in responses suggest config changes based on user behavior
-- Subtitle colors: default, green, light_green, yellow, amber, rust, red, light_red, blue, light_blue, cyan, light_cyan, magenta, light_magenta, white, gray
 
-### Dynamic Configurables (via `configure` tool)
-| Setting | Default | Range/Notes |
-|---------|---------|-------------|
-| `talk_silence_timeout` | 4.0s | Silence cutoff in talk mode |
-| `silence_timeout` | 3.0s | Silence cutoff in listen mode |
-| `no_speech_timeout` | 7.0s | Max wait for any speech (1-30s) |
-| `energy_multiplier` | 2.5 | Mic sensitivity, lower=more sensitive (0.5-20) |
-| `end_word` | "over" | Word to immediately stop recording |
-| `max_record_seconds` | 120 | Max recording duration (5-300) |
-| `enable_echo_cancel` | false | [Experimental] PipeWire echo cancellation |
-| `enable_barge_in` | false | [Experimental] User speech pauses TTS |
-| `debug` | false | Logs to /tmp/speech-debug.log |
+- TTS max 5000 chars/segment. WS cached 540s. Noise floor cached 120s.
+- Post-TTS threshold reset to 300. Pre-warmed recorder/player/WS/HTTP.
+- End word "over" stops recording immediately. SSML safety via `_sanitize_ssml_attr()`.
+- Connection pooling saves ~150ms/call. numpy RMS fast path ~5-10x.
 
-## Conventions for Editing
-- **State access**: Always `import state` then `state.X = val` for reassignable globals. Never do `from state import X` for mutable scalars.
-- **CONFIG dict**: `from state import CONFIG` is fine — it's mutated in-place, never reassigned.
-- **Threading**: All audio I/O runs in daemon threads. Use `is_cancelled()` checks in loops.
-- **Progress**: Call `send_progress(token, pct, 100, "description")` — Claude Code renders ANSI in `description`, Gemini CLI uses plain `message` field.
-- **SSML safety**: All user-supplied voice/pitch/volume values go through `_sanitize_ssml_attr()`.
-- **Error returns**: Tool handlers return `{"error": "msg"}` dicts; MCP layer wraps in JSON-RPC.
-- **No tests**: This project has no test suite. Test manually by running `python3 mcp_speech.py` and sending JSON-RPC on stdin, or use the MCP tools via Claude Code.
+## Version Management
 
-## Debugging
-```bash
-SPEECH_DEBUG=1 python3 mcp_speech.py   # or configure(debug=true) at runtime
-tail -f /tmp/speech-debug.log          # watch STT/TTS debug output
-```
+Version in 3 files: `mcp_speech.py`, `gemini-extension.json`, `CLAUDE.md`. Use `./bump-version.sh X.Y.Z` or `/bump-version` skill.
 
-## Planned: multi_talk
-Multi-voice SSML in one TTS request (keeps talk_fullduplex architecture intact).
-Alternative: multi_speak → converse (works today but mic not recording during TTS).
+## Hooks
 
-## Pairing with cloud-chat-assistant
-Use alongside [cloud-chat-assistant](../cloud-chat-assistant/) MCP server for multi-model voice:
-1. `multi_chat` → parallel LLM queries  2. `multi_speak` → parallel TTS + sequential playback
-
-### Voice Assignments (multi-agent)
-| Agent | Voice | Color |
-|-------|-------|-------|
-| Claude | en-US-AvaNeural | amber |
-| GPT-5.3 | en-US-DavisNeural | cyan |
-| Llama 405B | en-US-AndrewNeural | yellow |
-| DeepSeek R1 | en-US-BrianNeural | magenta |
-| Phi-4 | en-US-JennyNeural | light_blue |
+- **PreToolUse**: Blocks direct edits to config.json (use `configure` tool).
+- **PostToolUse**: Warns about version sync when editing version files.
