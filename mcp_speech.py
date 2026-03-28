@@ -173,8 +173,9 @@ TOOLS = [
             "MUCH FASTER than multi_speak — one API call instead of N calls. "
             "Ideal for multi_chat responses: each model's response plays with its own voice, "
             "switching seamlessly within a single audio stream. "
-            "Voice assignments: gpt-5.3-chat→DavisNeural, Claude→AvaNeural, "
-            "Llama→AndrewNeural, DeepSeek→BrianNeural, Phi→JennyNeural, Gemini→AriaNeural."
+            "Voice assignments by family: OpenAI (gpt-5.x, o1, o4)→DavisNeural, Claude→AvaNeural, "
+            "Llama→AndrewNeural, DeepSeek→BrianNeural, Grok→GuyNeural, Gemini→AriaNeural, "
+            "Cohere→JennyNeural, Phi/Mistral→EmmaNeural, Nova→JasonNeural, DO OSS→TonyNeural, Puter→SaraNeural."
         ),
         "inputSchema": {
             "type": "object",
