@@ -1,8 +1,3 @@
 {
-  "mcpServers": {
-    "azure-speech": {
-      "command": "python3",
-      "args": ["/home/jp/Projects/speech-to-cli/mcp_speech.py"]
-    }
-  }
+  "mcpServers": {}
 }
