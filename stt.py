@@ -143,14 +143,29 @@ _STT_WAV_HEADER = struct.pack('<4sI4s4sIHHIIHH4sI',
     b'RIFF', 0, b'WAVE', b'fmt ', 16, 1, 1, 16000, 32000, 2, 16, b'data', 0)
 
 # Pre-serialized speech config JSON (never changes)
-_STT_SPEECH_CONFIG = json.dumps({
-    "context": {
-        "system": {"version": "1.0.00000"},
-        "os": {"platform": "Linux", "name": "speech-to-cli"},
-        "audio": {"source": {"connectivity": "Unknown", "manufacturer": "Unknown",
-                             "model": "Unknown", "type": "Unknown"}},
+def _build_speech_config():
+    """Build speech.config JSON, including custom phrase list if configured."""
+    config = {
+        "context": {
+            "system": {"version": "1.0.00000"},
+            "os": {"platform": "Linux", "name": "speech-to-cli"},
+            "audio": {"source": {"connectivity": "Unknown", "manufacturer": "Unknown",
+                                 "model": "Unknown", "type": "Unknown"}},
+        }
     }
-})
+    # Custom phrase list boosts recognition of domain-specific terms
+    phrases = CONFIG.get("phrase_list", [])
+    if phrases:
+        config["phraseDetection"] = {
+            "enrichment": {
+                "pronunciationAssessment": {},
+                "phraseList": [{"phrase": p} for p in phrases],
+            }
+        }
+    return json.dumps(config)
+
+
+_STT_SPEECH_CONFIG = _build_speech_config()
 
 
 def _init_stt_ws_session(ws, request_id, drain=True):
