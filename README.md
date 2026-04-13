@@ -1,5 +1,7 @@
 # speech-to-cli
 
+**Live docs:** [jphein.github.io/speech-to-cli](https://jphein.github.io/speech-to-cli/)
+
 Voice interface for AI coding assistants — talk to your CLI agent and hear it respond, powered by Azure Speech Services. Works with **GitHub Copilot CLI**, **Claude Code**, and **Gemini CLI**.
 
 ![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue)
