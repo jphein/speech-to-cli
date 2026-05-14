@@ -82,7 +82,7 @@ Browse all available voices in the [Azure Voice Gallery](https://speech.microsof
 ### Install
 
 ```bash
-git clone https://github.com/jphein/speech-to-cli.git
+git clone https://github.com/techempower-org/speech-to-cli.git
 cd speech-to-cli
 ./install.sh
 ```
@@ -294,8 +294,8 @@ No Azure SDK required — just plain REST/WebSocket API calls.
 
 Other projects import the core modules from this repository directly rather than going through the MCP server:
 
-- **[gnome-speaks](https://github.com/jphein/gnome-speaks)** — a GNOME Shell extension that adds voice control to the desktop. It imports `state.py`, `audio.py`, `stt.py`, and `speech_tts.py` via `sys.path`.
-- **[the-oracle](https://github.com/jphein/the-oracle)** — proxies this MCP server through a FastMCP gateway so multiple clients can share a single speech backend.
+- **[gnome-speaks](https://github.com/techempower-org/gnome-speaks)** — a GNOME Shell extension that adds voice control to the desktop. It imports `state.py`, `audio.py`, `stt.py`, and `speech_tts.py` via `sys.path`.
+- **[the-oracle](https://github.com/techempower-org/the-oracle)** — proxies this MCP server through a FastMCP gateway so multiple clients can share a single speech backend.
 
 The env var `SPEECH_ENGINE_PATH` can be set to the path of this directory so that downstream projects can locate and import the modules at runtime.
 
