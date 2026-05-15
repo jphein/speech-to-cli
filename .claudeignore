@@ -15,7 +15,5 @@ build/
 # Secrets
 .env
 .mcp.json
-config/
-
 # Tooling
 .claude/
