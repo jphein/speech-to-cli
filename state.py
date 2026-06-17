@@ -108,6 +108,7 @@ _warmup_lock = threading.Lock()
 _prewarmed_player = None
 _prewarmed_player_rate = 0
 _prewarmed_player_lock = threading.Lock()
+_player_idle_timer = None  # threading.Timer that reaps an idle prewarmed player
 
 # TTY / terminal width caching
 _tty_fd = None

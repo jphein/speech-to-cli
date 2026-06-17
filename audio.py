@@ -601,6 +601,7 @@ def record_with_vad(proc, max_seconds):
 # ---------------------------------------------------------------------------
 
 _REC_IDLE_SECONDS = 30  # kill prewarmed recorder after this many seconds idle
+_PLAYER_IDLE_SECONDS = 30  # reap prewarmed player after this many seconds idle (it holds the audio sink open on stdin)
 
 def _prewarm_recorder():
     """Start a recorder process in background so next listen/converse is instant.
@@ -637,6 +638,14 @@ def _prewarm_player(tts_rate=24000):
                 )
                 state._prewarmed_player = proc
                 state._prewarmed_player_rate = tts_rate
+                # Auto-reap if never consumed: an idle prewarmed player holds
+                # the audio sink open (blocked on stdin) and accumulates across
+                # long-lived MCP servers, driving PipeWire xruns (audible crackle).
+                if state._player_idle_timer is not None:
+                    state._player_idle_timer.cancel()
+                state._player_idle_timer = threading.Timer(_PLAYER_IDLE_SECONDS, _discard_prewarmed_player)
+                state._player_idle_timer.daemon = True
+                state._player_idle_timer.start()
                 return
             except FileNotFoundError:
                 continue
@@ -670,9 +679,38 @@ def _discard_prewarmed_rec():
             pass
 
 
+def _discard_prewarmed_player():
+    """Close and reap any pre-warmed player (idle timeout or shutdown).
+
+    An unused prewarmed player holds the audio sink open blocked on stdin;
+    these accumulate across long-lived MCP servers and cause PipeWire
+    xruns/crackle. Closing stdin sends EOF so aplay drains and exits."""
+    with state._prewarmed_player_lock:
+        proc = state._prewarmed_player
+        state._prewarmed_player = None
+        if state._player_idle_timer is not None:
+            state._player_idle_timer.cancel()
+            state._player_idle_timer = None
+    if proc:
+        try:
+            if proc.stdin:
+                proc.stdin.close()  # EOF -> aplay drains and exits cleanly
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=1)
+            except Exception:
+                pass
+
+
 def _take_prewarmed_player(tts_rate):
     """Take the pre-warmed player if rate matches, or return None."""
     with state._prewarmed_player_lock:
+        # Player is being taken/replaced -- cancel the idle reaper.
+        if state._player_idle_timer is not None:
+            state._player_idle_timer.cancel()
+            state._player_idle_timer = None
         if state._prewarmed_player is not None and state._prewarmed_player_rate == tts_rate:
             proc = state._prewarmed_player
             state._prewarmed_player = None
