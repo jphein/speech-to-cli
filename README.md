@@ -18,6 +18,8 @@ This project adds voice input and output to your terminal AI workflow via the [M
 | **Voice Chat** (`voice_chat.py`) | Standalone voice chat companion — runs in a second terminal alongside Copilot CLI |
 | **Speech-to-Text** (`speech.py`) | Simple mic → text → clipboard tool |
 | **Text-to-Speech** (`tts.py`) | Simple text → speech tool (reads from args, stdin, or clipboard) |
+| **Listen** (`listen.py`) | One-shot scriptable listen — record until silence, transcript on stdout (for agent voice loops) |
+| **Speak** (`speak.py`) | Agent-friendly TTS — per-call `--voice` override, uses `tts_region` (HD voices) |
 
 ## Features
 
@@ -276,7 +278,29 @@ python3 speech.py
 python3 tts.py "Hello world"
 echo "Hello" | python3 tts.py
 python3 tts.py  # speaks clipboard contents
+
+# One-shot listen: record until silence, print transcript to stdout
+python3 listen.py                        # exit 0 = speech, 1 = silence
+python3 listen.py --markers --silence-timeout 2
+
+# Speak with a per-call voice (no env juggling; HD voices via tts_region)
+python3 speak.py --voice en-US-AndrewNeural "A different character"
 ```
+
+### Agent voice loop (no MCP needed)
+
+When the MCP server isn't connected in a session, an AI CLI agent can still
+hold a real voice conversation from Bash — speak a turn, listen for the reply,
+respond, repeat:
+
+```bash
+python3 speak.py --voice en-US-AndrewNeural "What do you think?" \
+  && python3 listen.py --markers 2>/dev/null
+```
+
+Progress/VU noise goes to stderr; only the transcript reaches stdout. Born in a
+live smol brainstorm session where Claude pitched roadmap ideas by voice using
+exactly this loop.
 
 ## How it works
 

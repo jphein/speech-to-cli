@@ -27,6 +27,8 @@ python3 mcp_speech.py           # MCP server
 python3 speech.py               # Standalone: mic → clipboard
 python3 tts.py "hello"          # Standalone: text → speech
 python3 voice_chat.py           # Standalone: voice chat
+python3 listen.py --markers     # Standalone: one-shot listen → transcript on stdout (agent loops)
+python3 speak.py -v en-US-AndrewNeural "hi"  # Standalone: TTS w/ per-call voice + tts_region
 SPEECH_DEBUG=1 python3 mcp_speech.py && tail -f /tmp/speech-debug.log
 ```
 
@@ -56,7 +58,7 @@ mcp_speech.py (997L) — MCP tool schemas, request routing, stdio transport
   ↑ imports state, audio, stt, speech_tts
 ```
 
-Standalone utilities (`speech.py`, `tts.py`, `voice_chat.py`) import `load_config_standalone` from `state.py`.
+Standalone utilities (`speech.py`, `tts.py`, `voice_chat.py`) import `load_config_standalone` from `state.py`. Agent-loop standalones: `listen.py` (wraps `stt.stt()` — one-shot record-until-silence, transcript on stdout, `--markers` + exit-code contract) and `speak.py` (reuses `tts.py` synth with `--voice` override, prefers `tts_region`) pair as a Bash speak→listen loop when the MCP server isn't connected in a session.
 
 **Import pattern**: `import state` then `state.X = val`. `CONFIG` dict imported by name (mutated in-place).
 
