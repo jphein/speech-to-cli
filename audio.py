@@ -230,39 +230,127 @@ def _build_rec_cmd(max_seconds=None, raw=True):
 # Chime generation and playback
 # ---------------------------------------------------------------------------
 
-def _generate_chimes():
-    """Generate all status chime WAV files if they don't exist."""
-    import wave
-    rate = 16000
+CHIME_RATE = 44100
 
-    def _make(path, tones):
+# Struck-glass partial structure. Real bells and glass have INHARMONIC
+# partials — ratios that aren't whole numbers — and that's the whole reason
+# they read as a physical object rather than a synthesiser. Higher partials
+# also decay faster on a real struck body, which `decay` encodes.
+#
+#            ratio   amp    decay (x faster than fundamental)
+_PARTIALS = [(1.000, 1.000, 1.00),
+             (2.000, 0.460, 1.45),
+             (3.010, 0.250, 1.95),
+             (4.170, 0.130, 2.60),
+             (5.430, 0.062, 3.40),
+             (6.790, 0.030, 4.30)]
+
+# Warm F-pentatonic. Every pair is consonant, so the tones sound like one
+# family instead of seven unrelated beeps.
+F3, F4, G4, A4, C5, D5 = 174.61, 349.23, 392.00, 440.00, 523.25, 587.33
+
+
+def _generate_chimes():
+    """Generate all status chime WAV files if they don't exist.
+
+    Replaces the original pure-sine generator, which sounded thin and clicky
+    for two independent reasons:
+
+      1. A single `math.sin` per note — no partials, so no timbre.
+      2. Notes were hard-concatenated with a trapezoidal 20ms attack/release,
+         so every note boundary was a step discontinuity. That broadband click
+         was the actual harshness (a zero-crossing analysis of the old files
+         reads ~7.4kHz dominant, which is the splice artefact, not the tone).
+
+    This version uses struck-glass synthesis: inharmonic partials, exponential
+    decay with a fast attack, notes that OVERLAP and ring into each other
+    rather than butting together, and a faintly detuned twin voice for shimmer.
+    44.1kHz so the upper partials aren't aliased.
+    """
+    import wave
+
+    def _render(notes, tail=0.5):
+        """notes: [(freq, start_s, amp, decay_s)] -> float list, summed.
+
+        Notes are placed on a shared timeline by START TIME, so they overlap
+        and decay through one another. Nothing is ever spliced.
+        """
+        total = max(s + d for _, s, _, d in notes) + tail
+        n = int(CHIME_RATE * total)
+        buf = [0.0] * n
+        for freq, start, amp, decay in notes:
+            i0 = int(start * CHIME_RATE)
+            # Two voices detuned by 0.15% — slow beating reads as "glassy"
+            # rather than as two notes.
+            for detune, dweight in ((1.0, 1.0), (1.0015, 0.55)):
+                for ratio, pamp, pdecay in _PARTIALS:
+                    f = freq * ratio * detune
+                    if f > CHIME_RATE * 0.45:      # keep well under Nyquist
+                        continue
+                    tau = decay / pdecay
+                    a = amp * pamp * dweight
+                    w = 2.0 * math.pi * f
+                    for i in range(i0, n):
+                        t = (i - i0) / CHIME_RATE
+                        e = math.exp(-t / tau)
+                        if e < 0.0005:             # stop when inaudible
+                            break
+                        # 4ms raised-cosine attack: fast enough to read as a
+                        # strike, smooth enough to add no click.
+                        if t < 0.004:
+                            e *= 0.5 - 0.5 * math.cos(math.pi * t / 0.004)
+                        buf[i] += a * e * math.sin(w * t)
+        return buf
+
+    def _write(path, buf, peak=0.42):
         if os.path.exists(path):
             return
-        samples = []
-        for freq, dur, vol in tones:
-            if freq == 0:  # silence gap
-                samples.extend([0] * int(rate * dur))
-            else:
-                for i in range(int(rate * dur)):
-                    t = i / rate
-                    env = min(1.0, min(t * 50, (dur - t) * 50))
-                    samples.append(int(vol * env * math.sin(2 * math.pi * freq * t) * 32767))
-        raw = struct.pack(f"<{len(samples)}h", *samples)
+        m = max((abs(v) for v in buf), default=0.0)
+        g = (peak / m) if m > 0 else 0.0
+        out = []
+        for v in buf:
+            x = v * g
+            # Gentle tanh-ish soft clip; cannot ever hard-clip to a buzz.
+            x = math.tanh(x * 1.35) / 1.35
+            out.append(int(max(-1.0, min(1.0, x)) * 32767))
         try:
             with open(path, "wb") as f:
                 w = wave.open(f, "wb")
-                w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate)
-                w.writeframes(raw); w.close()
+                w.setnchannels(1); w.setsampwidth(2); w.setframerate(CHIME_RATE)
+                w.writeframes(struct.pack(f"<{len(out)}h", *out)); w.close()
         except OSError:
             pass
 
-    _make(state.CHIME_PATH, [(880, 0.03, 0.3), (1175, 0.05, 0.4)])
-    _make(state.CHIME_PROCESSING, [(1320, 0.025, 0.2)])
-    _make(state.CHIME_SPEAK, [(1175, 0.03, 0.25), (880, 0.04, 0.3)])
-    _make(state.CHIME_DONE, [(1175, 0.03, 0.2), (880, 0.05, 0.15)])
-    _make(state.CHIME_HUM, [(150, 1.0, 0.1)])
-    _make(state.CHIME_PAUSE, [(660, 0.04, 0.25), (440, 0.06, 0.2)])
-    _make(state.CHIME_RESUME, [(440, 0.04, 0.2), (660, 0.06, 0.25)])
+    # ready — an open rising fifth: an invitation to speak.
+    _write(state.CHIME_PATH,
+           _render([(A4, 0.000, 0.85, 0.55), (D5, 0.075, 0.95, 0.85)]))
+
+    # processing — a single soft low tick. Deliberately the quietest of the
+    # set: it can fire repeatedly and must never draw attention.
+    _write(state.CHIME_PROCESSING,
+           _render([(F4, 0.0, 0.50, 0.22)], tail=0.15), peak=0.20)
+
+    # speak — one warm note, Ember about to talk.
+    _write(state.CHIME_SPEAK,
+           _render([(C5, 0.0, 0.95, 0.70)]), peak=0.38)
+
+    # done — a falling fifth resolving down to the root: closure.
+    _write(state.CHIME_DONE,
+           _render([(C5, 0.000, 0.80, 0.50), (F4, 0.080, 0.90, 1.00)]), peak=0.34)
+
+    # hum — sustained working drone, two octaves beating slowly. Very soft;
+    # this one loops continuously while thinking.
+    _write(state.CHIME_HUM,
+           _render([(F3, 0.0, 0.85, 1.60), (F4, 0.0, 0.30, 1.40)], tail=0.2),
+           peak=0.16)
+
+    # pause — damped falling step, short decay: something set down.
+    _write(state.CHIME_PAUSE,
+           _render([(A4, 0.000, 0.75, 0.30), (F4, 0.055, 0.80, 0.40)]), peak=0.30)
+
+    # resume — the mirror of pause, rising and opening back up.
+    _write(state.CHIME_RESUME,
+           _render([(F4, 0.000, 0.75, 0.35), (A4, 0.055, 0.85, 0.60)]), peak=0.32)
 
 
 def _play_sound(path):
