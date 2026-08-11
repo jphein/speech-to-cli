@@ -148,6 +148,27 @@ Example `config.json`:
 
 > ⚠️ **Never commit your API key.** Use environment variables or the config file (which is in your home directory, outside the repo). See [Security](#security) below.
 
+### Offline fallback (Wyoming)
+
+If you run a [Wyoming](https://github.com/rhasspy/wyoming) server on your LAN
+(e.g. Piper for TTS, an ONNX-ASR/whisper server for STT — the same services
+Home Assistant's Assist uses), STT and TTS automatically fall back to it on
+network-class Azure failures (timeouts, connection errors, HTTP 5xx — never on
+content errors or recognized silence):
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `wyoming_host` | `""` | LAN hostname/IP of the Wyoming server; empty disables the feature. |
+| `wyoming_tts_port` | `10200` | Wyoming TTS (e.g. wyoming-piper). |
+| `wyoming_stt_port` | `10300` | Wyoming STT (e.g. wyoming-onnx-asr / wyoming-faster-whisper). |
+| `wyoming_tts_voice` | `""` | Piper voice name; empty uses the server default. |
+
+A 60-second circuit breaker skips Azure entirely while it's marked down, so
+offline calls don't wait out the timeout. Set `SPEECH_FORCE_OFFLINE=1` to force
+the fallback (manual offline mode; also the test lever). Degradation is
+graceful: everything speaks in the single Piper voice, and streaming dictation
+loses live partials (the final transcript still arrives).
+
 ## Usage
 
 ### MCP Server (recommended)

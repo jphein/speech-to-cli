@@ -168,6 +168,11 @@ def load_config():
         # Separate TTS region/key for DragonHD voices (only available in select regions)
         "tts_region": cfg.get("tts_region", None),  # None = use main region
         "tts_key": cfg.get("tts_key", None),          # None = use main key
+        # Wyoming offline fallback (LAN STT/TTS when Azure is unreachable)
+        "wyoming_host": cfg.get("wyoming_host", ""),  # "" = feature off
+        "wyoming_tts_port": cfg.get("wyoming_tts_port", 10200),
+        "wyoming_stt_port": cfg.get("wyoming_stt_port", 10300),
+        "wyoming_tts_voice": cfg.get("wyoming_tts_voice", ""),  # "" = server default
         # Audio device settings
         "player": cfg.get("player", "auto"),
         "recorder": cfg.get("recorder", "auto"),

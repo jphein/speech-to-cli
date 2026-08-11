@@ -13,6 +13,7 @@ import time
 import uuid
 
 import state
+import wyoming
 from state import (CONFIG, HAS_VAD, HAS_WS, HAS_WHISPER,
                    is_cancelled, register_proc, unregister_proc,
                    get_http_session, send_progress, _get_iso_timestamp)
@@ -253,13 +254,39 @@ def _parse_ws_msg(msg, phrases, partial_holder, end_word_event, end_word, _log,
     return None
 
 
+def _wyoming_stt(raw_data, _log):
+    """Offline STT via the configured Wyoming server. Returns text or ""."""
+    host = CONFIG.get("wyoming_host", "")
+    if not host:
+        return ""
+    if raw_data[:4] == b"RIFF":
+        raw_data = raw_data[44:]  # strip our own standard WAV header
+    try:
+        text = wyoming.transcribe(
+            host, int(CONFIG.get("wyoming_stt_port", 10300)),
+            raw_data, rate=16000)
+        _log(f"Wyoming STT recovered: {repr(text[:100])}")
+        return text
+    except wyoming.WyomingError as e:
+        _log(f"Wyoming STT failed: {e}")
+        return ""
+
+
 def _rest_stt_fallback(raw_frames, _log=None):
-    """Fallback STT via REST API when WS fails. Returns text or empty string."""
+    """Fallback STT via REST API when WS fails. Returns text or empty string.
+
+    Falls through to the LAN Wyoming server only on network-class Azure
+    failures — an Azure-reachable "NoMatch" (silence) stays silent.
+    """
     if _log is None:
         _log = lambda msg: None
     raw_data = b"".join(raw_frames) if isinstance(raw_frames, list) else raw_frames
     if not raw_data:
         return ""
+    if wyoming.skip_azure():
+        _log("Azure marked down — Wyoming STT direct")
+        return _wyoming_stt(raw_data, _log)
+    azure_reachable = False
     _log(f"REST STT fallback: {len(raw_data)} bytes")
     # Build WAV in memory — no disk I/O
     wav_header = struct.pack('<4sI4s4sIHHIIHH4sI',
@@ -279,6 +306,8 @@ def _rest_stt_fallback(raw_frames, _log=None):
             headers=stt_headers, data=wav_data, timeout=30,
         )
         if resp.status_code == 200:
+            azure_reachable = True
+            wyoming.mark_azure_up()
             result = resp.json()
             status = result.get("RecognitionStatus", "?")
             _log(f"REST STT status={status}")
@@ -290,9 +319,14 @@ def _rest_stt_fallback(raw_frames, _log=None):
             _log(f"REST STT non-success: {status}")
         else:
             _log(f"REST STT HTTP error: {resp.status_code}")
+            if resp.status_code >= 500:
+                wyoming.mark_azure_down()
     except Exception as e:
         _log(f"REST STT exception: {e}")
-    return ""
+        wyoming.mark_azure_down()
+    if azure_reachable:
+        return ""
+    return _wyoming_stt(raw_data, _log)
 
 
 # ---------------------------------------------------------------------------
@@ -524,16 +558,36 @@ def stt_vad(max_seconds=30, progress_token=None):
         write_wav(tmp_path, raw_data)
 
         send_progress(progress_token, 50, 100, "🧠 Transcribing...")
+        if wyoming.skip_azure():
+            with open(tmp_path, "rb") as f:
+                text = _wyoming_stt(f.read(), lambda m: None)
+            send_progress(progress_token, 100, 100, "✅ Done (offline)")
+            return {"text": text, "engine": "wyoming"}
         url = f"https://{CONFIG['region']}.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1"
         headers = {
             "Ocp-Apim-Subscription-Key": CONFIG["key"],
             "Content-Type": "audio/wav; codecs=audio/pcm; samplerate=16000",
         }
-        with open(tmp_path, "rb") as f:
-            resp = get_http_session().post(url, params={"language": CONFIG.get("language", "en-US"), "format": "detailed"},
-                                 headers=headers, data=f, timeout=30)
+        try:
+            with open(tmp_path, "rb") as f:
+                resp = get_http_session().post(url, params={"language": CONFIG.get("language", "en-US"), "format": "detailed"},
+                                     headers=headers, data=f, timeout=30)
+        except Exception as e:
+            wyoming.mark_azure_down()
+            with open(tmp_path, "rb") as f:
+                text = _wyoming_stt(f.read(), lambda m: None)
+            if text:
+                return {"text": text, "engine": "wyoming"}
+            return {"error": f"Azure STT unreachable ({e}); offline fallback failed"}
         if resp.status_code != 200:
+            if resp.status_code >= 500:
+                wyoming.mark_azure_down()
+                with open(tmp_path, "rb") as f:
+                    text = _wyoming_stt(f.read(), lambda m: None)
+                if text:
+                    return {"text": text, "engine": "wyoming"}
             return {"error": f"Azure STT error {resp.status_code}"}
+        wyoming.mark_azure_up()
         result = resp.json()
         if result.get("RecognitionStatus") == "Success":
             nbest = result.get("NBest", [])
@@ -629,16 +683,36 @@ def stt_fixed(seconds=5, progress_token=None):
             return {"error": "Recording failed"}
 
         send_progress(progress_token, 50, 100, "🧠 Transcribing...")
+        if wyoming.skip_azure():
+            with open(tmp_path, "rb") as f:
+                text = _wyoming_stt(f.read(), lambda m: None)
+            send_progress(progress_token, 100, 100, "✅ Done (offline)")
+            return {"text": text, "engine": "wyoming"}
         url = f"https://{CONFIG['region']}.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1"
         headers = {
             "Ocp-Apim-Subscription-Key": CONFIG["key"],
             "Content-Type": "audio/wav; codecs=audio/pcm; samplerate=16000",
         }
-        with open(tmp_path, "rb") as f:
-            resp = get_http_session().post(url, params={"language": CONFIG.get("language", "en-US"), "format": "detailed"},
-                                 headers=headers, data=f, timeout=30)
+        try:
+            with open(tmp_path, "rb") as f:
+                resp = get_http_session().post(url, params={"language": CONFIG.get("language", "en-US"), "format": "detailed"},
+                                     headers=headers, data=f, timeout=30)
+        except Exception as e:
+            wyoming.mark_azure_down()
+            with open(tmp_path, "rb") as f:
+                text = _wyoming_stt(f.read(), lambda m: None)
+            if text:
+                return {"text": text, "engine": "wyoming"}
+            return {"error": f"Azure STT unreachable ({e}); offline fallback failed"}
         if resp.status_code != 200:
+            if resp.status_code >= 500:
+                wyoming.mark_azure_down()
+                with open(tmp_path, "rb") as f:
+                    text = _wyoming_stt(f.read(), lambda m: None)
+                if text:
+                    return {"text": text, "engine": "wyoming"}
             return {"error": f"Azure STT error {resp.status_code}"}
+        wyoming.mark_azure_up()
         result = resp.json()
         if result.get("RecognitionStatus") == "Success":
             nbest = result.get("NBest", [])

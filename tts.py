@@ -12,10 +12,13 @@ Usage:
 
 import argparse
 import os
+import struct
 import subprocess
 import sys
 import requests
 
+import state
+import wyoming
 from state import load_config_standalone
 
 
@@ -36,8 +39,35 @@ def get_text(args_text):
     return None
 
 
+def _synthesize_wyoming(text):
+    """Offline synthesis via the configured Wyoming server → RIFF WAV bytes."""
+    host = state.CONFIG.get("wyoming_host", "")
+    if not host:
+        return None
+    try:
+        rate, width, channels, pcm = wyoming.synthesize(
+            host, int(state.CONFIG.get("wyoming_tts_port", 10200)), text,
+            voice=state.CONFIG.get("wyoming_tts_voice") or None)
+    except wyoming.WyomingError as e:
+        print(f"[wyoming] TTS fallback failed: {e}", file=sys.stderr)
+        return None
+    print(f"[wyoming] TTS via {host} ({len(pcm)} bytes @ {rate} Hz)",
+          file=sys.stderr)
+    header = struct.pack('<4sI4s4sIHHIIHH4sI',
+        b'RIFF', 36 + len(pcm), b'WAVE', b'fmt ', 16, 1, channels,
+        rate, rate * width * channels, width * channels, width * 8,
+        b'data', len(pcm))
+    return header + pcm
+
+
 def synthesize(text, key, region, voice):
-    """Send text to Azure TTS, return audio bytes."""
+    """Send text to Azure TTS, return audio bytes (RIFF WAV).
+
+    Falls back to the LAN Wyoming server on network-class Azure failures
+    (aplay parses the WAV header, so the different sample rate just works).
+    """
+    if wyoming.skip_azure():
+        return _synthesize_wyoming(text)
     url = f"https://{region}.tts.speech.microsoft.com/cognitiveservices/v1"
     safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
     ssml = (
@@ -49,10 +79,24 @@ def synthesize(text, key, region, voice):
         "Content-Type": "application/ssml+xml",
         "X-Microsoft-OutputFormat": "riff-24khz-16bit-mono-pcm",
     }
-    resp = requests.post(url, headers=headers, data=ssml.encode("utf-8"), timeout=30)
+    try:
+        resp = requests.post(url, headers=headers, data=ssml.encode("utf-8"), timeout=30)
+    except requests.RequestException as e:
+        wyoming.mark_azure_down()
+        audio = _synthesize_wyoming(text)
+        if audio is not None:
+            return audio
+        print(f"Azure TTS request failed: {e}", file=sys.stderr)
+        return None
     if resp.status_code != 200:
+        if resp.status_code >= 500:
+            wyoming.mark_azure_down()
+            audio = _synthesize_wyoming(text)
+            if audio is not None:
+                return audio
         print(f"Azure TTS error {resp.status_code}: {resp.text}", file=sys.stderr)
         return None
+    wyoming.mark_azure_up()
     return resp.content
 
 
