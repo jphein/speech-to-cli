@@ -14,7 +14,10 @@ import threading
 import time
 import uuid
 
+import sys
+
 import state
+import wyoming
 from state import (CONFIG, HAS_WS, HAS_VAD,
                    is_cancelled, register_proc, unregister_proc,
                    get_http_session, send_progress, _pause_event)
@@ -456,6 +459,78 @@ def multi_speak(segments, quality="fast", progress_token=None, output_file=None)
 # tts (single segment, streaming playback)
 # ---------------------------------------------------------------------------
 
+def _tts_wyoming(text, proc, audio_level_cb=None, output_file=None,
+                 progress_token=None):
+    """Offline TTS via the configured Wyoming server.
+
+    proc: an already-started Azure-rate player to discard, or None.
+    Returns a result dict, or None when Wyoming is unconfigured/failed
+    (caller then returns its original Azure error).
+    """
+    host = CONFIG.get("wyoming_host", "")
+    if not host:
+        return None
+    try:
+        rate, width, channels, pcm = wyoming.synthesize(
+            host, int(CONFIG.get("wyoming_tts_port", 10200)), text,
+            voice=CONFIG.get("wyoming_tts_voice") or None)
+    except wyoming.WyomingError as e:
+        print(f"[wyoming] TTS fallback failed: {e}", file=sys.stderr)
+        return None
+    print(f"[wyoming] TTS via {host} ({len(pcm)} bytes @ {rate} Hz)",
+          file=sys.stderr)
+    if proc is not None:
+        try:
+            proc.stdin.close()
+            proc.terminate()
+        except Exception:
+            pass
+    proc = _start_player(rate)
+    if proc is None:
+        return {"error": "No audio player found — set 'player' in config"}
+    register_proc(proc)
+    play_speak()
+    send_progress(progress_token, 5, 100, "🔊 Speaking (offline)...")
+    try:
+        lead_ms = _tts_lead_in_ms()
+        proc.stdin.write(b"\x00" * (rate * width * lead_ms // 1000))
+        n = 0
+        for i in range(0, len(pcm), 16384):
+            if is_cancelled():
+                break
+            while _pause_event.is_set() and not is_cancelled():
+                time.sleep(0.05)
+            chunk = pcm[i:i + 16384]
+            proc.stdin.write(chunk)
+            proc.stdin.flush()
+            n += 1
+            if audio_level_cb and n % 3 == 0:
+                try:
+                    audio_level_cb(min(rms_energy(chunk[:3200]) / 8000.0, 1.0))
+                except Exception:
+                    pass
+        proc.stdin.close()
+        while proc.poll() is None:
+            if is_cancelled():
+                proc.terminate()
+                break
+            time.sleep(0.1)
+    except (BrokenPipeError, OSError):
+        pass
+    if output_file:
+        try:
+            with open(output_file, "wb") as f:
+                f.write(struct.pack('<4sI4s4sIHHIIHH4sI',
+                    b'RIFF', 36 + len(pcm), b'WAVE', b'fmt ', 16, 1, channels,
+                    rate, rate * width * channels, width * channels,
+                    width * 8, b'data', len(pcm)))
+                f.write(pcm)
+        except OSError:
+            pass
+    send_progress(progress_token, 100, 100, "✅ Done (offline)")
+    return {"ok": True, "engine": "wyoming"}
+
+
 def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="default", progress_token=None, subtitle_color=None, audio_level_cb=None, output_file=None):
     """Speak text aloud via Azure TTS with streaming playback.
     If output_file is set, saves audio to that path (MP3 or WAV) alongside playback."""
@@ -470,17 +545,44 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
 
     ssml, tts_rate, headers, url = _prepare_tts(text, quality, speed, voice, pitch, volume)
 
+    # Circuit breaker open (or forced offline): skip Azure entirely
+    if wyoming.skip_azure():
+        result = _tts_wyoming(text, None, audio_level_cb=audio_level_cb,
+                              output_file=output_file,
+                              progress_token=progress_token)
+        if result is not None:
+            return result
+        return {"error": "Azure marked down and offline fallback unavailable"}
+
     # Take pre-warmed player or start fresh (overlaps with TTS API latency)
     proc = _take_prewarmed_player(tts_rate) or _start_player(tts_rate)
     if proc is None:
         return {"error": "No audio player found — set 'player' in config"}
 
     # Fire TTS request (player is already waiting for stdin data)
-    resp = get_http_session().post(url, headers=headers, data=ssml.encode("utf-8"), timeout=60, stream=True)
+    try:
+        resp = get_http_session().post(url, headers=headers, data=ssml.encode("utf-8"), timeout=60, stream=True)
+    except Exception as e:
+        # Network-class failure — try the LAN Wyoming fallback
+        wyoming.mark_azure_down()
+        result = _tts_wyoming(text, proc, audio_level_cb=audio_level_cb,
+                              output_file=output_file,
+                              progress_token=progress_token)
+        if result is not None:
+            return result
+        return {"error": f"TTS request failed: {e}"}
     if resp.status_code != 200:
+        if resp.status_code >= 500:
+            wyoming.mark_azure_down()
+            result = _tts_wyoming(text, proc, audio_level_cb=audio_level_cb,
+                                  output_file=output_file,
+                                  progress_token=progress_token)
+            if result is not None:
+                return result
         proc.stdin.close()
         proc.wait()
         return {"error": f"Azure TTS error {resp.status_code}: {resp.text}"}
+    wyoming.mark_azure_up()
 
     send_progress(progress_token, 5, 100, "🔊 Speaking...")
     play_speak()
