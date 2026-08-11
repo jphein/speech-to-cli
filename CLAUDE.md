@@ -12,7 +12,8 @@ License: GPL-3.0.
 - **PipeWire / ALSA** — audio recording and playback
 - **webrtcvad** — voice activity detection
 - **websocket-client** — persistent WebSocket for streaming STT
-- **faster-whisper** — optional local STT (offline fallback)
+- **faster-whisper** — optional local STT (superseded as the offline path by the Wyoming LAN fallback below; remains available as the explicit `whisper` mode if installed)
+- **Wyoming fallback** — STT/TTS automatically fall back to a LAN Wyoming server (Piper TTS + ONNX-ASR STT) on network-class Azure failures. Config: `wyoming_host` ("" = off), `wyoming_tts_port`, `wyoming_stt_port`, `wyoming_tts_voice` in config.json. A 60s circuit breaker skips Azure while it's marked down; `SPEECH_FORCE_OFFLINE=1` forces offline (manual lever + test seam). Degradation: single Piper voice, no live partials.
 - **requests** — HTTP client with connection pooling
 - **numpy** — optional, accelerates RMS energy calculation (~5-10x via SIMD)
 
