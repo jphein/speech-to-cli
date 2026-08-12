@@ -2,7 +2,7 @@
 # Azure Speech MCP Server (speech-to-cli)
 
 MCP server providing voice I/O (STT + TTS) for AI CLI agents via Azure Speech Services.
-Version 4.3.0. Python 3, threading-based, no Azure SDK — plain REST/WebSocket.
+Version 4.4.0. Python 3, threading-based, no Azure SDK — plain REST/WebSocket.
 License: GPL-3.0.
 
 ## Tech Stack
