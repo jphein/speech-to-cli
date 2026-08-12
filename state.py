@@ -175,6 +175,10 @@ def load_config():
         "wyoming_tts_voice": cfg.get("wyoming_tts_voice", "en_GB-cori-high"),
         "wyoming_wake_port": cfg.get("wyoming_wake_port", 10400),
         "llm_thinking": cfg.get("llm_thinking", False),  # reasoning models: think before voice replies
+        # Spiel speech provider (org.freedesktop.Speech.Provider)
+        "spiel_provider": cfg.get("spiel_provider", False),
+        "spiel_voices": cfg.get("spiel_voices", ["en_GB-cori-high"]),
+        "spiel_expose_azure": cfg.get("spiel_expose_azure", False),
         "wake_word": cfg.get("wake_word", False),           # wake watcher on/off
         "wake_word_model": cfg.get("wake_word_model", ""),  # openwakeword model name
         # Audio device settings
