@@ -173,6 +173,9 @@ def load_config():
         "wyoming_tts_port": cfg.get("wyoming_tts_port", 10200),
         "wyoming_stt_port": cfg.get("wyoming_stt_port", 10300),
         "wyoming_tts_voice": cfg.get("wyoming_tts_voice", ""),  # "" = server default
+        "wyoming_wake_port": cfg.get("wyoming_wake_port", 10400),
+        "wake_word": cfg.get("wake_word", False),           # wake watcher on/off
+        "wake_word_model": cfg.get("wake_word_model", ""),  # openwakeword model name
         # Audio device settings
         "player": cfg.get("player", "auto"),
         "recorder": cfg.get("recorder", "auto"),
