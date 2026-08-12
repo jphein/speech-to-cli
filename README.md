@@ -162,6 +162,9 @@ content errors or recognized silence):
 | `wyoming_tts_port` | `10200` | Wyoming TTS (e.g. wyoming-piper). |
 | `wyoming_stt_port` | `10300` | Wyoming STT (e.g. wyoming-onnx-asr / wyoming-faster-whisper). |
 | `wyoming_tts_voice` | `""` | Piper voice name; empty uses the server default. |
+| `wyoming_wake_port` | `10400` | Wyoming wake-word server (e.g. wyoming-openwakeword). |
+| `wake_word` | `false` | Arm the wake-word watcher (consumers like gnome-speaks stream mic audio for detection). |
+| `wake_word_model` | `""` | openwakeword model name — effectively your wake phrase; keep it out of public repos. |
 
 A 60-second circuit breaker skips Azure entirely while it's marked down, so
 offline calls don't wait out the timeout. Set `SPEECH_FORCE_OFFLINE=1` to force

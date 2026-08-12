@@ -13,6 +13,7 @@ wyoming_host is empty.
 import json
 import os
 import socket
+import threading
 import time
 
 import state
@@ -157,4 +158,56 @@ def transcribe(host, port, pcm, rate=16000, width=2, channels=1, timeout=20.0):
             if etype == "transcript":
                 return (edata.get("text") or "").strip()
     finally:
+        sock.close()
+
+
+def detect_stream(host, port, model, chunk_iter, timeout=5.0):
+    """Stream mic audio to a Wyoming wake-word server until detection.
+
+    chunk_iter yields raw s16le 16 kHz mono chunks and stops when the caller
+    wants to disarm. A reader thread blocks on server events (select() over a
+    BufferedReader misses buffered events — thread avoids the trap). Returns
+    the detection name, or None if chunk_iter ended first. Raises
+    WyomingError on connect failure.
+    """
+    sock = _connect(host, port, timeout)
+    sock.settimeout(None)  # reader thread blocks indefinitely
+    f = sock.makefile("rb")
+    detected = []
+    done = threading.Event()
+
+    def _reader():
+        try:
+            while not done.is_set():
+                etype, edata, _payload = _read_event(f)
+                if etype == "detection":
+                    detected.append(edata.get("name") or model)
+                    done.set()
+                    return
+        except Exception:
+            done.set()
+
+    reader = threading.Thread(target=_reader, daemon=True,
+                              name="wyoming-wake-reader")
+    try:
+        _send_event(sock, "detect", {"names": [model]})
+        fmt = {"rate": 16000, "width": 2, "channels": 1}
+        _send_event(sock, "audio-start", dict(fmt))
+        reader.start()
+        for chunk in chunk_iter:
+            if done.is_set():
+                break
+            try:
+                _send_event(sock, "audio-chunk", dict(fmt), chunk)
+            except OSError as e:
+                raise WyomingError(f"wake stream write: {e}")
+        # Give an in-flight detection a moment to land after the last chunk
+        done.wait(timeout=0.5)
+        return detected[0] if detected else None
+    finally:
+        done.set()
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         sock.close()
