@@ -131,7 +131,12 @@ def _build_ssml(text, voice, quality, speed, pitch, volume):
     safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
     attrs = []
     if quality == "fast":
-        attrs.append('rate="+15%"')
+        # Fast quality's +15% baseline COMPOSES with the user's speed
+        # instead of silently discarding it (gnome-speaks#17: the Speed
+        # setting did nothing on the default quality). speed=1.0 keeps
+        # the historical +15%.
+        pct = int((speed * 1.15 - 1.0) * 100)
+        attrs.append(f'rate="{("+" if pct >= 0 else "")}{pct}%"')
     elif speed != 1.0:
         pct = int((speed - 1.0) * 100)
         attrs.append(f'rate="{("+" if pct >= 0 else "")}{pct}%"')

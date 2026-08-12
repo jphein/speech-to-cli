@@ -140,6 +140,10 @@ def main():
     args = parser.parse_args()
 
     key, region, voice = load_config_standalone(need_voice=True)
+    # HD voices only exist in certain regions — honor the dedicated TTS
+    # region/key like the MCP path does (#9). None/empty = primary.
+    region = state.CONFIG.get("tts_region") or region
+    key = state.CONFIG.get("tts_key") or key
     text = get_text(args.text)
     if not text:
         print("No text to speak. Usage: tts.py \"text\" or copy text to clipboard first.", file=sys.stderr)
@@ -154,15 +158,21 @@ def main():
     print(f"\033[93m🔊 {preview}\033[0m", file=sys.stderr)
 
     audio = synthesize(text, key, region, voice)
-    if audio:
-        if args.output:
-            if save_audio(audio, args.output):
-                size = os.path.getsize(os.path.expanduser(args.output))
-                print(f"\033[92m💾 Saved: {args.output} ({size} bytes)\033[0m", file=sys.stderr)
-            else:
-                print(f"\033[91m❌ Failed to save: {args.output}\033[0m", file=sys.stderr)
-        if not args.silent:
-            play_audio(audio)
+    if not audio:
+        # Azure failed AND the Wyoming fallback (if configured) failed —
+        # exit non-zero so callers (agent loops, dreamteam) can detect it (#7).
+        print("\033[91m❌ Synthesis failed — no audio produced\033[0m", file=sys.stderr)
+        sys.exit(1)
+
+    if args.output:
+        if save_audio(audio, args.output):
+            size = os.path.getsize(os.path.expanduser(args.output))
+            print(f"\033[92m💾 Saved: {args.output} ({size} bytes)\033[0m", file=sys.stderr)
+        else:
+            print(f"\033[91m❌ Failed to save: {args.output}\033[0m", file=sys.stderr)
+            sys.exit(1)
+    if not args.silent:
+        play_audio(audio)
 
 
 if __name__ == "__main__":

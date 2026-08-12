@@ -208,6 +208,10 @@ def load_config():
         "end_word": cfg.get("end_word", "over"),
         "max_record_seconds": cfg.get("max_record_seconds", 120),
         "enable_echo_cancel": cfg.get("enable_echo_cancel", False),
+        # TTS prosody — passed through to tts() by consumers (gnome-speaks#17)
+        "speed": cfg.get("speed", 1.0),
+        "pitch": cfg.get("pitch", "default"),
+        "volume": cfg.get("volume", "default"),
         # User-authored word corrections — read by gnome-speaks
         # apply_auto_corrections(); was unwhitelisted, so every user's
         # corrections silently never applied (prefs-audit finding #1).
