@@ -218,7 +218,7 @@ def load_config():
         "half_duplex": cfg.get("half_duplex", "auto"),
         # LLM / conversation mode settings (used by gnome-speaks)
         "llm_provider": cfg.get("llm_provider", "anthropic"),
-        "llm_model": cfg.get("llm_model", "claude-opus-4-6"),
+        "llm_model": cfg.get("llm_model", "claude-opus-4.6"),  # dotted canonical (MODEL_MAP form)
         "llm_api_key": cfg.get("llm_api_key", ""),
         "llm_system_prompt": cfg.get("llm_system_prompt", ""),
         "conversation_mode": cfg.get("conversation_mode", False),
