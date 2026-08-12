@@ -212,6 +212,8 @@ def load_config():
         "speed": cfg.get("speed", 1.0),
         "pitch": cfg.get("pitch", "default"),
         "volume": cfg.get("volume", "default"),
+        # Spoken-word ledger kept by gnome-speaks (chronicle.jsonl + respeak)
+        "chronicle": cfg.get("chronicle", True),
         # User-authored word corrections — read by gnome-speaks
         # apply_auto_corrections(); was unwhitelisted, so every user's
         # corrections silently never applied (prefs-audit finding #1).
