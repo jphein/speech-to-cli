@@ -174,6 +174,7 @@ def load_config():
         "wyoming_stt_port": cfg.get("wyoming_stt_port", 10300),
         "wyoming_tts_voice": cfg.get("wyoming_tts_voice", "en_GB-cori-high"),
         "wyoming_wake_port": cfg.get("wyoming_wake_port", 10400),
+        "llm_thinking": cfg.get("llm_thinking", False),  # reasoning models: think before voice replies
         "wake_word": cfg.get("wake_word", False),           # wake watcher on/off
         "wake_word_model": cfg.get("wake_word_model", ""),  # openwakeword model name
         # Audio device settings
