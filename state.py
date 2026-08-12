@@ -208,6 +208,11 @@ def load_config():
         "end_word": cfg.get("end_word", "over"),
         "max_record_seconds": cfg.get("max_record_seconds", 120),
         "enable_echo_cancel": cfg.get("enable_echo_cancel", False),
+        # User-authored word corrections — read by gnome-speaks
+        # apply_auto_corrections(); was unwhitelisted, so every user's
+        # corrections silently never applied (prefs-audit finding #1).
+        "auto_corrections": cfg.get("auto_corrections", {}),
+        "conversation_silence_timeout": cfg.get("conversation_silence_timeout", 4.0),
         "enable_barge_in": cfg.get("enable_barge_in", False),
         "debug": cfg.get("debug", False),
         "half_duplex": cfg.get("half_duplex", "auto"),
