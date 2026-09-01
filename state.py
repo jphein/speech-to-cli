@@ -231,6 +231,11 @@ def load_config():
         "dictation_mode": cfg.get("dictation_mode", True),
         "skip_final_paste": cfg.get("skip_final_paste", True),
         "terminal_mode": cfg.get("terminal_mode", False),
+        # Text-injection backend used by gnome-speaks: "ydotool" | "ibus" |
+        # "auto". Read by the Python side, so it MUST live in this whitelist —
+        # an unlisted key is silently dropped and the feature reads its
+        # default forever.
+        "injection_method": cfg.get("injection_method", "ydotool"),
         "continuous_dictation": cfg.get("continuous_dictation", False),
         "loop_silence_timeout": cfg.get("loop_silence_timeout", 1.2),
         "read_notifications": cfg.get("read_notifications", False),
