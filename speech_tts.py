@@ -465,10 +465,15 @@ def multi_speak(segments, quality="fast", progress_token=None, output_file=None)
 # ---------------------------------------------------------------------------
 
 def _tts_wyoming(text, proc, audio_level_cb=None, output_file=None,
-                 progress_token=None):
+                 progress_token=None, voice=None):
     """Offline TTS via the configured Wyoming server.
 
     proc: an already-started Azure-rate player to discard, or None.
+    voice: a Piper voice name (e.g. "en_GB-cori-high"). Caller-specified wins
+    over the config default. Before 2026-08-16 this parameter DID NOT EXIST —
+    per-call voices sent by HTTP /speak callers were silently discarded on
+    this path, so every caller spoke in the resident default.
+    Measured, not inferred: a nonexistent voice name returned "done".
     Returns a result dict, or None when Wyoming is unconfigured/failed
     (caller then returns its original Azure error).
     """
@@ -478,7 +483,7 @@ def _tts_wyoming(text, proc, audio_level_cb=None, output_file=None,
     try:
         rate, width, channels, pcm = wyoming.synthesize(
             host, int(CONFIG.get("wyoming_tts_port", 10200)), text,
-            voice=CONFIG.get("wyoming_tts_voice") or None)
+            voice=voice or CONFIG.get("wyoming_tts_voice") or None)
     except wyoming.WyomingError as e:
         print(f"[wyoming] TTS fallback failed: {e}", file=sys.stderr)
         return None
@@ -547,6 +552,23 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
     text = text[:state._MAX_TTS_CHARS]
     if not output_file:
         output_file = _auto_output_file()
+
+    # A Piper-shaped voice name (xx_YY-name-tier) routes DIRECTLY to Wyoming and
+    # never touches Azure. Two failure modes this forecloses (2026-08-16, both
+    # measured): Azure-healthy would 400 on a Piper name and 400 < 500 skips the
+    # fallback — nothing is spoken at all; Azure-down spoke in the resident
+    # default — every caller sounded IDENTICAL. Same config, two wrong
+    # behaviours, selected by circuit-breaker state nobody can see.
+    piper_voice = None
+    if voice and re.match(r"^[a-z]{2}_[A-Z]{2}-[A-Za-z0-9_]+-(x_low|low|medium|high)$", voice):
+        piper_voice = voice
+    if piper_voice is not None:
+        result = _tts_wyoming(text, None, audio_level_cb=audio_level_cb,
+                              output_file=output_file,
+                              progress_token=progress_token, voice=piper_voice)
+        if result is not None:
+            return result
+        return {"error": f"Piper voice '{piper_voice}' requested but Wyoming TTS unavailable"}
 
     ssml, tts_rate, headers, url = _prepare_tts(text, quality, speed, voice, pitch, volume)
 
