@@ -572,14 +572,19 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
 
     ssml, tts_rate, headers, url = _prepare_tts(text, quality, speed, voice, pitch, volume)
 
-    # Circuit breaker open (or forced offline): skip Azure entirely
+    # Azure skipped (forced offline / local preferred / Azure on cooldown):
+    # go to the LAN Wyoming server first. If IT fails and we are not forced
+    # offline, trip the local breaker and fall through to Azure below.
     if wyoming.skip_azure():
+        reason = wyoming.skip_reason()
         result = _tts_wyoming(text, None, audio_level_cb=audio_level_cb,
                               output_file=output_file,
                               progress_token=progress_token)
         if result is not None:
             return result
-        return {"error": "Azure marked down and offline fallback unavailable"}
+        if not wyoming.azure_fallback_allowed() or reason == "azure_down":
+            return {"error": f"offline TTS unavailable ({reason}) and Azure not attempted"}
+        wyoming.mark_local_down()
 
     # Take pre-warmed player or start fresh (overlaps with TTS API latency)
     proc = _take_prewarmed_player(tts_rate) or _start_player(tts_rate)

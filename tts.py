@@ -67,7 +67,13 @@ def synthesize(text, key, region, voice):
     (aplay parses the WAV header, so the different sample rate just works).
     """
     if wyoming.skip_azure():
-        return _synthesize_wyoming(text)
+        reason = wyoming.skip_reason()
+        audio = _synthesize_wyoming(text)
+        if audio is not None:
+            return audio
+        if not wyoming.azure_fallback_allowed() or reason == "azure_down":
+            return None
+        wyoming.mark_local_down()  # local failed: fall through to Azure
     url = f"https://{region}.tts.speech.microsoft.com/cognitiveservices/v1"
     safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
     ssml = (

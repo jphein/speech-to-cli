@@ -36,9 +36,73 @@ def enabled():
     return bool(state.CONFIG.get("wyoming_host", ""))
 
 
+def prefer_local():
+    """True when config says the LAN Wyoming server is the PRIMARY backend.
+
+    `speech_backend`: "azure" (default) | "local". Set from gnome-speaks prefs
+    (Voice & Sound → Speech Backend). Requires a configured wyoming_host;
+    without one there is nothing local to prefer. Replaces the old
+    SPEECH_FORCE_OFFLINE drop-in for the common case, with one difference:
+    this one FALLS BACK to Azure when the local server fails; forced never does.
+    """
+    return enabled() and str(state.CONFIG.get("speech_backend", "azure")).strip().lower() == "local"
+
+
+_local_down_until = 0.0
+
+
+def local_down():
+    """True while the LAN server is on cooldown after a failure."""
+    return time.time() < _local_down_until
+
+
+def mark_local_down(cooldown=60):
+    global _local_down_until
+    _local_down_until = time.time() + cooldown
+
+
+def mark_local_up():
+    global _local_down_until
+    _local_down_until = 0.0
+
+
 def skip_azure():
-    """True while Azure should not even be attempted."""
-    return force_offline() or (enabled() and time.time() < _azure_down_until)
+    """True while Azure should not even be attempted.
+
+    Three reasons, in priority order (see skip_reason): forced offline via
+    SPEECH_FORCE_OFFLINE; the local server is preferred and not on cooldown;
+    Azure is on cooldown after a failure.
+    """
+    if force_offline():
+        return True
+    if not enabled():
+        return False
+    if time.time() < _azure_down_until:
+        return True
+    return prefer_local() and not local_down()
+
+
+def skip_reason():
+    """Why Azure is being skipped, for logs and /status. None = Azure is live.
+
+    'forced'        SPEECH_FORCE_OFFLINE is set (no Azure fallback at all)
+    'azure_down'    Azure failed within the cooldown window
+    'prefer_local'  speech_backend=local and the LAN server is healthy
+    """
+    if force_offline():
+        return "forced"
+    if not enabled():
+        return None
+    if time.time() < _azure_down_until:
+        return "azure_down"
+    if prefer_local() and not local_down():
+        return "prefer_local"
+    return None
+
+
+def azure_fallback_allowed():
+    """After a LOCAL failure, may the caller try Azure? Never when forced."""
+    return not force_offline()
 
 
 def mark_azure_down(cooldown=60):

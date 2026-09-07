@@ -268,6 +268,7 @@ def _wyoming_stt(raw_data, _log):
         _log(f"Wyoming STT recovered: {repr(text[:100])}")
         return text
     except wyoming.WyomingError as e:
+        wyoming.mark_local_down()  # the LAN server failed, not the speaker
         _log(f"Wyoming STT failed: {e}")
         return ""
 
@@ -284,8 +285,12 @@ def _rest_stt_fallback(raw_frames, _log=None):
     if not raw_data:
         return ""
     if wyoming.skip_azure():
-        _log("Azure marked down — Wyoming STT direct")
-        return _wyoming_stt(raw_data, _log)
+        reason = wyoming.skip_reason()
+        _log(f"Azure skipped ({reason}) — Wyoming STT direct")
+        text = _wyoming_stt(raw_data, _log)
+        if text or not wyoming.local_down() or not wyoming.azure_fallback_allowed() or reason == "azure_down":
+            return text
+        _log("Wyoming STT failed — falling back to Azure REST")
     azure_reachable = False
     _log(f"REST STT fallback: {len(raw_data)} bytes")
     # Build WAV in memory — no disk I/O
@@ -559,10 +564,13 @@ def stt_vad(max_seconds=30, progress_token=None):
 
         send_progress(progress_token, 50, 100, "🧠 Transcribing...")
         if wyoming.skip_azure():
+            reason = wyoming.skip_reason()
             with open(tmp_path, "rb") as f:
                 text = _wyoming_stt(f.read(), lambda m: None)
-            send_progress(progress_token, 100, 100, "✅ Done (offline)")
-            return {"text": text, "engine": "wyoming"}
+            if text or not wyoming.local_down() or not wyoming.azure_fallback_allowed() or reason == "azure_down":
+                send_progress(progress_token, 100, 100, "✅ Done (offline)")
+                return {"text": text, "engine": "wyoming"}
+            # the LAN server failed (not silence): fall through to Azure
         url = f"https://{CONFIG['region']}.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1"
         headers = {
             "Ocp-Apim-Subscription-Key": CONFIG["key"],
@@ -684,10 +692,13 @@ def stt_fixed(seconds=5, progress_token=None):
 
         send_progress(progress_token, 50, 100, "🧠 Transcribing...")
         if wyoming.skip_azure():
+            reason = wyoming.skip_reason()
             with open(tmp_path, "rb") as f:
                 text = _wyoming_stt(f.read(), lambda m: None)
-            send_progress(progress_token, 100, 100, "✅ Done (offline)")
-            return {"text": text, "engine": "wyoming"}
+            if text or not wyoming.local_down() or not wyoming.azure_fallback_allowed() or reason == "azure_down":
+                send_progress(progress_token, 100, 100, "✅ Done (offline)")
+                return {"text": text, "engine": "wyoming"}
+            # the LAN server failed (not silence): fall through to Azure
         url = f"https://{CONFIG['region']}.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1"
         headers = {
             "Ocp-Apim-Subscription-Key": CONFIG["key"],
