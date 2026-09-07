@@ -159,6 +159,7 @@ content errors or recognized silence):
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `wyoming_host` | `""` | LAN hostname/IP of the Wyoming server; empty disables the feature. |
+| `speech_backend` | `"azure"` | Which provider is PRIMARY: `azure` (Wyoming only as fallback) or `local` (Wyoming first, Azure only when the local server fails — a 60 s local breaker). Set from gnome-speaks prefs. |
 | `wyoming_tts_port` | `10200` | Wyoming TTS (e.g. wyoming-piper). |
 | `wyoming_stt_port` | `10300` | Wyoming STT (e.g. wyoming-onnx-asr / wyoming-faster-whisper). |
 | `wyoming_tts_voice` | `""` | Piper voice name; empty uses the server default. |
