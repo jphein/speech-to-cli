@@ -238,6 +238,10 @@ def load_config():
         # an unlisted key is silently dropped and the feature reads its
         # default forever.
         "injection_method": cfg.get("injection_method", "ydotool"),
+        # Which speech provider is PRIMARY: "azure" (default) | "local" (the
+        # Wyoming server, Azure only as fallback). Read by wyoming.prefer_local()
+        # on the Python side, so it MUST be whitelisted here too.
+        "speech_backend": cfg.get("speech_backend", "azure"),
         "continuous_dictation": cfg.get("continuous_dictation", False),
         "loop_silence_timeout": cfg.get("loop_silence_timeout", 1.2),
         "read_notifications": cfg.get("read_notifications", False),
