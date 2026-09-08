@@ -269,6 +269,13 @@ def load_config():
         "voice_commands": cfg.get("voice_commands", True),
         "continuous_dictation": cfg.get("continuous_dictation", False),
         "loop_silence_timeout": cfg.get("loop_silence_timeout", 1.2),
+        # Home Assistant token source for gnome-speaks' spellbook `assist`
+        # action (gnome-speaks#129): the vault item name for `bw get password`
+        # and a token cache file. Read on the Python side by _get_ha_token(),
+        # so both MUST be whitelisted here; both default to "" = not used, so
+        # a stock install never shells out to bw or opens a personal path.
+        "ha_token_item": cfg.get("ha_token_item", ""),
+        "ha_token_cache": cfg.get("ha_token_cache", ""),
         "read_notifications": cfg.get("read_notifications", False),
         # Audio file saving
         "save_audio_dir": cfg.get("save_audio_dir", None),  # auto-save all TTS to this dir
