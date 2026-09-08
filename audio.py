@@ -650,8 +650,18 @@ def _classify_voice_cmd(raw_frames):
 # Recording with VAD
 # ---------------------------------------------------------------------------
 
-def record_with_vad(proc, max_seconds):
-    """Record with energy-gated VAD, returning (raw_frames, energy_threshold)."""
+def record_with_vad(proc, max_seconds, stop_when=None):
+    """Record with energy-gated VAD, returning (raw_frames, energy_threshold).
+
+    Two ways to end early, and they mean different things:
+      is_cancelled()  the process-global cancel wire -- ABANDON (the caller
+                      discards the frames);
+      stop_when()     an optional per-call predicate -- FINISH NOW and KEEP
+                      what was captured. This is the dictation hotkey / a badge
+                      tap in loop mode: without it a batch (VAD) recording ran
+                      on until silence or max_seconds, and a tap looked ignored
+                      (gnome-speaks #110).
+    """
     energy_threshold, calibration_frames = calibrate_noise(proc)
     vad = state.webrtcvad.Vad(state.VAD_AGGRESSIVENESS) if state.HAS_VAD else None
     frames = list(calibration_frames)
@@ -666,6 +676,8 @@ def record_with_vad(proc, max_seconds):
     for _ in range(max_frames):
         if is_cancelled():
             break
+        if stop_when is not None and stop_when():
+            break  # finish early; the frames so far are the utterance
         chunk = proc.stdout.read(state.FRAME_BYTES)
         if not chunk or len(chunk) < state.FRAME_BYTES:
             break
