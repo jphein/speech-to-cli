@@ -78,6 +78,14 @@ class FakeServer:
         except OSError:
             # The client hung up first (cancel mid-stream) -- expected, not noise.
             pass
+        finally:
+            # Release the server side promptly so a caller counting fds (the
+            # unplayed-handle check in tts_prepare_play.py) sees the truth
+            # rather than a socket waiting on the thread's refcount.
+            try:
+                conn.close()
+            except OSError:
+                pass
 
     def _serve(self, conn):
         f = conn.makefile("rb")
@@ -344,11 +352,10 @@ def main():
     check(prewarm_rate() == 24000, f"speech_backend=azure -> 24 kHz prewarm as before ({prewarm_rate()})")
 
 
-try:
-    main()
-finally:
-    # Only ever remove the directory THIS process created, and only if it
-    # still resolves inside the scratch root.
+def cleanup_scratch():
+    """Remove the directory THIS process created -- and only if it still
+    resolves inside the scratch root. Also called by tts_prepare_play.py,
+    which imports this module for its fakes and so inherits its STATE_DIR."""
     real = os.path.realpath(STATE_DIR)
     root = os.path.realpath(SCRATCH_ROOT)
     assert real.startswith(root + os.sep), (real, root)
@@ -358,5 +365,13 @@ finally:
     except OSError:
         pass
 
-print("\n%d failure(s)" % len(fails))
-sys.exit(1 if fails else 0)
+
+if __name__ == "__main__":
+    # Guarded so tts_prepare_play.py can import FakeServer/FakeProc/patch_player
+    # without running this suite. Nothing above this line runs the checks.
+    try:
+        main()
+    finally:
+        cleanup_scratch()
+    print("\n%d failure(s)" % len(fails))
+    sys.exit(1 if fails else 0)
