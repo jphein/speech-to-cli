@@ -242,6 +242,10 @@ def load_config():
         # Wyoming server, Azure only as fallback). Read by wyoming.prefer_local()
         # on the Python side, so it MUST be whitelisted here too.
         "speech_backend": cfg.get("speech_backend", "azure"),
+        # Azure STT phrase hints (list, or the comma-separated string a prefs
+        # entry row stores -- gnome-speaks normalises). Read on the Python
+        # side, so it must be whitelisted or the prefs row is a no-op.
+        "phrase_list": cfg.get("phrase_list", []),
         "continuous_dictation": cfg.get("continuous_dictation", False),
         "loop_silence_timeout": cfg.get("loop_silence_timeout", 1.2),
         "read_notifications": cfg.get("read_notifications", False),
