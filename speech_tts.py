@@ -464,6 +464,28 @@ def multi_speak(segments, quality="fast", progress_token=None, output_file=None)
 # tts (single segment, streaming playback)
 # ---------------------------------------------------------------------------
 
+def _release_player(proc):
+    """Close the player's stdin and make sure it exits -- on EVERY exit path.
+
+    Idempotent, and called from _tts_wyoming's `finally`, so no exception
+    class can orphan a registered player (#20 review: a mid-stream
+    ConnectionResetError skipped the close and returned {'ok': True} while
+    the player sat alive, blocked on stdin). Closing stdin is EOF: a healthy
+    player drains what it was given and exits on its own; the terminate()
+    only fires for one that is still running after that.
+    """
+    try:
+        if proc.stdin is not None and not proc.stdin.closed:
+            proc.stdin.close()
+    except (BrokenPipeError, OSError):
+        pass
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+    except Exception:
+        pass
+
+
 def _tts_wyoming(text, proc, audio_level_cb=None, output_file=None,
                  progress_token=None, voice=None):
     """Offline TTS via the configured Wyoming server.
@@ -493,6 +515,9 @@ def _tts_wyoming(text, proc, audio_level_cb=None, output_file=None,
     except wyoming.WyomingError as e:
         print(f"[wyoming] TTS fallback failed: {e}", file=sys.stderr)
         return None
+    # Remember the server's rate so the next prewarm matches it (#20 review:
+    # a 24 kHz prewarm was discarded, with a synchronous wait, on every take).
+    state._wyoming_tts_rate = rate
     if proc is not None:
         try:
             proc.stdin.close()
@@ -510,6 +535,7 @@ def _tts_wyoming(text, proc, audio_level_cb=None, output_file=None,
     save_buf = bytearray() if output_file else None
     total = 0
     stream_error = None
+    player_error = None
     try:
         lead_ms = _tts_lead_in_ms()
         proc.stdin.write(b"\x00" * (rate * width * lead_ms // 1000))
@@ -532,6 +558,9 @@ def _tts_wyoming(text, proc, audio_level_cb=None, output_file=None,
                     except Exception:
                         pass
         except wyoming.WyomingError as e:
+            # The SERVER went away (synthesize_stream wraps every socket error,
+            # so nothing from the wire reaches the clause below). EOF the
+            # player so what it already holds is heard, then decide.
             stream_error = e
         proc.stdin.close()
         while proc.poll() is None:
@@ -539,10 +568,16 @@ def _tts_wyoming(text, proc, audio_level_cb=None, output_file=None,
                 proc.terminate()
                 break
             time.sleep(0.1)
-    except (BrokenPipeError, OSError):
-        pass
+    except (BrokenPipeError, OSError) as e:
+        # The PLAYER's pipe went away under us -- distinct from a stream error
+        # by construction (see above). The utterance is over either way.
+        player_error = e
     finally:
         stream.close()
+        _release_player(proc)
+        unregister_proc(proc)
+    if player_error is not None:
+        print(f"[wyoming] player pipe closed early: {player_error}", file=sys.stderr)
     if stream_error is not None and total == 0:
         # Nothing reached the speaker: same verdict as a failed connect, so the
         # caller may fall back to Azure.
