@@ -486,18 +486,82 @@ def _release_player(proc):
         pass
 
 
-def _tts_wyoming(text, proc, audio_level_cb=None, output_file=None,
-                 progress_token=None, voice=None):
-    """Offline TTS via the configured Wyoming server.
+class PreparedTTS:
+    """A synthesis that has been OPENED but not yet played.
 
-    proc: an already-started Azure-rate player to discard, or None.
-    voice: a Piper voice name (e.g. "en_GB-cori-high"). Caller-specified wins
-    over the config default. Before 2026-08-16 this parameter DID NOT EXIST —
-    per-call voices sent by HTTP /speak callers were silently discarded on
-    this path, so every caller spoke in the resident default.
-    Measured, not inferred: a nonexistent voice name returned "done".
-    Returns a result dict, or None when Wyoming is unconfigured/failed
-    (caller then returns its original Azure error).
+    ``tts_prepare()`` returns one; ``tts_play()`` consumes it. It holds the
+    network half of an utterance -- the Azure streaming response, or the
+    Wyoming stream positioned just after ``audio-start`` -- with the audio
+    buffering behind it, so a caller can pay the synthesis latency for
+    sentence N+1 while sentence N is still playing (gnome-speaks#134). It
+    never holds a player: a player belongs to playback, and two prepared
+    sentences must not mean two players.
+
+    ``close()`` releases a handle that will never be played. Idempotent, and
+    the only correct end for a prepared-but-abandoned sentence -- the socket
+    (or response) behind it is otherwise held open until GC.
+
+    ``route`` is ``"wyoming"``, ``"azure"`` or ``"error"``; an error handle
+    carries the dict ``tts_play()`` will return, so ``tts_prepare()`` itself
+    never raises and never returns None.
+    """
+
+    __slots__ = ("text", "quality", "route", "stream", "fmt", "resp",
+                 "tts_rate", "output_file", "error", "azure_req", "closed")
+
+    def __init__(self, text, quality, route, stream=None, fmt=None, resp=None,
+                 tts_rate=0, output_file=None, error=None, azure_req=None):
+        self.text = text
+        self.quality = quality
+        self.route = route
+        self.stream = stream          # wyoming: the synthesize_stream generator
+        self.fmt = fmt                # wyoming: (rate, width, channels)
+        self.resp = resp              # azure: the streaming requests.Response
+        self.tts_rate = tts_rate      # azure: player rate
+        self.output_file = output_file
+        self.error = error            # route == "error": the result dict
+        # wyoming via the skip_azure route only: (ssml, tts_rate, headers,
+        # url) so tts_play() can still fall back to Azure if the server dies
+        # before its first chunk -- the fallback tts() always had there.
+        self.azure_req = azure_req
+        self.closed = False
+
+    @classmethod
+    def failed(cls, message, text=""):
+        return cls(text, None, "error", error={"error": message})
+
+    def close(self):
+        """Release the network side of a handle that will not be played."""
+        if self.closed:
+            return
+        self.closed = True
+        stream, self.stream = self.stream, None
+        resp, self.resp = self.resp, None
+        if stream is not None:
+            try:
+                stream.close()        # generator close -> its finally closes the socket
+            except Exception:
+                pass
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+    def __repr__(self):
+        mark = " closed" if self.closed else ""
+        return f"<PreparedTTS {self.route} {self.text[:24]!r}{mark}>"
+
+
+def _open_wyoming(text, voice=None):
+    """Open a Wyoming synthesis: connect, send, wait for audio-start.
+
+    Returns (stream, (rate, width, channels)) with the stream positioned at
+    the first PCM chunk, or None when Wyoming is unconfigured or failed (the
+    caller then falls back or reports its own error, exactly as before).
+    This is the network half of the old _tts_wyoming(); the latency it pays
+    -- connect plus Piper's first chunk -- is what a prefetching caller wants
+    to pay ahead of time.
     """
     host = CONFIG.get("wyoming_host", "")
     if not host:
@@ -511,23 +575,23 @@ def _tts_wyoming(text, proc, audio_level_cb=None, output_file=None,
         host, int(CONFIG.get("wyoming_tts_port", 10200)), text,
         voice=voice or CONFIG.get("wyoming_tts_voice") or None)
     try:
-        rate, width, channels = next(stream)
+        fmt = next(stream)
     except wyoming.WyomingError as e:
         print(f"[wyoming] TTS fallback failed: {e}", file=sys.stderr)
         return None
     # Remember the server's rate so the next prewarm matches it (#20 review:
     # a 24 kHz prewarm was discarded, with a synchronous wait, on every take).
-    state._wyoming_tts_rate = rate
-    if proc is not None:
-        try:
-            proc.stdin.close()
-            proc.terminate()
-        except Exception:
-            pass
-    proc = _take_prewarmed_player(rate) or _start_player(rate)
-    if proc is None:
-        stream.close()
-        return {"error": "No audio player found — set 'player' in config"}
+    state._wyoming_tts_rate = fmt[0]
+    return stream, fmt
+
+
+def _play_wyoming(stream, fmt, proc, audio_level_cb=None, output_file=None,
+                  progress_token=None):
+    """Play an opened Wyoming stream through `proc`, a player ALREADY started
+    at the stream's rate. The playback half of the old _tts_wyoming(); every
+    exit path releases the player and closes the stream (#20 review)."""
+    host = CONFIG.get("wyoming_host", "")
+    rate, width, channels = fmt
     register_proc(proc)
     play_speak()
     send_progress(progress_token, 5, 100, "🔊 Speaking (offline)...")
@@ -608,14 +672,65 @@ def _tts_wyoming(text, proc, audio_level_cb=None, output_file=None,
     return {"ok": True, "engine": "wyoming"}
 
 
-def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="default", progress_token=None, subtitle_color=None, audio_level_cb=None, output_file=None):
-    """Speak text aloud via Azure TTS with streaming playback.
-    If output_file is set, saves audio to that path (MP3 or WAV) alongside playback."""
+def _tts_wyoming(text, proc, audio_level_cb=None, output_file=None,
+                 progress_token=None, voice=None):
+    """Offline TTS via the configured Wyoming server, open + play in one call.
+
+    Kept for callers that still want the one-shot shape; tts() itself now goes
+    through tts_prepare()/tts_play(), which split this into its network half
+    (_open_wyoming) and its playback half (_play_wyoming).
+
+    proc: an already-started Azure-rate player to discard, or None.
+    voice: a Piper voice name (e.g. "en_GB-cori-high"). Caller-specified wins
+    over the config default. Before 2026-08-16 this parameter DID NOT EXIST —
+    per-call voices sent by HTTP /speak callers were silently discarded on
+    this path, so every caller spoke in the resident default.
+    Measured, not inferred: a nonexistent voice name returned "done".
+    Returns a result dict, or None when Wyoming is unconfigured/failed
+    (caller then returns its original Azure error).
+    """
+    opened = _open_wyoming(text, voice=voice)
+    if opened is None:
+        return None
+    stream, fmt = opened
+    if proc is not None:
+        try:
+            proc.stdin.close()
+            proc.terminate()
+        except Exception:
+            pass
+    player = _take_prewarmed_player(fmt[0]) or _start_player(fmt[0])
+    if player is None:
+        stream.close()
+        return {"error": "No audio player found — set 'player' in config"}
+    return _play_wyoming(stream, fmt, player, audio_level_cb=audio_level_cb,
+                         output_file=output_file, progress_token=progress_token)
+
+
+def tts_prepare(text, quality="fast", speed=1.0, voice=None, pitch="default",
+                volume="default", progress_token=None, output_file=None):
+    """Open an utterance's synthesis without playing it. Never raises.
+
+    The network half of tts(): route selection (Piper-shaped voice, the
+    local/Azure breakers via wyoming.skip_azure(), the Azure POST, the
+    Azure->Wyoming fallbacks) exactly as tts() has always decided it, ending
+    with a PreparedTTS whose audio is streaming into a buffer the caller has
+    not started draining. tts_play() drains it through a player; close()
+    abandons it. A caller that prepares sentence N+1 while N plays pays the
+    synthesis latency under the previous sentence (gnome-speaks#134).
+
+    No player is started here -- two prepared sentences must not be two
+    players, and a prepared sentence that is never played must leave nothing
+    behind but a closed socket. Every failure is returned as an error handle
+    (tts_play() turns it into the same result dict tts() returned), so the
+    contract for a prefetching caller is: prepare never raises, play never
+    surprises.
+    """
     stop_hum()
     send_progress(progress_token, 0, 100, "🔊 Synthesizing...")
 
     if not text or not isinstance(text, str):
-        return {"error": "No text provided"}
+        return PreparedTTS.failed("No text provided")
     text = text[:state._MAX_TTS_CHARS]
     if not output_file:
         output_file = _auto_output_file()
@@ -630,12 +745,12 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
     if voice and re.match(r"^[a-z]{2}_[A-Z]{2}-[A-Za-z0-9_]+-(x_low|low|medium|high)$", voice):
         piper_voice = voice
     if piper_voice is not None:
-        result = _tts_wyoming(text, None, audio_level_cb=audio_level_cb,
-                              output_file=output_file,
-                              progress_token=progress_token, voice=piper_voice)
-        if result is not None:
-            return result
-        return {"error": f"Piper voice '{piper_voice}' requested but Wyoming TTS unavailable"}
+        opened = _open_wyoming(text, voice=piper_voice)
+        if opened is not None:
+            return PreparedTTS(text, quality, "wyoming", stream=opened[0],
+                               fmt=opened[1], output_file=output_file)
+        return PreparedTTS.failed(
+            f"Piper voice '{piper_voice}' requested but Wyoming TTS unavailable", text)
 
     ssml, tts_rate, headers, url = _prepare_tts(text, quality, speed, voice, pitch, volume)
 
@@ -644,45 +759,132 @@ def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="de
     # offline, trip the local breaker and fall through to Azure below.
     if wyoming.skip_azure():
         reason = wyoming.skip_reason()
-        result = _tts_wyoming(text, None, audio_level_cb=audio_level_cb,
-                              output_file=output_file,
-                              progress_token=progress_token)
-        if result is not None:
-            return result
+        opened = _open_wyoming(text)
+        if opened is not None:
+            fallback = None
+            if wyoming.azure_fallback_allowed() and reason != "azure_down":
+                fallback = (ssml, tts_rate, headers, url)
+            return PreparedTTS(text, quality, "wyoming", stream=opened[0],
+                               fmt=opened[1], output_file=output_file,
+                               azure_req=fallback)
         if not wyoming.azure_fallback_allowed() or reason == "azure_down":
-            return {"error": f"offline TTS unavailable ({reason}) and Azure not attempted"}
+            return PreparedTTS.failed(
+                f"offline TTS unavailable ({reason}) and Azure not attempted", text)
         wyoming.mark_local_down()
 
-    # Take pre-warmed player or start fresh (overlaps with TTS API latency)
-    proc = _take_prewarmed_player(tts_rate) or _start_player(tts_rate)
-    if proc is None:
-        return {"error": "No audio player found — set 'player' in config"}
+    return _prepare_azure(text, quality, ssml, tts_rate, headers, url, output_file)
 
-    # Fire TTS request (player is already waiting for stdin data)
+
+def _prepare_azure(text, quality, ssml, tts_rate, headers, url, output_file):
+    """The Azure half of tts_prepare(): POST, or fall back to Wyoming on a
+    network-class failure / 5xx exactly as tts() always did."""
+    # Fire the TTS request. The player used to be started before this POST so
+    # its spawn overlapped the API latency; it now starts in tts_play(), where
+    # the prewarmed player (audio._prewarm_player) covers the same cost.
     try:
         resp = get_http_session().post(url, headers=headers, data=ssml.encode("utf-8"), timeout=60, stream=True)
     except Exception as e:
         # Network-class failure — try the LAN Wyoming fallback
         wyoming.mark_azure_down()
-        result = _tts_wyoming(text, proc, audio_level_cb=audio_level_cb,
-                              output_file=output_file,
-                              progress_token=progress_token)
-        if result is not None:
-            return result
-        return {"error": f"TTS request failed: {e}"}
+        opened = _open_wyoming(text)
+        if opened is not None:
+            return PreparedTTS(text, quality, "wyoming", stream=opened[0],
+                               fmt=opened[1], output_file=output_file)
+        return PreparedTTS.failed(f"TTS request failed: {e}", text)
     if resp.status_code != 200:
         if resp.status_code >= 500:
             wyoming.mark_azure_down()
-            result = _tts_wyoming(text, proc, audio_level_cb=audio_level_cb,
-                                  output_file=output_file,
-                                  progress_token=progress_token)
-            if result is not None:
-                return result
-        proc.stdin.close()
-        proc.wait()
-        return {"error": f"Azure TTS error {resp.status_code}: {resp.text}"}
+            opened = _open_wyoming(text)
+            if opened is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                return PreparedTTS(text, quality, "wyoming", stream=opened[0],
+                                   fmt=opened[1], output_file=output_file)
+        message = f"Azure TTS error {resp.status_code}: {resp.text}"
+        try:
+            resp.close()
+        except Exception:
+            pass
+        return PreparedTTS.failed(message, text)
     wyoming.mark_azure_up()
+    return PreparedTTS(text, quality, "azure", resp=resp, tts_rate=tts_rate,
+                       output_file=output_file)
 
+
+def tts_play(prepared, progress_token=None, subtitle_color=None, audio_level_cb=None):
+    """Play a PreparedTTS to completion. Returns the result dict tts() returns.
+
+    Consumes the handle: starts (or takes the prewarmed) player at the
+    stream's rate and runs the same playback loop tts() always ran, honouring
+    the cancel wire and pause exactly as before. A handle that was already
+    close()d plays nothing and says so -- an abandoned sentence must never
+    reach the speaker.
+    """
+    p = prepared
+    if p.route == "error":
+        p.close()
+        return dict(p.error)
+    if p.closed:
+        return {"spoken": False, "cancelled": True, "error": "prepared TTS was closed"}
+    p.closed = True   # the network side now belongs to the play path below
+    if p.route == "wyoming":
+        stream, fmt = p.stream, p.fmt
+        p.stream = None
+        proc = _take_prewarmed_player(fmt[0]) or _start_player(fmt[0])
+        if proc is None:
+            stream.close()
+            return {"error": "No audio player found — set 'player' in config"}
+        result = _play_wyoming(stream, fmt, proc, audio_level_cb=audio_level_cb,
+                               output_file=p.output_file, progress_token=progress_token)
+        if result is None:
+            # Nothing reached the speaker: the server died between audio-start
+            # and its first chunk. tts() fell back to Azure here (after
+            # tripping the local breaker) when the route allowed it; the
+            # handle carries that request so the same fallback still happens.
+            if p.azure_req is not None:
+                wyoming.mark_local_down()
+                ssml, tts_rate, headers, url = p.azure_req
+                return tts_play(_prepare_azure(p.text, p.quality, ssml, tts_rate,
+                                               headers, url, p.output_file),
+                                progress_token=progress_token,
+                                subtitle_color=subtitle_color,
+                                audio_level_cb=audio_level_cb)
+            reason = wyoming.skip_reason() or "local"
+            return {"error": f"offline TTS unavailable ({reason}) and Azure not attempted"}
+        return result
+    resp, p.resp = p.resp, None
+    proc = _take_prewarmed_player(p.tts_rate) or _start_player(p.tts_rate)
+    if proc is None:
+        try:
+            resp.close()
+        except Exception:
+            pass
+        return {"error": "No audio player found — set 'player' in config"}
+    return _play_azure(resp, p.text, p.quality, p.tts_rate, proc,
+                       progress_token=progress_token, subtitle_color=subtitle_color,
+                       audio_level_cb=audio_level_cb, output_file=p.output_file)
+
+
+def tts(text, quality="fast", speed=1.0, voice=None, pitch="default", volume="default", progress_token=None, subtitle_color=None, audio_level_cb=None, output_file=None):
+    """Speak text aloud via Azure TTS with streaming playback.
+    If output_file is set, saves audio to that path (MP3 or WAV) alongside playback.
+
+    Equivalent to tts_play(tts_prepare(...)) -- the two halves exist so a
+    caller can open the next utterance's synthesis while this one plays
+    (gnome-speaks#134); this one-shot form is unchanged for everyone else."""
+    prepared = tts_prepare(text, quality=quality, speed=speed, voice=voice,
+                           pitch=pitch, volume=volume,
+                           progress_token=progress_token, output_file=output_file)
+    return tts_play(prepared, progress_token=progress_token,
+                    subtitle_color=subtitle_color, audio_level_cb=audio_level_cb)
+
+
+def _play_azure(resp, text, quality, tts_rate, proc, progress_token=None,
+                subtitle_color=None, audio_level_cb=None, output_file=None):
+    """Stream an Azure TTS response into `proc` (a player at tts_rate) with the
+    VU/subtitle progress loop. The playback half of the old tts()."""
     send_progress(progress_token, 5, 100, "🔊 Speaking...")
     play_speak()
 
