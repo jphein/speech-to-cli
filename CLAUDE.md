@@ -37,7 +37,7 @@ SPEECH_DEBUG=1 python3 mcp_speech.py && tail -f /tmp/speech-debug.log
 
 **Claude Code** (`.mcp.json`):
 ```json
-{"mcpServers": {"azure-speech": {"command": "python3", "args": ["/home/jp/Projects/speech-to-cli/mcp_speech.py"]}}}
+{"mcpServers": {"azure-speech": {"command": "python3", "args": ["${HOME}/Projects/speech-to-cli/mcp_speech.py"]}}}
 ```
 
 **Gemini CLI**: Uses `gemini-extension.json`.
