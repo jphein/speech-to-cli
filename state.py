@@ -246,6 +246,14 @@ def load_config():
         # entry row stores -- gnome-speaks normalises). Read on the Python
         # side, so it must be whitelisted or the prefs row is a no-op.
         "phrase_list": cfg.get("phrase_list", []),
+        # STT recognition language (stt.py, and gnome-speaks get/set_language)
+        # and the spoken-punctuation rewriter (gnome-speaks
+        # apply_voice_commands). Both are read on the Python side, so both
+        # MUST be whitelisted: unlisted, they reached CONFIG only through
+        # gnome-speaks' _SYNC_FLAGS side door, which a wake-word-first
+        # session (start_listening(quick=True)) never opens (gnome-speaks#127).
+        "language": cfg.get("language", "en-US"),
+        "voice_commands": cfg.get("voice_commands", True),
         "continuous_dictation": cfg.get("continuous_dictation", False),
         "loop_silence_timeout": cfg.get("loop_silence_timeout", 1.2),
         "read_notifications": cfg.get("read_notifications", False),
