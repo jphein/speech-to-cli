@@ -156,6 +156,18 @@ _request_cond = threading.Condition()
 # Config
 # ---------------------------------------------------------------------------
 
+def _normalise_phrase_list(value):
+    """phrase_list is a LIST of phrases. A prefs entry row stores it as ONE
+    comma-separated string; iterating that would hand Azure one phrase per
+    CHARACTER (stt.py builds the phrase list straight from CONFIG). Normalise
+    here, at the single point every reader passes through."""
+    if isinstance(value, str):
+        return [p.strip() for p in value.split(",") if p.strip()]
+    if isinstance(value, (list, tuple)):
+        return [str(p).strip() for p in value if str(p).strip()]
+    return []
+
+
 def load_config():
     cfg = {}
     if os.path.exists(DEFAULTS_PATH):
@@ -246,7 +258,7 @@ def load_config():
         # Azure STT phrase hints (list, or the comma-separated string a prefs
         # entry row stores -- gnome-speaks normalises). Read on the Python
         # side, so it must be whitelisted or the prefs row is a no-op.
-        "phrase_list": cfg.get("phrase_list", []),
+        "phrase_list": _normalise_phrase_list(cfg.get("phrase_list", [])),
         # STT recognition language (stt.py, and gnome-speaks get/set_language)
         # and the spoken-punctuation rewriter (gnome-speaks
         # apply_voice_commands). Both are read on the Python side, so both
