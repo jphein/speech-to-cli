@@ -533,8 +533,8 @@ def stt_streaming(max_seconds=30, progress_token=None):
             return {"error": str(e)}
 
 
-def stt_vad(max_seconds=30, progress_token=None):
-    """Record with energy-gated VAD, stop on silence, upload via REST."""
+def stt_vad(max_seconds=30, progress_token=None, stop_when=None):
+    """Record with energy-gated VAD, stop on silence (or stop_when), upload via REST."""
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp_path = tmp.name
     try:
@@ -548,7 +548,7 @@ def stt_vad(max_seconds=30, progress_token=None):
             )
         register_proc(proc)
 
-        frames, _ = record_with_vad(proc, max_seconds)
+        frames, _ = record_with_vad(proc, max_seconds, stop_when=stop_when)
         proc.terminate()
         proc.wait()
         unregister_proc(proc)
@@ -740,8 +740,15 @@ def stt_fixed(seconds=5, progress_token=None):
 
 
 def stt(seconds=None, mode=None, silence_timeout=None, vad_aggressiveness=None,
-        energy_multiplier=None, progress_token=None):
-    """Speech-to-text with automatic mode selection."""
+        energy_multiplier=None, progress_token=None, stop_when=None):
+    """Speech-to-text with automatic mode selection.
+
+    stop_when: optional predicate; when it turns true the batch (VAD)
+    recorder finishes EARLY and keeps what it captured -- the dictation
+    hotkey / loop-mode badge tap. Distinct from the cancel wire, which
+    abandons. Honoured by the vad mode; streaming has its own stop path and
+    fixed-length recording cannot be cut short without corrupting the WAV.
+    """
     max_seconds = max(1, min(int(seconds or 30), 30))
 
     with state._stt_lock:
@@ -770,7 +777,8 @@ def stt(seconds=None, mode=None, silence_timeout=None, vad_aggressiveness=None,
             elif mode == "whisper" and HAS_WHISPER:
                 result = stt_whisper(max_seconds, progress_token=progress_token)
             elif mode == "vad" and HAS_VAD:
-                result = stt_vad(max_seconds, progress_token=progress_token)
+                result = stt_vad(max_seconds, progress_token=progress_token,
+                                 stop_when=stop_when)
             else:
                 result = stt_fixed(max_seconds, progress_token=progress_token)
 
