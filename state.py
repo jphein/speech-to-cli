@@ -107,6 +107,7 @@ _warmup_lock = threading.Lock()
 # Pre-warmed player
 _prewarmed_player = None
 _prewarmed_player_rate = 0
+_wyoming_tts_rate = 0  # rate of the last Wyoming audio-start; 0 = none seen yet (audio._prewarm_rate)
 _prewarmed_player_lock = threading.Lock()
 _player_idle_timer = None  # threading.Timer that reaps an idle prewarmed player
 

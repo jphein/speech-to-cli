@@ -169,35 +169,93 @@ def _connect(host, port, timeout):
 
 # -- Public API -------------------------------------------------------------------
 
-def synthesize(host, port, text, voice=None, timeout=10.0):
-    """TTS via Wyoming. Returns (rate, width, channels, pcm_bytes)."""
+def synthesize_stream(host, port, text, voice=None, timeout=10.0):
+    """TTS via Wyoming, streamed. Generator: the FIRST item is the format
+    tuple (rate, width, channels), every later item is a bytes PCM chunk as
+    the server sends it.
+
+    Piper streams progressively (#19: first audio-chunk at ~0.2-0.5 s, audio-stop
+    at 1.4 s / 4.5 s for a line / a paragraph), so a caller that plays chunks as
+    they arrive starts speaking seconds before the collect-all `synthesize()`
+    would even return. The format is yielded at `audio-start`, before any PCM,
+    so the caller can spawn its player while synthesis is still running.
+    Raises WyomingError on connect failure, ANY socket error (a mid-stream
+    RST included -- #20 review), timeout, or an empty stream; the socket is
+    closed when the generator finishes or is closed early. Nothing but
+    WyomingError escapes this generator's wire handling, so a caller that
+    also owns a player pipe can tell "the server went away" from "the player
+    went away" by exception class.
+
+    `timeout` bounds the time spent WAITING ON THE SERVER, summed over the
+    stream -- not wall-clock. A consumer that plays as it reads is throttled
+    by the player, so an utterance longer than `timeout` seconds must not
+    "time out" mid-playback while the server is keeping up.
+    """
     data = {"text": text}
     if voice:
         data["voice"] = {"name": voice}
     sock = _connect(host, port, timeout)
     try:
         f = sock.makefile("rb")
-        _send_event(sock, "synthesize", data)
+        try:
+            _send_event(sock, "synthesize", data)
+        except OSError as e:
+            raise WyomingError(f"synthesize send: {e}")
         rate, width, channels = 22050, 2, 1
-        pcm = bytearray()
-        deadline = time.time() + timeout
+        started = False
+        got_audio = False
+        waited = 0.0
         while True:
-            if time.time() > deadline:
+            t0 = time.monotonic()
+            try:
+                etype, edata, payload = _read_event(f)
+            except socket.timeout:
+                # Subclass of OSError -- must stay ABOVE the generic clause.
+                raise WyomingError("synthesize stalled")
+            except OSError as e:
+                # Mirror _connect(): a ConnectionResetError from a mid-stream
+                # RST used to escape as a bare OSError, land in _tts_wyoming's
+                # player-pipe handler, skip the player's stdin.close() and
+                # report {'ok': True} with the player orphaned on stdin.
+                raise WyomingError(f"synthesize read: {e}")
+            waited += time.monotonic() - t0
+            if waited > timeout:
                 raise WyomingError("synthesize timed out")
-            etype, edata, payload = _read_event(f)
             if etype == "audio-start":
                 rate = int(edata.get("rate", rate))
                 width = int(edata.get("width", width))
                 channels = int(edata.get("channels", channels))
+                if not started:
+                    started = True
+                    yield rate, width, channels
             elif etype == "audio-chunk":
-                pcm.extend(payload)
+                if not started:
+                    # No audio-start seen: fall back to the wire defaults.
+                    started = True
+                    yield rate, width, channels
+                if payload:
+                    got_audio = True
+                    yield payload
             elif etype == "audio-stop":
                 break
-        if not pcm:
+        if not got_audio:
             raise WyomingError("no audio returned")
-        return rate, width, channels, bytes(pcm)
     finally:
         sock.close()
+
+
+def synthesize(host, port, text, voice=None, timeout=10.0):
+    """TTS via Wyoming. Returns (rate, width, channels, pcm_bytes).
+
+    Collect-all wrapper over synthesize_stream() for callers that want a WAV
+    (tts.py, speak.py). Live playback should consume the stream instead.
+    """
+    gen = synthesize_stream(host, port, text, voice=voice, timeout=timeout)
+    rate, width, channels = next(gen)
+    pcm = bytearray()
+    for chunk in gen:
+        pcm.extend(chunk)
+    return rate, width, channels, bytes(pcm)
 
 
 def transcribe(host, port, pcm, rate=16000, width=2, channels=1, timeout=20.0):

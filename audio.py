@@ -13,6 +13,7 @@ import threading
 import time
 
 import state
+import wyoming
 from state import (CONFIG, _cancel_event, _pause_event,
                    is_cancelled, register_proc, unregister_proc, get_http_session)
 
@@ -815,16 +816,58 @@ def _take_prewarmed_player(tts_rate):
             proc = state._prewarmed_player
             state._prewarmed_player = None
             return proc
-        # Rate mismatch -- discard stale player
+        # Rate mismatch -- discard the stale player WITHOUT waiting for it.
         if state._prewarmed_player is not None:
             old = state._prewarmed_player
             state._prewarmed_player = None
+            _reap_player_async(old)
+        return None
+
+
+def _reap_player_async(proc):
+    """EOF a player now; wait for it (and kill it if needed) off-thread.
+
+    Closing stdin returns at once (nothing was ever written to a prewarmed
+    player). It is the wait() that costs 164-214 ms (measured, #20 review --
+    aplay/pw-play tearing the sink down), and on the take path that wait sat
+    between audio-start and the FIRST PCM WRITE of every offline utterance
+    whenever the prewarm was at a different rate than the server's.
+    """
+    try:
+        if proc.stdin is not None:
+            proc.stdin.close()
+    except Exception:
+        pass
+
+    def _wait():
+        try:
+            proc.wait(timeout=1)
+        except Exception:
             try:
-                old.stdin.close()
-                old.wait(timeout=1)
+                proc.kill()
+                proc.wait(timeout=1)
             except Exception:
                 pass
-        return None
+
+    threading.Thread(target=_wait, daemon=True).start()
+
+
+def _prewarm_rate():
+    """Rate the NEXT utterance is expected to play at.
+
+    Azure streams at 24 kHz (fast quality). While Azure is being skipped --
+    speech_backend=local, SPEECH_FORCE_OFFLINE, or Azure on cooldown -- the
+    next utterance comes from Wyoming at the SERVER's rate (Piper: 22050),
+    and a 24 kHz prewarm could only ever be discarded on take (#20 review).
+    The server's rate is learned from its last audio-start (speech_tts sets
+    state._wyoming_tts_rate); 22050 until one has been seen.
+    """
+    try:
+        if wyoming.skip_azure():
+            return int(state._wyoming_tts_rate or 22050)
+    except Exception:
+        pass
+    return 24000
 
 
 def _start_player(tts_rate, target=None):
@@ -843,7 +886,7 @@ def _start_player(tts_rate, target=None):
 def _prewarm_all():
     """Pre-warm recorder + player + refresh STT WebSocket + TTS connection."""
     _prewarm_recorder()
-    _prewarm_player()  # Pre-warm player at 24kHz (fast quality default)
+    _prewarm_player(_prewarm_rate())  # 24 kHz for Azure, the server's rate for Wyoming
     # Refresh STT WebSocket if it might have timed out
     try:
         if state.HAS_WS:

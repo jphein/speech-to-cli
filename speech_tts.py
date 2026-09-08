@@ -464,6 +464,28 @@ def multi_speak(segments, quality="fast", progress_token=None, output_file=None)
 # tts (single segment, streaming playback)
 # ---------------------------------------------------------------------------
 
+def _release_player(proc):
+    """Close the player's stdin and make sure it exits -- on EVERY exit path.
+
+    Idempotent, and called from _tts_wyoming's `finally`, so no exception
+    class can orphan a registered player (#20 review: a mid-stream
+    ConnectionResetError skipped the close and returned {'ok': True} while
+    the player sat alive, blocked on stdin). Closing stdin is EOF: a healthy
+    player drains what it was given and exits on its own; the terminate()
+    only fires for one that is still running after that.
+    """
+    try:
+        if proc.stdin is not None and not proc.stdin.closed:
+            proc.stdin.close()
+    except (BrokenPipeError, OSError):
+        pass
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+    except Exception:
+        pass
+
+
 def _tts_wyoming(text, proc, audio_level_cb=None, output_file=None,
                  progress_token=None, voice=None):
     """Offline TTS via the configured Wyoming server.
@@ -480,61 +502,106 @@ def _tts_wyoming(text, proc, audio_level_cb=None, output_file=None,
     host = CONFIG.get("wyoming_host", "")
     if not host:
         return None
+    # Stream, don't collect (#19): Piper sends the first audio-chunk ~0.2-0.5 s
+    # in and audio-stop seconds later, so waiting for the whole synthesis
+    # before the first byte plays cost ~1 s of silence on a normal line and
+    # ~4 s on a paragraph. The format arrives at audio-start, so the player is
+    # spawned (or the prewarmed one taken) while synthesis is still running.
+    stream = wyoming.synthesize_stream(
+        host, int(CONFIG.get("wyoming_tts_port", 10200)), text,
+        voice=voice or CONFIG.get("wyoming_tts_voice") or None)
     try:
-        rate, width, channels, pcm = wyoming.synthesize(
-            host, int(CONFIG.get("wyoming_tts_port", 10200)), text,
-            voice=voice or CONFIG.get("wyoming_tts_voice") or None)
+        rate, width, channels = next(stream)
     except wyoming.WyomingError as e:
         print(f"[wyoming] TTS fallback failed: {e}", file=sys.stderr)
         return None
-    print(f"[wyoming] TTS via {host} ({len(pcm)} bytes @ {rate} Hz)",
-          file=sys.stderr)
+    # Remember the server's rate so the next prewarm matches it (#20 review:
+    # a 24 kHz prewarm was discarded, with a synchronous wait, on every take).
+    state._wyoming_tts_rate = rate
     if proc is not None:
         try:
             proc.stdin.close()
             proc.terminate()
         except Exception:
             pass
-    proc = _start_player(rate)
+    proc = _take_prewarmed_player(rate) or _start_player(rate)
     if proc is None:
+        stream.close()
         return {"error": "No audio player found — set 'player' in config"}
     register_proc(proc)
     play_speak()
     send_progress(progress_token, 5, 100, "🔊 Speaking (offline)...")
+    # Accumulate only when a WAV is wanted; the total is logged either way.
+    save_buf = bytearray() if output_file else None
+    total = 0
+    stream_error = None
+    player_error = None
     try:
         lead_ms = _tts_lead_in_ms()
         proc.stdin.write(b"\x00" * (rate * width * lead_ms // 1000))
         n = 0
-        for i in range(0, len(pcm), 16384):
-            if is_cancelled():
-                break
-            while _pause_event.is_set() and not is_cancelled():
-                time.sleep(0.05)
-            chunk = pcm[i:i + 16384]
-            proc.stdin.write(chunk)
-            proc.stdin.flush()
-            n += 1
-            if audio_level_cb and n % 3 == 0:
-                try:
-                    audio_level_cb(min(rms_energy(chunk[:3200]) / 8000.0, 1.0))
-                except Exception:
-                    pass
+        try:
+            for chunk in stream:
+                if is_cancelled():
+                    break
+                while _pause_event.is_set() and not is_cancelled():
+                    time.sleep(0.05)
+                proc.stdin.write(chunk)
+                proc.stdin.flush()
+                total += len(chunk)
+                if save_buf is not None:
+                    save_buf.extend(chunk)
+                n += 1
+                if audio_level_cb and n % 3 == 0:
+                    try:
+                        audio_level_cb(min(rms_energy(chunk[:3200]) / 8000.0, 1.0))
+                    except Exception:
+                        pass
+        except wyoming.WyomingError as e:
+            # The SERVER went away (synthesize_stream wraps every socket error,
+            # so nothing from the wire reaches the clause below). EOF the
+            # player so what it already holds is heard, then decide.
+            stream_error = e
         proc.stdin.close()
         while proc.poll() is None:
             if is_cancelled():
                 proc.terminate()
                 break
             time.sleep(0.1)
-    except (BrokenPipeError, OSError):
-        pass
+    except (BrokenPipeError, OSError) as e:
+        # The PLAYER's pipe went away under us -- distinct from a stream error
+        # by construction (see above). The utterance is over either way.
+        player_error = e
+    finally:
+        stream.close()
+        _release_player(proc)
+        unregister_proc(proc)
+    if player_error is not None:
+        print(f"[wyoming] player pipe closed early: {player_error}", file=sys.stderr)
+    if stream_error is not None and total == 0:
+        # Nothing reached the speaker: same verdict as a failed connect, so the
+        # caller may fall back to Azure.
+        print(f"[wyoming] TTS fallback failed: {stream_error}", file=sys.stderr)
+        return None
+    _mark_tts_end()
+    print(f"[wyoming] TTS via {host} ({total} bytes @ {rate} Hz)",
+          file=sys.stderr)
+    if stream_error is not None:
+        # Audio already reached the speaker, so this is NOT a fallback case:
+        # returning None would make the caller re-speak the whole text via
+        # Azure on top of what was already heard.
+        print(f"[wyoming] TTS stream failed mid-utterance: {stream_error}",
+              file=sys.stderr)
+        return {"error": f"offline TTS stream failed: {stream_error}",
+                "engine": "wyoming"}
     if output_file:
         try:
             with open(output_file, "wb") as f:
                 f.write(struct.pack('<4sI4s4sIHHIIHH4sI',
-                    b'RIFF', 36 + len(pcm), b'WAVE', b'fmt ', 16, 1, channels,
+                    b'RIFF', 36 + len(save_buf), b'WAVE', b'fmt ', 16, 1, channels,
                     rate, rate * width * channels, width * channels,
-                    width * 8, b'data', len(pcm)))
-                f.write(pcm)
+                    width * 8, b'data', len(save_buf)))
+                f.write(save_buf)
         except OSError:
             pass
     send_progress(progress_token, 100, 100, "✅ Done (offline)")
