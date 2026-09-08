@@ -27,6 +27,13 @@ is measured here rather than read off the code:
      tts_play() a second later gets every chunk from the socket buffer at
      once. That is the latency a prefetching caller pays under the previous
      sentence instead of as a gap.
+  4. CANCEL HYGIENE (#27). A cancelled utterance still returns
+     {"spoken": False, "cancelled": True}, still sends the "⏹ Cancelled" frame
+     and still skips play_done() -- but an exception raised by the player
+     while the utterance is cancelled now PROPAGATES out of tts_play(). The
+     old `return` inside the play loop's `finally` swallowed it. The control
+     for this one is the pre-fix TREE: run this script with
+     tests/repros/tts_prepare_play.py <extracted 875a48f> and it goes red.
 
 Fake Wyoming server on loopback, fake player, fake Azure session -- no audio,
 no network, no chimes, nothing written to the user config. Reuses the fakes of
@@ -87,10 +94,11 @@ class FakeSession:
 class Rig:
     """Everything one TTS call touches, patched on ONE speech_tts module."""
 
-    def __init__(self, mod, session=None):
+    def __init__(self, mod, session=None, proc=None):
         self.mod = mod
-        self.proc = FakeProc()
+        self.proc = proc if proc is not None else FakeProc()
         self.player_starts = 0
+        self.frames = []          # every send_progress() call, as its arg tuple
         self.session = session or FakeSession(FakeResp())
 
         def start(rate, target=None):
@@ -104,12 +112,29 @@ class Rig:
         mod.play_speak = lambda: None
         mod.play_done = lambda: None
         mod.stop_hum = lambda: None
-        mod.send_progress = lambda *a, **k: None
+        mod.send_progress = lambda *a, **k: self.frames.append(a + tuple(k.values()))
         mod.is_cancelled = lambda: False
         mod.get_http_session = lambda: self.session
 
     def pcm_writes(self):
         return [b for _t, b in self.proc.stdin.writes if b != b"\x00" * len(b)]
+
+    def sent_frame(self, needle):
+        return any(needle in str(part) for frame in self.frames for part in frame)
+
+
+class VanishingPlayer(FakeProc):
+    """A player that never finishes on its own and whose terminate() raises --
+    the process went away between poll() and the signal, say. Fault injection
+    for section 4: what matters is that SOME exception leaves the play loop's
+    try while the utterance is cancelled, not this particular one."""
+
+    def poll(self):
+        return None
+
+    def terminate(self):
+        self.terminated = True
+        raise OSError("player vanished")
 
 
 def pin_config(**over):
@@ -326,6 +351,44 @@ def main():
     check(t_play < gap * n / 2, f"play drained buffered audio faster than realtime ({t_play*1000:.0f} ms)")
     check(rig.proc.stdin.writes and rig.proc.stdin.writes[0][1] == b"\x00" * LEAD_IN,
           "cold-device lead-in still written first")
+
+    # --- 4. a cancelled utterance keeps its verdict, and stops hiding crashes --
+    print("\n== 4. cancelled utterance: verdict unchanged, exceptions propagate (#27) ==")
+    # The cancel lands DURING playback, so the handle is prepared with the
+    # wire low and the wire is raised before tts_play() -- as in a real stop.
+    # Control first: a healthy player. This is the contract that must not move.
+    pin_config()
+    rig = Rig(speech_tts, FakeSession(FakeResp(200, chunks=3)))
+    play_done_calls = []
+    speech_tts.play_done = lambda: play_done_calls.append(1)
+    h = speech_tts.tts_prepare("cancel me")
+    speech_tts.is_cancelled = lambda: True
+    res = speech_tts.tts_play(h)
+    check(res == {"spoken": False, "cancelled": True},
+          f"cancelled, healthy player: verdict unchanged: {res}")
+    check(rig.sent_frame("⏹ Cancelled"), "cancelled, healthy player: the '⏹ Cancelled' frame is sent")
+    check(not rig.sent_frame("cancel me"), "cancelled, healthy player: no final-subtitle frame")
+    check(not play_done_calls, "cancelled, healthy player: play_done() is not called")
+
+    # The defect: `return` inside the play loop's `finally` discarded whatever
+    # was propagating out of the try, so a player crash during a cancelled
+    # utterance came back as a clean {"cancelled": True}. RED on 875a48f.
+    pin_config()
+    rig = Rig(speech_tts, FakeSession(FakeResp(200, chunks=3)), proc=VanishingPlayer())
+    h = speech_tts.tts_prepare("cancel me, then crash")
+    speech_tts.is_cancelled = lambda: True
+    raised, res = None, None
+    try:
+        res = speech_tts.tts_play(h)
+    except OSError as exc:
+        raised = exc
+    check(rig.proc.terminated, "positive control: the cancel path reached terminate() (which raised)")
+    check(raised is not None,
+          f"cancelled, player raises: the exception propagates out of tts_play "
+          f"(raised={raised!r}, returned={res})")
+    check(rig.sent_frame("⏹ Cancelled"),
+          "cancelled, player raises: the '⏹ Cancelled' frame was still sent on the way out")
+    speech_tts.is_cancelled = lambda: False
 
 
 try:

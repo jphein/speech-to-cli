@@ -988,12 +988,18 @@ def _play_azure(resp, text, quality, tts_rate, proc, progress_token=None,
     finally:
         unregister_proc(proc)
         stop_hum()
-        if is_cancelled():
+        cancelled = is_cancelled()
+        if cancelled:
             send_progress(progress_token, 100, 100, "⏹ Cancelled")
-            return {"spoken": False, "cancelled": True}
-        # Show full text in final message so subtitles persist
-        tts_color = subtitle_color or CONFIG.get("subtitle_color_tts")
-        send_progress(progress_token, 100, 100, f"🔊 {_colorize(text, tts_color)}")
+        else:
+            # Show full text in final message so subtitles persist
+            tts_color = subtitle_color or CONFIG.get("subtitle_color_tts")
+            send_progress(progress_token, 100, 100, f"🔊 {_colorize(text, tts_color)}")
+    # The verdict is returned HERE, not inside the finally: a `return` in a
+    # finally discards any exception propagating out of the try, so a player
+    # crash during a cancelled utterance read as a clean cancel (#27).
+    if cancelled:
+        return {"spoken": False, "cancelled": True}
     play_done()
     _mark_tts_end()
 
